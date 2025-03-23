@@ -982,7 +982,7 @@ PHP_METHOD(NDArray, normal) {
  * @param execute_data
  * @param return_value
  */
-ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_normal, 0, 0, 1)
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_truncated_normal, 0, 0, 1)
 ZEND_ARG_INFO(0, size)
 ZEND_ARG_INFO(0, loc)
 ZEND_ARG_INFO(0, scale)
@@ -3822,12 +3822,12 @@ PHP_METHOD(NDArray, verticalStack) {
 }
 
 /**
-* NDArray::horizontalstack
+* NDArray::horizontalStack
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_hstack, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, horizontalstack) {
+PHP_METHOD(NDArray, horizontalStack) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -5096,7 +5096,7 @@ static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, transpose, arginfo_ndarray_transpose, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, slice, arginfo_slice, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, append, arginfo_ndarray_append, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, expand_dims, arginfo_ndarray_expand_dims, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NDArray, expandDims, arginfo_ndarray_expand_dims, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, squeeze, arginfo_ndarray_squeeze, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, flip, arginfo_ndarray_flip, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, swapAxes, arginfo_ndarray_swapaxes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -5124,7 +5124,7 @@ static const zend_function_entry class_NDArray_methods[] = {
 
     // RANDOM
     ZEND_ME(NDArray, normal, arginfo_ndarray_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, truncatedNormal, arginfo_ndarray_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NDArray, truncatedNormal, arginfo_ndarray_truncated_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, standardNormal, arginfo_ndarray_standard_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, poisson, arginfo_ndarray_poisson, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, uniform, arginfo_ndarray_uniform, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
