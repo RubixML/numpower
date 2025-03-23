@@ -508,6 +508,35 @@ NDArray_Identity(int size) {
 }
 
 /**
+ * Random samples from a truncated Gaussian distribution.
+ *
+ * The values generated are similar to values from a Normal distribution,
+ * except that values more than two standard deviations from the mean are
+ * discarded and re-drawn.
+ * 
+ * @param size
+ * @return
+ */
+NDArray*
+NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim) {
+    NDArray *rtn;
+    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+
+    for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
+        float z;
+        do {
+            float u1 = (float)rand() / (float)RAND_MAX;
+            float u2 = (float)rand() / (float)RAND_MAX;
+            z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+            z = (float)loc + (float)scale * z;
+            NDArray_FDATA(rtn)[i] = z;
+        } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
+    }
+
+    return rtn;
+}
+
+/**
  * Random samples from a Gaussian distribution.
  *
  * @param size

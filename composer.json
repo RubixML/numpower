@@ -1,5 +1,5 @@
 {
-    "name": "numpower/extension",
+    "name": "rubixnumpower/extension",
     "require-dev": {
         "phpbench/phpbench": "^1.0"
     },
