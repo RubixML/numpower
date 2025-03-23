@@ -106,6 +106,15 @@ final class NDArray {
     public static function reciprocal(NDArray|array|float|int $a): NDArray|float|int {}
 
     /**
+     * Subtract two arrays element-wise
+     *
+     * @param NDArray|array|float|int $a Input array
+     * @param NDArray|array|float|int $b Input array
+     * @return NDArray|float|int $a - $b
+     */
+    public static function subtract(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray|float|int {}
+
+    /**
      * Raises each element of an array $a to a specified power $b and returns a new array containing the result.
      *
      * Same as $a ** $b;
@@ -114,16 +123,7 @@ final class NDArray {
      * @param NDArray|array|float|int $b Input array
      * @return NDArray|float|int $a ** $b
      */
-    public static function pow(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray|float|int {};
-
-    /**
-     * Subtract two arrays element-wise
-     *
-     * @param NDArray|array|float|int $a Input array
-     * @param NDArray|array|float|int $b Input array
-     * @return NDArray|float|int $a - $b
-     */
-    public static function subtract(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray|float|int {}
+    public static function pow(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray|float|int {}
 
     /**
      * Computes the element-wise exponential function of an array, returning
@@ -475,6 +475,20 @@ final class NDArray {
     public static function normal(array $size, float $loc = 0.0, float $scale = 1.0): NDArray {}
 
     /**
+     * Generates an array of random numbers from a truncated normal distribution.
+     * 
+     * The values generated are similar to values from a Normal distribution,
+     * except that values more than two standard deviations from the mean are
+     * discarded and re-drawn.
+     *
+     * @param array $size
+     * @param float $loc
+     * @param float $scale
+     * @return NDArray
+     */
+    public static function truncatedNormal(array $size, float $loc = 0.0, float $scale = 1.0): NDArray {}
+
+    /**
      * Generates an array of random integers from a Poisson distribution.
      * The Poisson distribution models the number of events occurring in fixed intervals of time
      * or space, given the average rate of occurrence.
@@ -493,7 +507,7 @@ final class NDArray {
      * @param array $size
      * @return NDArray
      */
-    public static function standard_normal(array $size): NDArray {}
+    public static function standardNormal(array $size): NDArray {}
 
     /**
      * Generates an array of random numbers from a uniform distribution. The uniform distribution provides an equal
@@ -601,7 +615,7 @@ final class NDArray {
      * @param NDArray|array|float|int $array
      * @return NDArray
      */
-    public static function atleast_1d(NDArray|array|float|int $array): NDArray {}
+    public static function atleast1d(NDArray|array|float|int $array): NDArray {}
 
     /**
      * Convert inputs to arrays with at least two dimensions.
@@ -609,7 +623,7 @@ final class NDArray {
      * @param NDArray|array|float|int $array
      * @return NDArray
      */
-    public static function atleast_2d(NDArray|array|float|int $array): NDArray {}
+    public static function atleast2d(NDArray|array|float|int $array): NDArray {}
 
     /**
      * Convert inputs to arrays with at least three dimensions.
@@ -617,7 +631,7 @@ final class NDArray {
      * @param NDArray|array|float|int $array
      * @return NDArray
      */
-    public static function atleast_3d(NDArray|array|float|int $array): NDArray {}
+    public static function atleast3d(NDArray|array|float|int $array): NDArray {}
 
     /**
      * Create a copy of array `$a`.
@@ -641,7 +655,7 @@ final class NDArray {
      * @param int|int[]|null $axis This parameter specifies the position where the new axis (or axes) will be inserted within the expanded array.
      * @return NDArray
      */
-    public static function expand_dims(NDArray|array|float|int $target, int|array $axis = NULL): NDArray {}
+    public static function expandDims(NDArray|array|float|int $target, int|array $axis = NULL): NDArray {}
 
     /**
      * Return a **copy** of the array `$a` into one dimension.
@@ -698,7 +712,7 @@ final class NDArray {
      * @param int $axis2 Second axis
      * @return NDArray
      */
-    public static function swapaxes(NDArray|array|float|int $a, int $axis1, int $axis2): NDArray {}
+    public static function swapAxes(NDArray|array|float|int $a, int $axis1, int $axis2): NDArray {}
 
     /**
      * Roll the specified axis backwards, until it lies in a given position.
@@ -708,7 +722,7 @@ final class NDArray {
      * @param int $start
      * @return NDArray
      */
-    public static function rollaxis(NDArray|array|float|int $a, int $axis, int $start = 0): NDArray {}
+    public static function rollAxis(NDArray|array|float|int $a, int $axis, int $start = 0): NDArray {}
 
     /**
      * Move axes of an array to new positions.
@@ -718,7 +732,7 @@ final class NDArray {
      * @param int|array $destination
      * @return NDArray
      */
-    public static function moveaxis(NDArray|array|float|int $a, int|array $source, int|array $destination): NDArray {}
+    public static function moveAxis(NDArray|array|float|int $a, int|array $source, int|array $destination): NDArray {}
 
     /**
      * Stack arrays in sequence vertically (row wise).
@@ -726,7 +740,7 @@ final class NDArray {
      * @param NDArray[] $arrays
      * @return NDArray
      */
-    public static function vstack(array $arrays): NDArray {}
+    public static function verticalStack(array $arrays): NDArray {}
 
     /**
      * Stack arrays in sequence horizontally (column wise).
@@ -734,7 +748,7 @@ final class NDArray {
      * @param NDArray[] $arrays
      * @return NDArray
      */
-    public static function hstack(array $arrays): NDArray {}
+    public static function horizontalStack(array $arrays): NDArray {}
 
     /**
      * Stack arrays in sequence depth wise (along third axis).
@@ -742,7 +756,7 @@ final class NDArray {
      * @param NDArray[] $arrays
      * @return NDArray
      */
-    public static function dstack(array $arrays): NDArray {}
+    public static function depthStack(array $arrays): NDArray {}
 
     /**
      * Join a sequence of arrays along an existing axis.
@@ -769,7 +783,7 @@ final class NDArray {
      * @param NDArray[] $arrays
      * @return NDArray
      */
-    public static function column_stack(array $arrays): NDArray {}
+    public static function columnStack(array $arrays): NDArray {}
 
     /**
      * Creates a new NDArray from a PHP array.
@@ -836,7 +850,7 @@ final class NDArray {
      * @param float $atol
      * @return NDArray
      */
-    public static function allclose(NDArray|array|float|int $a, NDArray|array|float|int $b, float $rtol = 1e-05, float $atol = 1e-08): NDArray {}
+    public static function allClose(NDArray|array|float|int $a, NDArray|array|float|int $b, float $rtol = 1e-05, float $atol = 1e-08): NDArray {}
 
     /**
      * Performs an element-wise equality comparison between two arrays and returns a
@@ -869,7 +883,7 @@ final class NDArray {
      * @param NDArray|array|float|int $b
      * @return NDArray
      */
-    public static function greater_equal(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
+    public static function greaterEqual(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
 
     /**
      * Performs an element-wise less-than comparison between two arrays and returns a new array of the same shape.
@@ -891,7 +905,7 @@ final class NDArray {
      * @param NDArray|array|float|int $b
      * @return NDArray
      */
-    public static function less_equal(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
+    public static function lessEqual(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
 
     /**
      * Performs an element-wise inequality comparison between two arrays and returns a new array of the same shape.
@@ -901,7 +915,7 @@ final class NDArray {
      * @param NDArray|array|float|int $b
      * @return NDArray
      */
-    public static function not_equal(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
+    public static function notEqual(NDArray|array|float|int $a, NDArray|array|float|int $b): NDArray {}
 
     /**
      * Computes the sum of the diagonal elements of a square array, also known as the trace of the array.
@@ -971,7 +985,7 @@ final class NDArray {
      * @param float $tol
      * @return NDArray
      */
-    public static function matrix_rank(NDArray|array $a, float $tol = 1e-6): NDArray {}
+    public static function matrixRank(NDArray|array $a, float $tol = 1e-6): NDArray {}
 
     /**
      * Performs matrix multiplication between two arrays and returns the result as a new array.
@@ -1162,5 +1176,5 @@ final class NDArray {
      * @param array ...$indices
      * @return NDArray|float
      */
-    public function slice(...$indices): NDArray|float {};
+    public function slice(...$indices): NDArray|float {}
 }
