@@ -100,7 +100,7 @@ NDArray* ZVAL_TO_NDARRAY(zval* obj) {
         zend_class_entry* ce = NULL;
         ce = Z_OBJCE_P(obj);
         zend_string* class_name = Z_OBJ_P(obj)->ce->name;
-        if (strcmp(ZSTR_VAL(class_name), "NDArray") == 0) {
+        if (strcmp(ZSTR_VAL(class_name), "NumPower") == 0) {
             if (ce == phpsci_ce_NDArray) {
                 return buffer_get(get_object_uuid(obj));
             }
@@ -112,7 +112,7 @@ NDArray* ZVAL_TO_NDARRAY(zval* obj) {
         }
 #endif
     }
-    zend_throw_error(NULL, "argument must be an array, long, double, gdimage or ndarray.");
+    zend_throw_error(NULL, "argument must be an array, long, double, gdimage or NumPower.");
     return NULL;
 }
 
@@ -950,29 +950,41 @@ PHP_METHOD(NDArray, identity) {
  * @param return_value
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_normal, 0, 0, 1)
-ZEND_ARG_INFO(0, size)
-ZEND_ARG_INFO(0, loc)
-ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, loc)
+    ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, accelerator)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NDArray, normal) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
+    long accelerator = 0;
     double loc = 0.0, scale = 1.0;
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-    Z_PARAM_ZVAL(size)
+    
+    ZEND_PARSE_PARAMETERS_START(1, 4)
+        Z_PARAM_ZVAL(size)
     Z_PARAM_OPTIONAL
-    Z_PARAM_DOUBLE(loc)
-    Z_PARAM_DOUBLE(scale)
+        Z_PARAM_DOUBLE(loc)
+        Z_PARAM_DOUBLE(scale)
+        Z_PARAM_LONG(accelerator)
     ZEND_PARSE_PARAMETERS_END();
+    
+    int accelerator_i = (int) accelerator;
     NDArray *nda = ZVAL_TO_NDARRAY(size);
+    
     if (nda == NULL) return;
+    
     shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
+    
     for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
             shape[i] = (int) NDArray_FDATA(nda)[i];
+    
     }
-    rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda));
+
+    rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
     NDArray_FREE(nda);
+    
     RETURN_NDARRAY(rtn, return_value);
 }
 
@@ -5244,7 +5256,7 @@ static const zend_function_entry class_NDArray_methods[] = {
 
 static zend_class_entry *register_class_NDArray(zend_class_entry *class_entry_Iterator, zend_class_entry *class_entry_Countable, zend_class_entry *class_entry_ArrayAccess) {
     zend_class_entry ce, *class_entry;
-    INIT_CLASS_ENTRY(ce, "NDArray", class_NDArray_methods);
+    INIT_CLASS_ENTRY(ce, "NumPower", class_NDArray_methods);
     ndarray_objects_init(&ce);
     ce.create_object = ndarray_create_object;
     class_entry = zend_register_internal_class(&ce);
@@ -5274,6 +5286,8 @@ static zend_class_entry *register_class_ArithmeticOperand(zend_class_entry *clas
 PHP_MINIT_FUNCTION(ndarray) {
     phpsci_ce_NDArray = register_class_NDArray(zend_ce_iterator, zend_ce_countable, zend_ce_arrayaccess);
     phpsci_ce_ArithmeticOperand = register_class_ArithmeticOperand(zend_ce_iterator, zend_ce_countable, zend_ce_arrayaccess);
+    REGISTER_LONG_CONSTANT("NUMPOWER_CPU", 0, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("NUMPOWER_CUDA", 1, CONST_CS | CONST_PERSISTENT);
     return SUCCESS;
 }
 

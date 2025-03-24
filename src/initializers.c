@@ -13,6 +13,8 @@
 
 #ifdef HAVE_CUBLAS
 #include <cuda_runtime.h>
+#include "ndmath/cuda/cuda_math.h"
+#include <curand.h>
 #include <cublas_v2.h>
 #include "ndmath/cuda/cuda_math.h"
 #include "gpu_alloc.h"
@@ -520,9 +522,10 @@ NDArray_Identity(int size) {
 NDArray*
 NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim) {
     NDArray *rtn;
-    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
+    scale = scale / 0.88;
 
-    for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
+    /*for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
         float z;
         do {
             float u1 = (float)rand() / (float)RAND_MAX;
@@ -533,6 +536,9 @@ NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim) {
         } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
     }
 
+    return rtn;*/
+    int size = NDArray_NUMELEMENTS(rtn);
+    cuda_truncated_normal(NDArray_FDATA(rtn), size, loc, scale);
     return rtn;
 }
 
@@ -543,21 +549,60 @@ NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim) {
  * @return
  */
 NDArray*
-NDArray_Normal(double loc, double scale, int* shape, int ndim) {
+NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator) {
     NDArray *rtn;
-    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+    if (accelerator == 1) {
+#ifdef HAVE_CUBLAS
+        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
+        if (rtn == NULL) {
+            return rtn;
+        }
 
-    // Generate random samples from the normal distribution
-    for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
-        // Box-Muller transform to generate standard normal samples
-        float u1 = (float)rand() / (float)RAND_MAX;
-        float u2 = (float)rand() / (float)RAND_MAX;
-        float z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+        int size = NDArray_NUMELEMENTS(rtn);
+        float* d_matrix = NULL;
+    
+        vmalloc((void**)&d_matrix, size * sizeof(float));
+    
+        curandGenerator_t gen;
+        curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
+        curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
+        curandGenerateNormal(gen, d_matrix, size, (float)loc, (float)scale);
+        
+        if (rtn->data != NULL) {
+            vfree(rtn->data);
+        }
+    
+        rtn->data = (void*)d_matrix;
+        curandDestroyGenerator(gen);
+#endif
+    } else {
+        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+        if (rtn == NULL) {
+            return rtn;
+        }
 
-        // Scale and shift the standard normal sample
-        NDArray_FDATA(rtn)[i] = (float)loc + (float)scale * z;
+        int size = NDArray_NUMELEMENTS(rtn);
+
+        // Generate random samples from the normal distribution
+        for (int i = 0; i < size; i += 2) {
+            float s, u, v;
+            do {
+                u = 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0;
+                v = 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0;
+                s = u * u + v * v;
+            } while (s >= 1.0f || s ==0);
+
+            float factor = sqrt(-2.0f * log(s) / s);
+            float z1 = u * factor;
+
+            NDArray_FDATA(rtn)[i] = (float)loc + (float)scale * z1;
+            if (i + 1 <= size) {
+                float z2 = v * factor;
+                NDArray_FDATA(rtn)[i+1] = (float)loc + (float)scale * z2;
+            }
+        }
     }
-
+    
     return rtn;
 }
 
@@ -569,7 +614,7 @@ NDArray_Normal(double loc, double scale, int* shape, int ndim) {
  */
 NDArray*
 NDArray_StandardNormal(int* shape, int ndim) {
-    return NDArray_Normal(0.0, 1.0, shape, ndim);
+    return NDArray_Normal(0.0, 1.0, shape, ndim, 0);
 }
 
 /**

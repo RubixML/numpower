@@ -7,7 +7,8 @@
 #include <float.h>
 #include <cusolverDn.h>
 #include <cuda.h>
-
+#include <curand.h>
+#include <curand_kernel.h>
 
 #define CHECK_CUDA(func) do { \
   cudaError_t status = (func); \
@@ -27,6 +28,29 @@
   } \
 } while (0)
 
+__global__ void truncatedNormalKernel(float* d_data, int size, double loc, double scale, unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    curandState_t state;
+
+    if (idx < size) {
+        curand_init(seed, idx, 0, &state);
+        float z;
+        do {
+            z = curand_normal(&state) * scale + loc;
+        } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
+        d_data[idx] = z;
+    }
+}
+
+void cuda_truncated_normal(float* h_data, int size, double loc, double scale) {
+    // Определение параметров сетки и блоков
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+
+    // Вызов ядра CUDA
+    truncatedNormalKernel<<<blocksPerGrid, threadsPerBlock>>>(h_data, size, loc, scale, 1234ULL);
+    cudaDeviceSynchronize();
+}
 
 // CUDA kernel to calculate the median of a float* array
 __global__ void findMedianKernelFloat(float* input, int size, float* median) {

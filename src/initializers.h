@@ -10,7 +10,7 @@ NDArray* NDArray_FromNDArray(NDArray *target, int buffer_offset, int* shape, int
 NDArray* NDArray_Zeros(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Ones(int *shape, int ndim, const char *type);
 NDArray* NDArray_Identity(int size);
-NDArray* NDArray_Normal(double loc, double scale, int* shape, int ndim);
+NDArray* NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator);
 NDArray* NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim);
 NDArray* NDArray_StandardNormal(int* shape, int ndim);
 NDArray* NDArray_Poisson(double lam, int* shape, int ndim);
