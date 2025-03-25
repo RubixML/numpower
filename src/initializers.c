@@ -520,25 +520,29 @@ NDArray_Identity(int size) {
  * @return
  */
 NDArray*
-NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim) {
+NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator) {
     NDArray *rtn;
-    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
     scale = scale / 0.88;
 
-    /*for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
-        float z;
-        do {
-            float u1 = (float)rand() / (float)RAND_MAX;
-            float u2 = (float)rand() / (float)RAND_MAX;
-            z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
-            z = (float)loc + (float)scale * z;
-            NDArray_FDATA(rtn)[i] = z;
-        } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
+    if (accelerator == NDARRAY_DEVICE_GPU) {
+#ifdef HAVE_CUBLAS
+        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
+        int size = NDArray_NUMELEMENTS(rtn);
+        cuda_truncated_normal(NDArray_FDATA(rtn), size, loc, scale);
+#endif
+    } else {
+        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+        for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
+            float z;
+            do {
+                float u1 = (float)rand() / (float)RAND_MAX;
+                float u2 = (float)rand() / (float)RAND_MAX;
+                z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+                z = (float)loc + (float)scale * z;
+                NDArray_FDATA(rtn)[i] = z;
+            } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
+        }
     }
-
-    return rtn;*/
-    int size = NDArray_NUMELEMENTS(rtn);
-    cuda_truncated_normal(NDArray_FDATA(rtn), size, loc, scale);
     return rtn;
 }
 
@@ -555,7 +559,7 @@ NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator) 
 #ifdef HAVE_CUBLAS
         rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
         if (rtn == NULL) {
-            return rtn;
+            return NULL;
         }
 
         int size = NDArray_NUMELEMENTS(rtn);
@@ -578,7 +582,7 @@ NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator) 
     } else {
         rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
         if (rtn == NULL) {
-            return rtn;
+            return NULL;
         }
 
         int size = NDArray_NUMELEMENTS(rtn);
@@ -596,7 +600,7 @@ NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator) 
             float z1 = u * factor;
 
             NDArray_FDATA(rtn)[i] = (float)loc + (float)scale * z1;
-            if (i + 1 <= size) {
+            if (i + 1 < size) {
                 float z2 = v * factor;
                 NDArray_FDATA(rtn)[i+1] = (float)loc + (float)scale * z2;
             }

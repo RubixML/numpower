@@ -288,7 +288,6 @@ int arithmetic_do_operation(zend_uchar opcode, zval *result, zval *op1, zval *op
     return retval;
 }
 
-
 static void ndarray_destructor(zend_object* object) {
     zval *obj_uuid = OBJ_PROP_NUM(object, 0);
     if (GC_REFCOUNT(object) <= 1 && Z_TYPE_P(obj_uuid) != IS_UNDEF) {
@@ -959,7 +958,7 @@ PHP_METHOD(NDArray, normal) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
-    long accelerator = 0;
+    long accelerator = NDARRAY_DEVICE_CPU;
     double loc = 0.0, scale = 1.0;
     
     ZEND_PARSE_PARAMETERS_START(1, 4)
@@ -978,8 +977,7 @@ PHP_METHOD(NDArray, normal) {
     shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
     
     for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-            shape[i] = (int) NDArray_FDATA(nda)[i];
-    
+        shape[i] = (int) NDArray_FDATA(nda)[i];
     }
 
     rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
@@ -995,29 +993,42 @@ PHP_METHOD(NDArray, normal) {
  * @param return_value
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_truncated_normal, 0, 0, 1)
-ZEND_ARG_INFO(0, size)
-ZEND_ARG_INFO(0, loc)
-ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, loc)
+    ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, accelerator)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NDArray, truncatedNormal) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
+    long accelerator = NDARRAY_DEVICE_CPU;
     double loc = 0.0, scale = 1.0;
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-    Z_PARAM_ZVAL(size)
+
+    ZEND_PARSE_PARAMETERS_START(1, 4)
+        Z_PARAM_ZVAL(size)
     Z_PARAM_OPTIONAL
-    Z_PARAM_DOUBLE(loc)
-    Z_PARAM_DOUBLE(scale)
+        Z_PARAM_DOUBLE(loc)
+        Z_PARAM_DOUBLE(scale)
+        Z_PARAM_LONG(accelerator)
     ZEND_PARSE_PARAMETERS_END();
+
+    int accelerator_i = (int) accelerator;
     NDArray *nda = ZVAL_TO_NDARRAY(size);
-    if (nda == NULL) return;
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-            shape[i] = (int) NDArray_FDATA(nda)[i];
+
+    if (nda == NULL) {
+        return;
     }
-    rtn = NDArray_TruncatedNormal(loc, scale, shape, NDArray_NUMELEMENTS(nda));
+
+    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
+
+    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
+        shape[i] = (int) NDArray_FDATA(nda)[i];
+    }
+
+    rtn = NDArray_TruncatedNormal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
     NDArray_FREE(nda);
+
     RETURN_NDARRAY(rtn, return_value);
 }
 
