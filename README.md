@@ -4,7 +4,7 @@
 
 <h1 align="center">Rubix NumPower</h1>
 <p align="center">
-<img width="500" height="100" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=100&separator=%3C&lines=use+NumPower;%3C%24arr+%3D+NumPower%3A%3Aarray(%5B%5B1%2C+2%5D%2C+%5B3%2C+4%5D%5D);%3C%24result+%3D+%24arr+*+2;%3Cecho+%24result;" alt="Typing code" />
+<img width="500" height="102" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=102&separator=%3C&lines=use+NumPower;%3C%24arr+%3D+NumPower%3A%3Aarray(%5B%5B1%2C+2%5D%2C+%5B3%2C+4%5D%5D);%3C%24result+%3D+%24arr+*+2;%3Cecho+%24result;" alt="Typing code" />
 </p>
 
 Inspired by NumPy, the NumPower extension was created by Henrique Borba to provide the foundation for efficient scientific computing in PHP, as well as leverage the machine learning tools and libraries that already exist and can benefit from it.
