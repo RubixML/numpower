@@ -77,7 +77,7 @@ NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOpera
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
 void cuda_float_positive(int nblocks, float *d_array);
 void cuda_float_reciprocal(int nblocks, float *d_array);
-
+void cuda_truncated_normal(float* d_data, int size, double loc, double scale);
 #ifdef __cplusplus
 }
 #endif

@@ -46,6 +46,7 @@
 #endif
 
 static zend_object_handlers ndarray_object_handlers;
+static zend_object_handlers numpower_object_handlers;
 static zend_object_handlers arithmetic_object_handlers;
 
 int *
@@ -112,7 +113,7 @@ NDArray* ZVAL_TO_NDARRAY(zval* obj) {
         }
 #endif
     }
-    zend_throw_error(NULL, "argument must be an array, long, double, gdimage or ndarray.");
+    zend_throw_error(NULL, "argument must be an array, long, double, gdimage or NDArray.");
     return NULL;
 }
 
@@ -189,6 +190,11 @@ typedef struct {
     zend_object std;
     int value;
 } NDArrayObject;
+
+typedef struct {
+    zend_object std;
+    int value;
+} NumPowerObject;
 
 static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
     NDArray *nda = ZVAL_TO_NDARRAY(op1);
@@ -288,7 +294,6 @@ int arithmetic_do_operation(zend_uchar opcode, zval *result, zval *op1, zval *op
     return retval;
 }
 
-
 static void ndarray_destructor(zend_object* object) {
     zval *obj_uuid = OBJ_PROP_NUM(object, 0);
     if (GC_REFCOUNT(object) <= 1 && Z_TYPE_P(obj_uuid) != IS_UNDEF) {
@@ -304,6 +309,10 @@ static void ndarray_objects_init(zend_class_entry *class_type) {
     ndarray_object_handlers.free_obj = ndarray_destructor;
 }
 
+static void numpower_objects_init(zend_class_entry *class_type) {
+    memcpy(&numpower_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));\
+}
+
 static void arithmetic_objects_init(zend_class_entry *class_type) {
     memcpy(&arithmetic_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
     arithmetic_object_handlers.do_operation = arithmetic_do_operation;
@@ -316,6 +325,14 @@ static zend_object *ndarray_create_object(zend_class_entry *class_type) {
     object_properties_init(&intern->std, class_type);
     intern->std.handlers = &ndarray_object_handlers;
 
+    return &intern->std;
+}
+
+static zend_object *numpower_create_object(zend_class_entry *class_type) {
+    NumPowerObject *intern = zend_object_alloc(sizeof(NumPowerObject), class_type);
+    zend_object_std_init(&intern->std, class_type);
+    object_properties_init(&intern->std, class_type);
+    intern->std.handlers = &numpower_object_handlers;
     return &intern->std;
 }
 
@@ -415,6 +432,13 @@ PHP_METHOD(ArithmeticOperand, __construct) {
     ZEND_PARSE_PARAMETERS_END();
 }
 
+ZEND_BEGIN_ARG_INFO(arginfo_NumPower_construct, 0)
+ZEND_END_ARG_INFO();
+PHP_METHOD(NumPower, __construct) {
+    zend_object *obj = Z_OBJ_P(ZEND_THIS);
+    ZEND_PARSE_PARAMETERS_START(0, 0)
+    ZEND_PARSE_PARAMETERS_END();
+}
 
 /* }}}*/
 ZEND_BEGIN_ARG_INFO(arginfo_construct, 1)
@@ -574,17 +598,29 @@ PHP_METHOD(NDArray, dump) {
 
 ZEND_BEGIN_ARG_INFO(arginfo_dump_devices, 0)
 ZEND_END_ARG_INFO();
-PHP_METHOD(NDArray, dumpDevices) {
+PHP_METHOD(NumPower, dumpDevices) {
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
     NDArray_DumpDevices();
+}
+
+ZEND_BEGIN_ARG_INFO(arginfo_load, 0)
+    ZEND_ARG_INFO(0, name)
+ZEND_END_ARG_INFO();
+PHP_METHOD(NumPower, load) {
+    zend_string *name;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(name)
+    ZEND_PARSE_PARAMETERS_END();
+    NDArray *rtn = NDArray_Load(name->val);
+    RETURN_NDARRAY(rtn, return_value);
 }
 
 ZEND_BEGIN_ARG_INFO(arginfo_save, 0)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, name)
 ZEND_END_ARG_INFO();
-PHP_METHOD(NDArray, save) {
+PHP_METHOD(NumPower, save) {
     zval *a;
     zend_string *name;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -597,22 +633,10 @@ PHP_METHOD(NDArray, save) {
     RETURN_NULL();
 }
 
-ZEND_BEGIN_ARG_INFO(arginfo_load, 0)
-    ZEND_ARG_INFO(0, a)
-ZEND_END_ARG_INFO();
-PHP_METHOD(NDArray, load) {
-    zend_string *name;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_STR(name)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *rtn = NDArray_Load(name->val);
-    RETURN_NDARRAY(rtn, return_value);
-}
-
 ZEND_BEGIN_ARG_INFO(arginfo_setdevice, 0)
 ZEND_ARG_INFO(0, deviceId)
 ZEND_END_ARG_INFO();
-PHP_METHOD(NDArray, setDevice) {
+PHP_METHOD(NumPower, setDevice) {
     int numDevices;
     long deviceId;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -703,7 +727,7 @@ PHP_FUNCTION(print_r_) {
 }
 
 /**
- * NDArray::zeros
+ * NumPower::zeros
  *
  * @param execute_data
  * @param return_value
@@ -711,7 +735,7 @@ PHP_FUNCTION(print_r_) {
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_zeros, 1)
 ZEND_ARG_INFO(0, shape_zval)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, zeros) {
+PHP_METHOD(NumPower, zeros) {
     NDArray *rtn = NULL;
     int *shape;
     zval *shape_zval;
@@ -732,7 +756,7 @@ PHP_METHOD(NDArray, zeros) {
 }
 
 /**
- * NDArray::equal
+ * NumPower::equal
  *
  * @param execute_data
  * @param return_value
@@ -741,7 +765,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_equal, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, equal) {
+PHP_METHOD(NumPower, equal) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -764,7 +788,7 @@ PHP_METHOD(NDArray, equal) {
 }
 
 /**
- * NDArray::greater
+ * NumPower::greater
  *
  * @param execute_data
  * @param return_value
@@ -773,7 +797,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_greater, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, greater) {
+PHP_METHOD(NumPower, greater) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -796,7 +820,7 @@ PHP_METHOD(NDArray, greater) {
 }
 
 /**
- * NDArray::greaterEqual
+ * NumPower::greaterEqual
  *
  * @param execute_data
  * @param return_value
@@ -805,7 +829,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_greaterequal, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, greaterEqual) {
+PHP_METHOD(NumPower, greaterEqual) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -828,7 +852,7 @@ PHP_METHOD(NDArray, greaterEqual) {
 }
 
 /**
- * NDArray::less
+ * NumPower::less
  *
  * @param execute_data
  * @param return_value
@@ -837,7 +861,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_less, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, less) {
+PHP_METHOD(NumPower, less) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -860,7 +884,7 @@ PHP_METHOD(NDArray, less) {
 }
 
 /**
- * NDArray::lessEqual
+ * NumPower::lessEqual
  *
  * @param execute_data
  * @param return_value
@@ -869,7 +893,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_lessequal, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, lessEqual) {
+PHP_METHOD(NumPower, lessEqual) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -892,7 +916,7 @@ PHP_METHOD(NDArray, lessEqual) {
 }
 
 /**
- * NDArray::notEqual
+ * NumPower::notEqual
  *
  * @param execute_data
  * @param return_value
@@ -901,7 +925,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_notequal, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, notEqual) {
+PHP_METHOD(NumPower, notEqual) {
     NDArray *nda, *ndb, *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -924,7 +948,7 @@ PHP_METHOD(NDArray, notEqual) {
 }
 
 /**
- * NDArray::identity
+ * NumPower::identity
  *
  * @param execute_data
  * @param return_value
@@ -932,7 +956,7 @@ PHP_METHOD(NDArray, notEqual) {
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_identity, 1)
 ZEND_ARG_INFO(0, size)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, identity) {
+PHP_METHOD(NumPower, identity) {
     NDArray *rtn = NULL;
     int *shape;
     long size;
@@ -944,73 +968,97 @@ PHP_METHOD(NDArray, identity) {
 }
 
 /**
- * NDArray::normal
+ * NumPower::normal
  *
  * @param execute_data
  * @param return_value
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_normal, 0, 0, 1)
-ZEND_ARG_INFO(0, size)
-ZEND_ARG_INFO(0, loc)
-ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, loc)
+    ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, accelerator)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, normal) {
+PHP_METHOD(NumPower, normal) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
+    long accelerator = NDARRAY_DEVICE_CPU;
     double loc = 0.0, scale = 1.0;
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-    Z_PARAM_ZVAL(size)
+    
+    ZEND_PARSE_PARAMETERS_START(1, 4)
+        Z_PARAM_ZVAL(size)
     Z_PARAM_OPTIONAL
-    Z_PARAM_DOUBLE(loc)
-    Z_PARAM_DOUBLE(scale)
+        Z_PARAM_DOUBLE(loc)
+        Z_PARAM_DOUBLE(scale)
+        Z_PARAM_LONG(accelerator)
     ZEND_PARSE_PARAMETERS_END();
+    
+    int accelerator_i = (int) accelerator;
     NDArray *nda = ZVAL_TO_NDARRAY(size);
+    
     if (nda == NULL) return;
+    
     shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
+    
     for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-            shape[i] = (int) NDArray_FDATA(nda)[i];
+        shape[i] = (int) NDArray_FDATA(nda)[i];
     }
-    rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda));
+
+    rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
     NDArray_FREE(nda);
+    
     RETURN_NDARRAY(rtn, return_value);
 }
 
 /**
- * NDArray::truncatedNormal
+ * NumPower::truncatedNormal
  *
  * @param execute_data
  * @param return_value
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_truncated_normal, 0, 0, 1)
-ZEND_ARG_INFO(0, size)
-ZEND_ARG_INFO(0, loc)
-ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, loc)
+    ZEND_ARG_INFO(0, scale)
+    ZEND_ARG_INFO(0, accelerator)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, truncatedNormal) {
+PHP_METHOD(NumPower, truncatedNormal) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
+    long accelerator = NDARRAY_DEVICE_CPU;
     double loc = 0.0, scale = 1.0;
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-    Z_PARAM_ZVAL(size)
+
+    ZEND_PARSE_PARAMETERS_START(1, 4)
+        Z_PARAM_ZVAL(size)
     Z_PARAM_OPTIONAL
-    Z_PARAM_DOUBLE(loc)
-    Z_PARAM_DOUBLE(scale)
+        Z_PARAM_DOUBLE(loc)
+        Z_PARAM_DOUBLE(scale)
+        Z_PARAM_LONG(accelerator)
     ZEND_PARSE_PARAMETERS_END();
+
+    int accelerator_i = (int) accelerator;
     NDArray *nda = ZVAL_TO_NDARRAY(size);
-    if (nda == NULL) return;
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-            shape[i] = (int) NDArray_FDATA(nda)[i];
+
+    if (nda == NULL) {
+        return;
     }
-    rtn = NDArray_TruncatedNormal(loc, scale, shape, NDArray_NUMELEMENTS(nda));
+
+    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
+
+    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
+        shape[i] = (int) NDArray_FDATA(nda)[i];
+    }
+
+    rtn = NDArray_TruncatedNormal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
     NDArray_FREE(nda);
+
     RETURN_NDARRAY(rtn, return_value);
 }
 
 /**
- * NDArray::randomBinomial
+ * NumPower::randomBinomial
  *
  * @param execute_data
  * @param return_value
@@ -1020,7 +1068,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_binomial, 0, 0, 3)
     ZEND_ARG_INFO(0, p)
     ZEND_ARG_INFO(0, n)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, randomBinomial) {
+PHP_METHOD(NumPower, randomBinomial) {
     NDArray *rtn = NULL;
     int *ishape;
     zval* shape;
@@ -1042,7 +1090,7 @@ PHP_METHOD(NDArray, randomBinomial) {
 }
 
 /**
- * NDArray::standardNormal
+ * NumPower::standardNormal
  *
  * @param shape
  */
@@ -1050,7 +1098,7 @@ ZEND_BEGIN_ARG_INFO(arginfo_ndarray_standard_normal, 1)
     ZEND_ARG_ARRAY_INFO(0, shape, 0)
 ZEND_END_ARG_INFO()
 
-PHP_METHOD(NDArray, standardNormal) {
+PHP_METHOD(NumPower, standardNormal) {
     NDArray *rtn = NULL;
     zval* shape;
     HashTable *shape_ht;
@@ -1090,7 +1138,7 @@ PHP_METHOD(NDArray, standardNormal) {
 }
 
 /**
- * NDArray::poisson
+ * NumPower::poisson
  *
  * @param execute_data
  * @param return_value
@@ -1099,7 +1147,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_poisson, 0, 0, 1)
     ZEND_ARG_ARRAY_INFO(0, shape, 0)
     ZEND_ARG_TYPE_INFO(0, lam, IS_DOUBLE, 0)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, poisson) {
+PHP_METHOD(NumPower, poisson) {
     NDArray *rtn = NULL;
     zval* shape;
     HashTable *shape_ht;
@@ -1142,7 +1190,7 @@ PHP_METHOD(NDArray, poisson) {
 }
 
 /**
- * NDArray::poisson
+ * NumPower::uniform
  *
  * @param execute_data
  * @param return_value
@@ -1152,7 +1200,7 @@ ZEND_ARG_INFO(0, size)
 ZEND_ARG_INFO(0, low)
 ZEND_ARG_INFO(0, high)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, uniform) {
+PHP_METHOD(NumPower, uniform) {
     NDArray *rtn = NULL;
     int *shape;
     zval* size;
@@ -1177,7 +1225,7 @@ PHP_METHOD(NDArray, uniform) {
 }
 
 /**
- * NDArray::diag
+ * NumPower::diag
  *
  * @param execute_data
  * @param return_value
@@ -1185,7 +1233,7 @@ PHP_METHOD(NDArray, uniform) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_diag, 0, 0, 1)
 ZEND_ARG_INFO(0, target)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, diag) {
+PHP_METHOD(NumPower, diag) {
     NDArray *rtn = NULL;
     zval* target;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1201,7 +1249,7 @@ PHP_METHOD(NDArray, diag) {
 }
 
 /**
- * NDArray::diag
+ * NumPower::diagonal
  *
  * @param execute_data
  * @param return_value
@@ -1209,7 +1257,7 @@ PHP_METHOD(NDArray, diag) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_diagonal, 0, 0, 1)
 ZEND_ARG_INFO(0, target)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, diagonal) {
+PHP_METHOD(NumPower, diagonal) {
     NDArray *rtn = NULL;
     zval* target;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1225,7 +1273,7 @@ PHP_METHOD(NDArray, diagonal) {
 }
 
 /**
- * NDArray::full
+ * NumPower::full
  *
  * @param execute_data
  * @param return_value
@@ -1234,7 +1282,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_full, 0, 0, 2)
 ZEND_ARG_INFO(0, shape)
 ZEND_ARG_INFO(0, fill_value)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, full) {
+PHP_METHOD(NumPower, full) {
     NDArray *rtn = NULL;
     zval* shape;
     HashTable *shape_ht;
@@ -1277,7 +1325,7 @@ PHP_METHOD(NDArray, full) {
 }
 
 /**
- * NDArray::ones
+ * NumPower::ones
  *
  * @param execute_data
  * @param return_value
@@ -1285,7 +1333,7 @@ PHP_METHOD(NDArray, full) {
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_ones, 1)
 ZEND_ARG_INFO(0, shape_zval)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, ones) {
+PHP_METHOD(NumPower, ones) {
     double *ptr;
     NDArray *rtn = NULL;
     int *shape;
@@ -1304,7 +1352,7 @@ PHP_METHOD(NDArray, ones) {
 }
 
 /**
- * NDArray::arange
+ * NumPower::arange
  *
  * @param execute_data
  * @param return_value
@@ -1314,7 +1362,7 @@ ZEND_ARG_INFO(0, stop)
 ZEND_ARG_INFO(0, start)
 ZEND_ARG_INFO(0, step)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arange) {
+PHP_METHOD(NumPower, arange) {
     NDArray *rtn = NULL;
     double start, stop, step;
     ZEND_PARSE_PARAMETERS_START(1, 3)
@@ -1335,7 +1383,7 @@ PHP_METHOD(NDArray, arange) {
 }
 
 /**
- * NDArray::all
+ * NumPower::all
  *
  * @param execute_data
  * @param return_value
@@ -1344,7 +1392,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_all, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, all) {
+PHP_METHOD(NumPower, all) {
     NDArray *rtn = NULL;
     zval *array;
     long axis;
@@ -1377,7 +1425,7 @@ PHP_METHOD(NDArray, all) {
 }
 
 /**
- * NDArray::allClose
+ * NumPower::allClose
  *
  * @param execute_data
  * @param return_value
@@ -1388,7 +1436,7 @@ ZEND_ARG_INFO(0, b)
 ZEND_ARG_INFO(0, rtol)
 ZEND_ARG_INFO(0, atol)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, allClose) {
+PHP_METHOD(NumPower, allClose) {
     zval *a, *b;
     double rtol = 1e-05, atol = 1e-08;
     int rtn;
@@ -1424,7 +1472,7 @@ PHP_METHOD(NDArray, allClose) {
 }
 
 /**
- * NDArray::transpose
+ * NumPower::transpose
  *
  * @param execute_data
  * @param return_value
@@ -1433,7 +1481,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_transpose, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axes)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, transpose) {
+PHP_METHOD(NumPower, transpose) {
     NDArray *rtn = NULL;
     zval *array, *axes;
     HashTable *axes_ht;
@@ -1473,7 +1521,7 @@ PHP_METHOD(NDArray, transpose) {
 }
 
 /**
- * NDArray::copy
+ * NumPower::copy
  *
  * @param execute_data
  * @param return_value
@@ -1482,7 +1530,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_copy, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, device)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, copy) {
+PHP_METHOD(NumPower, copy) {
     NDArray *rtn = NULL;
     zval *array;
     long device = -1;
@@ -1509,7 +1557,7 @@ PHP_METHOD(NDArray, copy) {
 }
 
 /**
- * NDArray::atleast1d
+ * NumPower::atleast1d
  *
  * @param execute_data
  * @param return_value
@@ -1517,7 +1565,7 @@ PHP_METHOD(NDArray, copy) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_atleast_1d, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, atleast1d) {
+PHP_METHOD(NumPower, atleast1d) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1534,7 +1582,7 @@ PHP_METHOD(NDArray, atleast1d) {
 }
 
 /**
- * NDArray::atleast2d
+ * NumPower::atleast2d
  *
  * @param execute_data
  * @param return_value
@@ -1542,7 +1590,7 @@ PHP_METHOD(NDArray, atleast1d) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_atleast_2d, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, atleast2d) {
+PHP_METHOD(NumPower, atleast2d) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1559,7 +1607,7 @@ PHP_METHOD(NDArray, atleast2d) {
 }
 
 /**
- * NDArray::atleast3d
+ * NumPower::atleast3d
  *
  * @param execute_data
  * @param return_value
@@ -1568,7 +1616,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_atleast_3d, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, atleast3d) {
+PHP_METHOD(NumPower, atleast3d) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1606,7 +1654,7 @@ PHP_METHOD(NDArray, shape) {
 }
 
 /**
- * NDArray::flatten
+ * NumPower::flatten
  *
  * @param execute_data
  * @param return_value
@@ -1614,7 +1662,7 @@ PHP_METHOD(NDArray, shape) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_flat, 0, 0, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, flatten) {
+PHP_METHOD(NumPower, flatten) {
     NDArray *rtn = NULL;
     zval *a;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1630,7 +1678,7 @@ PHP_METHOD(NDArray, flatten) {
 }
 
 /**
- * NDArray::abs
+ * NumPower::abs
  *
  * @param execute_data
  * @param return_value
@@ -1638,7 +1686,7 @@ PHP_METHOD(NDArray, flatten) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_abs, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, abs) {
+PHP_METHOD(NumPower, abs) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1658,7 +1706,7 @@ PHP_METHOD(NDArray, abs) {
 }
 
 /**
- * NDArray::sin
+ * NumPower::sin
  *
  * @param execute_data
  * @param return_value
@@ -1666,7 +1714,7 @@ PHP_METHOD(NDArray, abs) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sin, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sin) {
+PHP_METHOD(NumPower, sin) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1693,7 +1741,7 @@ PHP_METHOD(NDArray, sin) {
 }
 
 /**
- * NDArray::cos
+ * NumPower::cos
  *
  * @param execute_data
  * @param return_value
@@ -1701,7 +1749,7 @@ PHP_METHOD(NDArray, sin) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_cos, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, cos) {
+PHP_METHOD(NumPower, cos) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1728,7 +1776,7 @@ PHP_METHOD(NDArray, cos) {
 }
 
 /**
- * NDArray::sin
+ * NumPower::sin
  *
  * @param execute_data
  * @param return_value
@@ -1736,7 +1784,7 @@ PHP_METHOD(NDArray, cos) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_tan, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, tan) {
+PHP_METHOD(NumPower, tan) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1763,7 +1811,7 @@ PHP_METHOD(NDArray, tan) {
 }
 
 /**
- * NDArray::arcsin
+ * NumPower::arcsin
  *
  * @param execute_data
  * @param return_value
@@ -1771,7 +1819,7 @@ PHP_METHOD(NDArray, tan) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arcsin, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arcsin) {
+PHP_METHOD(NumPower, arcsin) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1798,7 +1846,7 @@ PHP_METHOD(NDArray, arcsin) {
 }
 
 /**
- * NDArray::rsqrt
+ * NumPower::rsqrt
  *
  * @param execute_data
  * @param return_value
@@ -1806,7 +1854,7 @@ PHP_METHOD(NDArray, arcsin) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_rsqrt, 0, 0, 1)
                 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, rsqrt) {
+PHP_METHOD(NumPower, rsqrt) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1833,7 +1881,7 @@ PHP_METHOD(NDArray, rsqrt) {
 }
 
 /**
- * NDArray::arccos
+ * NumPower::arccos
  *
  * @param execute_data
  * @param return_value
@@ -1841,7 +1889,7 @@ PHP_METHOD(NDArray, rsqrt) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arccos, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arccos) {
+PHP_METHOD(NumPower, arccos) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1868,7 +1916,7 @@ PHP_METHOD(NDArray, arccos) {
 }
 
 /**
- * NDArray::arccos
+ * NumPower::arccos
  *
  * @param execute_data
  * @param return_value
@@ -1876,7 +1924,7 @@ PHP_METHOD(NDArray, arccos) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctan, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arctan) {
+PHP_METHOD(NumPower, arctan) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1903,7 +1951,7 @@ PHP_METHOD(NDArray, arctan) {
 }
 
 /**
- * NDArray::arctan2
+ * NumPower::arctan2
  *
  * @param execute_data
  * @param return_value
@@ -1912,7 +1960,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctan2, 0, 0, 2)
     ZEND_ARG_INFO(0, x)
     ZEND_ARG_INFO(0, y)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arctan2) {
+PHP_METHOD(NumPower, arctan2) {
     NDArray *rtn = NULL;
     zval *x, *y;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -1940,7 +1988,7 @@ PHP_METHOD(NDArray, arctan2) {
 }
 
 /**
- * NDArray::degrees
+ * NumPower::degrees
  *
  * @param execute_data
  * @param return_value
@@ -1948,7 +1996,7 @@ PHP_METHOD(NDArray, arctan2) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_degrees, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, degrees) {
+PHP_METHOD(NumPower, degrees) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -1975,7 +2023,7 @@ PHP_METHOD(NDArray, degrees) {
 }
 
 /**
- * NDArray::sinh
+ * NumPower::sinh
  *
  * @param execute_data
  * @param return_value
@@ -1983,7 +2031,7 @@ PHP_METHOD(NDArray, degrees) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sinh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sinh) {
+PHP_METHOD(NumPower, sinh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2010,7 +2058,7 @@ PHP_METHOD(NDArray, sinh) {
 }
 
 /**
- * NDArray::cosh
+ * NumPower::cosh
  *
  * @param execute_data
  * @param return_value
@@ -2018,7 +2066,7 @@ PHP_METHOD(NDArray, sinh) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_cosh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, cosh) {
+PHP_METHOD(NumPower, cosh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2045,7 +2093,7 @@ PHP_METHOD(NDArray, cosh) {
 }
 
 /**
- * NDArray::tanh
+ * NumPower::tanh
  *
  * @param execute_data
  * @param return_value
@@ -2053,7 +2101,7 @@ PHP_METHOD(NDArray, cosh) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_tanh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, tanh) {
+PHP_METHOD(NumPower, tanh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2080,7 +2128,7 @@ PHP_METHOD(NDArray, tanh) {
 }
 
 /**
- * NDArray::arcsinh
+ * NumPower::arcsinh
  *
  * @param execute_data
  * @param return_value
@@ -2088,7 +2136,7 @@ PHP_METHOD(NDArray, tanh) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arcsinh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arcsinh) {
+PHP_METHOD(NumPower, arcsinh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2115,7 +2163,7 @@ PHP_METHOD(NDArray, arcsinh) {
 }
 
 /**
- * NDArray::arccosh
+ * NumPower::arccosh
  *
  * @param execute_data
  * @param return_value
@@ -2123,7 +2171,7 @@ PHP_METHOD(NDArray, arcsinh) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arccosh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arccosh) {
+PHP_METHOD(NumPower, arccosh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2150,7 +2198,7 @@ PHP_METHOD(NDArray, arccosh) {
 }
 
 /**
- * NDArray::fromImage
+ * NumPower::fromImage
  *
  * @param execute_data
  * @param return_value
@@ -2159,7 +2207,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_fromimage, 0, 0, 1)
     ZEND_ARG_INFO(0, image)
     ZEND_ARG_INFO(0, channelLast)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, fromImage) {
+PHP_METHOD(NumPower, fromImage) {
     NDArray *rtn = NULL;
     zval *image;
     bool channelLast = true;
@@ -2173,7 +2221,7 @@ PHP_METHOD(NDArray, fromImage) {
 }
 
 /**
- * NDArray::arctanh
+ * NumPower::arctanh
  *
  * @param execute_data
  * @param return_value
@@ -2181,7 +2229,7 @@ PHP_METHOD(NDArray, fromImage) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctanh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, arctanh) {
+PHP_METHOD(NumPower, arctanh) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2208,7 +2256,7 @@ PHP_METHOD(NDArray, arctanh) {
 }
 
 /**
- * NDArray::rint
+ * NumPower::rint
  *
  * @param execute_data
  * @param return_value
@@ -2216,7 +2264,7 @@ PHP_METHOD(NDArray, arctanh) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_rint, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, rint) {
+PHP_METHOD(NumPower, rint) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2243,7 +2291,7 @@ PHP_METHOD(NDArray, rint) {
 }
 
 /**
- * NDArray::fix
+ * NumPower::fix
  *
  * @param execute_data
  * @param return_value
@@ -2251,7 +2299,7 @@ PHP_METHOD(NDArray, rint) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_fix, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, fix) {
+PHP_METHOD(NumPower, fix) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2278,7 +2326,7 @@ PHP_METHOD(NDArray, fix) {
 }
 
 /**
- * NDArray::trunc
+ * NumPower::trunc
  *
  * @param execute_data
  * @param return_value
@@ -2286,7 +2334,7 @@ PHP_METHOD(NDArray, fix) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_trunc, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, trunc) {
+PHP_METHOD(NumPower, trunc) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2313,7 +2361,7 @@ PHP_METHOD(NDArray, trunc) {
 }
 
 /**
- * NDArray::sinc
+ * NumPower::sinc
  *
  * @param execute_data
  * @param return_value
@@ -2321,7 +2369,7 @@ PHP_METHOD(NDArray, trunc) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sinc, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sinc) {
+PHP_METHOD(NumPower, sinc) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2348,7 +2396,7 @@ PHP_METHOD(NDArray, sinc) {
 }
 
 /**
- * NDArray::negative
+ * NumPower::negative
  *
  * @param execute_data
  * @param return_value
@@ -2356,7 +2404,7 @@ PHP_METHOD(NDArray, sinc) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_negative, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, negative) {
+PHP_METHOD(NumPower, negative) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2383,7 +2431,7 @@ PHP_METHOD(NDArray, negative) {
 }
 
 /**
- * NDArray::positive
+ * NumPower::positive
  *
  * @param execute_data
  * @param return_value
@@ -2391,7 +2439,7 @@ PHP_METHOD(NDArray, negative) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_positive, 0, 0, 1)
     ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, positive) {
+PHP_METHOD(NumPower, positive) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2418,7 +2466,7 @@ PHP_METHOD(NDArray, positive) {
 }
 
 /**
- * NDArray::reciprocal
+ * NumPower::reciprocal
  *
  * @param execute_data
  * @param return_value
@@ -2426,7 +2474,7 @@ PHP_METHOD(NDArray, positive) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_reciprocal, 0, 0, 1)
     ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, reciprocal) {
+PHP_METHOD(NumPower, reciprocal) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2454,7 +2502,7 @@ PHP_METHOD(NDArray, reciprocal) {
 
 
 /**
- * NDArray::sign
+ * NumPower::sign
  *
  * @param execute_data
  * @param return_value
@@ -2462,7 +2510,7 @@ PHP_METHOD(NDArray, reciprocal) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sign, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sign) {
+PHP_METHOD(NumPower, sign) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2489,7 +2537,7 @@ PHP_METHOD(NDArray, sign) {
 }
 
 /**
- * NDArray::clip
+ * NumPower::clip
  *
  * @param execute_data
  * @param return_value
@@ -2499,7 +2547,7 @@ ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, min)
 ZEND_ARG_INFO(0, max)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, clip) {
+PHP_METHOD(NumPower, clip) {
     NDArray *rtn = NULL;
     zval *array;
     double min, max;
@@ -2532,7 +2580,7 @@ PHP_METHOD(NDArray, clip) {
 }
 
 /**
- * NDArray::maximum
+ * NumPower::maximum
  *
  * @param execute_data
  * @param return_value
@@ -2541,7 +2589,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_maximum, 0, 0, 1)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, maximum) {
+PHP_METHOD(NumPower, maximum) {
     NDArray *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -2562,7 +2610,7 @@ PHP_METHOD(NDArray, maximum) {
 }
 
 /**
- * NDArray::minimum
+ * NumPower::minimum
  *
  * @param execute_data
  * @param return_value
@@ -2571,7 +2619,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_minimum, 0, 0, 1)
         ZEND_ARG_INFO(0, a)
         ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, minimum) {
+PHP_METHOD(NumPower, minimum) {
     NDArray *rtn = NULL;
     zval *a, *b;
     ZEND_PARSE_PARAMETERS_START(2, 2)
@@ -2593,7 +2641,7 @@ PHP_METHOD(NDArray, minimum) {
 
 
 /**
- * NDArray::argmax
+ * NumPower::argmax
  *
  * @param execute_data
  * @param return_value
@@ -2603,7 +2651,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_argmax, 0, 0, 1)
     ZEND_ARG_INFO(0, axis)
     ZEND_ARG_INFO(0, keepdims)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, argmax) {
+PHP_METHOD(NumPower, argmax) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -2628,7 +2676,7 @@ PHP_METHOD(NDArray, argmax) {
 }
 
 /**
- * NDArray::argmin
+ * NumPower::argmin
  *
  * @param execute_data
  * @param return_value
@@ -2638,7 +2686,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_argmin, 0, 0, 1)
     ZEND_ARG_INFO(0, axis)
     ZEND_ARG_INFO(0, keepdims)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, argmin) {
+PHP_METHOD(NumPower, argmin) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -2663,7 +2711,7 @@ PHP_METHOD(NDArray, argmin) {
 }
 
 /**
- * NDArray::mean
+ * NumPower::mean
  *
  * @param execute_data
  * @param return_value
@@ -2672,7 +2720,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_mean, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, mean) {
+PHP_METHOD(NumPower, mean) {
     NDArray *rtn = NULL;
     zval *array;
     long axis;
@@ -2721,7 +2769,7 @@ PHP_METHOD(NDArray, mean) {
 }
 
 /**
- * NDArray::median
+ * NumPower::median
  *
  * @param execute_data
  * @param return_value
@@ -2730,7 +2778,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_median, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, median) {
+PHP_METHOD(NumPower, median) {
     NDArray *rtn = NULL;
     zval *array;
     long axis;
@@ -2764,7 +2812,7 @@ PHP_METHOD(NDArray, median) {
 }
 
 /**
- * NDArray::std
+ * NumPower::std
  *
  * @param execute_data
  * @param return_value
@@ -2773,7 +2821,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_std, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, std) {
+PHP_METHOD(NumPower, std) {
     NDArray *rtn = NULL;
     zval *array;
     long axis;
@@ -2810,7 +2858,7 @@ PHP_METHOD(NDArray, std) {
 }
 
 /**
- * NDArray::quantile
+ * NumPower::quantile
  *
  * @param execute_data
  * @param return_value
@@ -2818,7 +2866,7 @@ PHP_METHOD(NDArray, std) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_quantile, 0, 0, 1)
 ZEND_ARG_INFO(0, target)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, quantile) {
+PHP_METHOD(NumPower, quantile) {
     NDArray *rtn = NULL;
     zval *a, *q;
     long axis;
@@ -2845,7 +2893,7 @@ PHP_METHOD(NDArray, quantile) {
 }
 
 /**
- * NDArray::std
+ * NumPower::std
  *
  * @param execute_data
  * @param return_value
@@ -2854,7 +2902,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_average, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, weights)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, average) {
+PHP_METHOD(NumPower, average) {
     NDArray *rtn = NULL;
     zval *array, *weights = NULL;
     long axis;
@@ -2882,7 +2930,7 @@ PHP_METHOD(NDArray, average) {
 }
 
 /**
- * NDArray::variance
+ * NumPower::variance
  *
  * @param execute_data
  * @param return_value
@@ -2891,7 +2939,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_variance, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, variance) {
+PHP_METHOD(NumPower, variance) {
     NDArray *rtn = NULL;
     zval *array;
     long axis;
@@ -2928,7 +2976,7 @@ PHP_METHOD(NDArray, variance) {
 }
 
 /**
- * NDArray::ceil
+ * NumPower::ceil
  *
  * @param execute_data
  * @param return_value
@@ -2936,7 +2984,7 @@ PHP_METHOD(NDArray, variance) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_ceil, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, ceil) {
+PHP_METHOD(NumPower, ceil) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -2963,7 +3011,7 @@ PHP_METHOD(NDArray, ceil) {
 }
 
 /**
- * NDArray::round
+ * NumPower::round
  *
  * @param execute_data
  * @param return_value
@@ -2972,7 +3020,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_round, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, precision)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, round) {
+PHP_METHOD(NumPower, round) {
     NDArray *rtn = NULL;
     zval *array;
     long precision;
@@ -3001,7 +3049,7 @@ PHP_METHOD(NDArray, round) {
 }
 
 /**
- * NDArray::floor
+ * NumPower::floor
  *
  * @param execute_data
  * @param return_value
@@ -3009,7 +3057,7 @@ PHP_METHOD(NDArray, round) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_floor, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, floor) {
+PHP_METHOD(NumPower, floor) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3036,7 +3084,7 @@ PHP_METHOD(NDArray, floor) {
 }
 
 /**
- * NDArray::arccos
+ * NumPower::arccos
  *
  * @param execute_data
  * @param return_value
@@ -3044,7 +3092,7 @@ PHP_METHOD(NDArray, floor) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_radians, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, radians) {
+PHP_METHOD(NumPower, radians) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3071,7 +3119,7 @@ PHP_METHOD(NDArray, radians) {
 }
 
 /**
- * NDArray::sqrt
+ * NumPower::sqrt
  *
  * @param execute_data
  * @param return_value
@@ -3079,7 +3127,7 @@ PHP_METHOD(NDArray, radians) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sqrt, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sqrt) {
+PHP_METHOD(NumPower, sqrt) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3105,7 +3153,7 @@ PHP_METHOD(NDArray, sqrt) {
 }
 
 /**
- * NDArray::sqrt
+ * NumPower::sqrt
  *
  * @param execute_data
  * @param return_value
@@ -3113,7 +3161,7 @@ PHP_METHOD(NDArray, sqrt) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_square, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, square) {
+PHP_METHOD(NumPower, square) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3131,7 +3179,7 @@ PHP_METHOD(NDArray, square) {
 }
 
 /**
- * NDArray::exp
+ * NumPower::exp
  *
  * @param execute_data
  * @param return_value
@@ -3139,7 +3187,7 @@ PHP_METHOD(NDArray, square) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_exp, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, exp) {
+PHP_METHOD(NumPower, exp) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3165,7 +3213,7 @@ PHP_METHOD(NDArray, exp) {
 }
 
 /**
- * NDArray::exp2
+ * NumPower::exp2
  *
  * @param execute_data
  * @param return_value
@@ -3173,7 +3221,7 @@ PHP_METHOD(NDArray, exp) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_exp2, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, exp2) {
+PHP_METHOD(NumPower, exp2) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3191,7 +3239,7 @@ PHP_METHOD(NDArray, exp2) {
 }
 
 /**
- * NDArray::exp2
+ * NumPower::exp2
  *
  * @param execute_data
  * @param return_value
@@ -3199,7 +3247,7 @@ PHP_METHOD(NDArray, exp2) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_expm1, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, expm1) {
+PHP_METHOD(NumPower, expm1) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3226,7 +3274,7 @@ PHP_METHOD(NDArray, expm1) {
 }
 
 /**
- * NDArray::log
+ * NumPower::log
  *
  * @param execute_data
  * @param return_value
@@ -3234,7 +3282,7 @@ PHP_METHOD(NDArray, expm1) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, log) {
+PHP_METHOD(NumPower, log) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3260,7 +3308,7 @@ PHP_METHOD(NDArray, log) {
 }
 
 /**
- * NDArray::logb
+ * NumPower::logb
  *
  * @param execute_data
  * @param return_value
@@ -3268,7 +3316,7 @@ PHP_METHOD(NDArray, log) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_logb, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, logb) {
+PHP_METHOD(NumPower, logb) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3292,7 +3340,7 @@ PHP_METHOD(NDArray, logb) {
 }
 
 /**
- * NDArray::log10
+ * NumPower::log10
  *
  * @param execute_data
  * @param return_value
@@ -3300,7 +3348,7 @@ PHP_METHOD(NDArray, logb) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log10, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, log10) {
+PHP_METHOD(NumPower, log10) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3324,7 +3372,7 @@ PHP_METHOD(NDArray, log10) {
 }
 
 /**
- * NDArray::log1p
+ * NumPower::log1p
  *
  * @param execute_data
  * @param return_value
@@ -3332,7 +3380,7 @@ PHP_METHOD(NDArray, log10) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log1p, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, log1p) {
+PHP_METHOD(NumPower, log1p) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3356,7 +3404,7 @@ PHP_METHOD(NDArray, log1p) {
 }
 
 /**
- * NDArray::log1p
+ * NumPower::log1p
  *
  * @param execute_data
  * @param return_value
@@ -3364,7 +3412,7 @@ PHP_METHOD(NDArray, log1p) {
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log2, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, log2) {
+PHP_METHOD(NumPower, log2) {
     NDArray *rtn = NULL;
     zval *array;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -3388,13 +3436,13 @@ PHP_METHOD(NDArray, log2) {
 }
 
 /**
- * NDArray::subtract
+ * NumPower::subtract
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_subtract, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, subtract) {
+PHP_METHOD(NumPower, subtract) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3421,13 +3469,13 @@ PHP_METHOD(NDArray, subtract) {
 }
 
 /**
- * NDArray::mod
+ * NumPower::mod
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_mod, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, mod) {
+PHP_METHOD(NumPower, mod) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3454,13 +3502,13 @@ PHP_METHOD(NDArray, mod) {
 }
 
 /**
- * NDArray::pow
+ * NumPower::pow
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_pow, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, pow) {
+PHP_METHOD(NumPower, pow) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3488,13 +3536,13 @@ PHP_METHOD(NDArray, pow) {
 }
 
 /**
- * NDArray::multiply
+ * NumPower::multiply
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_multiply, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, multiply) {
+PHP_METHOD(NumPower, multiply) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3522,13 +3570,13 @@ PHP_METHOD(NDArray, multiply) {
 }
 
 /**
- * NDArray::divide
+ * NumPower::divide
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_divide, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, divide) {
+PHP_METHOD(NumPower, divide) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3554,13 +3602,13 @@ PHP_METHOD(NDArray, divide) {
 }
 
 /**
- * NDArray::add
+ * NumPower::add
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_add, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, add) {
+PHP_METHOD(NumPower, add) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -3587,13 +3635,13 @@ PHP_METHOD(NDArray, add) {
 }
 
 /**
-* NDArray::expandDims
+* NumPower::expandDims
 */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_expand_dims, 0)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, expandDims) {
+PHP_METHOD(NumPower, expandDims) {
     NDArray *rtn = NULL;
     zval *a;
     zval *axis;
@@ -3622,13 +3670,13 @@ PHP_METHOD(NDArray, expandDims) {
 }
 
 /**
-* NDArray::squeeze
+* NumPower::squeeze
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_squeeze, 0, 0, 1)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, squeeze) {
+PHP_METHOD(NumPower, squeeze) {
     NDArray *rtn = NULL, *ndaxis = NULL;
     zval *a;
     zval *axis;
@@ -3659,13 +3707,13 @@ PHP_METHOD(NDArray, squeeze) {
 }
 
 /**
-* NDArray::flip
+* NumPower::flip
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_flip, 0, 0, 1)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, flip) {
+PHP_METHOD(NumPower, flip) {
     NDArray *rtn = NULL;
     zval *a;
     zval *axis = NULL;
@@ -3694,14 +3742,14 @@ PHP_METHOD(NDArray, flip) {
 }
 
 /**
-* NDArray::swapAxes
+* NumPower::swapAxes
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_swapaxes, 0, 0, 3)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, axis1)
     ZEND_ARG_INFO(0, axis2)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, swapAxes) {
+PHP_METHOD(NumPower, swapAxes) {
     NDArray *rtn = NULL;
     zval *a;
     long axis1, axis2;
@@ -3726,14 +3774,14 @@ PHP_METHOD(NDArray, swapAxes) {
 }
 
 /**
-* NDArray::rollAxis
+* NumPower::rollAxis
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_rollaxis, 0, 0, 2)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, axis)
     ZEND_ARG_INFO(0, start)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, rollAxis) {
+PHP_METHOD(NumPower, rollAxis) {
     NDArray *rtn = NULL;
     zval *a;
     long axis, start = 0;
@@ -3759,14 +3807,14 @@ PHP_METHOD(NDArray, rollAxis) {
 }
 
 /**
-* NDArray::moveAxis
+* NumPower::moveAxis
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_moveaxis, 0, 0, 3)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, source)
 ZEND_ARG_INFO(0, destination)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, moveAxis) {
+PHP_METHOD(NumPower, moveAxis) {
     NDArray *rtn = NULL;
     zval *a;
     zval *source, *destination;
@@ -3798,12 +3846,12 @@ PHP_METHOD(NDArray, moveAxis) {
 }
 
 /**
-* NDArray::verticalStack
+* NumPower::verticalStack
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_vstack, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, verticalStack) {
+PHP_METHOD(NumPower, verticalStack) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -3822,12 +3870,12 @@ PHP_METHOD(NDArray, verticalStack) {
 }
 
 /**
-* NDArray::horizontalStack
+* NumPower::horizontalStack
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_hstack, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, horizontalStack) {
+PHP_METHOD(NumPower, horizontalStack) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -3846,12 +3894,12 @@ PHP_METHOD(NDArray, horizontalStack) {
 }
 
 /**
-* NDArray::depthStack
+* NumPower::depthStack
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_dstack, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, depthStack) {
+PHP_METHOD(NumPower, depthStack) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -3870,12 +3918,12 @@ PHP_METHOD(NDArray, depthStack) {
 }
 
 /**
-* NDArray::columnStack
+* NumPower::columnStack
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_column_stack, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, columnStack) {
+PHP_METHOD(NumPower, columnStack) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -3894,13 +3942,13 @@ PHP_METHOD(NDArray, columnStack) {
 }
 
 /**
-* NDArray::concatenate
+* NumPower::concatenate
 */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_concatenate, 0, 0, 1)
     ZEND_ARG_INFO(0, arrays)
     ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, concatenate) {
+PHP_METHOD(NumPower, concatenate) {
     NDArray *rtn = NULL;
     zval *arrays;
     int num_args;
@@ -3931,14 +3979,14 @@ PHP_METHOD(NDArray, concatenate) {
 }
 
 /**
- * NDArray::append
+ * NumPower::append
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_append, 0, 0, 2)
     ZEND_ARG_INFO(0, array)
     ZEND_ARG_INFO(0, values)
     ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-    PHP_METHOD(NDArray, append) {
+    PHP_METHOD(NumPower, append) {
     NDArray *rtn = NULL;
     int num_args;
     zval *axis = NULL, *array, *values;
@@ -3967,13 +4015,13 @@ ZEND_END_ARG_INFO()
 }
 
 /**
- * NDArray::matmul
+ * NumPower::matmul
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_matmul, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, matmul) {
+PHP_METHOD(NumPower, matmul) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4000,13 +4048,13 @@ PHP_METHOD(NDArray, matmul) {
 }
 
 /**
- * NDArray::inner
+ * NumPower::inner
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_inner, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, inner) {
+PHP_METHOD(NumPower, inner) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4031,13 +4079,13 @@ PHP_METHOD(NDArray, inner) {
 }
 
 /**
- * NDArray::outer
+ * NumPower::outer
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_outer, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, outer) {
+PHP_METHOD(NumPower, outer) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4062,13 +4110,13 @@ PHP_METHOD(NDArray, outer) {
 }
 
 /**
- * NDArray::dot
+ * NumPower::dot
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_dot, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, dot) {
+PHP_METHOD(NumPower, dot) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4092,12 +4140,12 @@ PHP_METHOD(NDArray, dot) {
 }
 
 /**
- * NDArray::trace
+ * NumPower::trace
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_trace, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, trace) {
+PHP_METHOD(NumPower, trace) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4117,12 +4165,12 @@ PHP_METHOD(NDArray, trace) {
 }
 
 /**
- * NDArray::eig
+ * NumPower::eig
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_eig, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, eig) {
+PHP_METHOD(NumPower, eig) {
     NDArray **rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4144,12 +4192,12 @@ PHP_METHOD(NDArray, eig) {
 }
 
 /**
- * NDArray::cholesky
+ * NumPower::cholesky
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_cholesky, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, cholesky) {
+PHP_METHOD(NumPower, cholesky) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4169,13 +4217,13 @@ PHP_METHOD(NDArray, cholesky) {
 }
 
 /**
- * NDArray::solve
+ * NumPower::solve
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_solve, 2)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, solve) {
+PHP_METHOD(NumPower, solve) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4201,13 +4249,13 @@ PHP_METHOD(NDArray, solve) {
 }
 
 /**
- * NDArray::lstsq
+ * NumPower::lstsq
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_lstsq, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, lstsq) {
+PHP_METHOD(NumPower, lstsq) {
     NDArray *rtn = NULL;
     zval *a, *b;
     long axis;
@@ -4232,12 +4280,12 @@ PHP_METHOD(NDArray, lstsq) {
 }
 
 /**
- * NDArray::qr
+ * NumPower::qr
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_qr, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, qr) {
+PHP_METHOD(NumPower, qr) {
     NDArray **rtns;
     zval *a, *b;
     long axis;
@@ -4256,12 +4304,12 @@ PHP_METHOD(NDArray, qr) {
 }
 
 /**
- * NDArray::lu
+ * NumPower::lu
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_lu, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, lu) {
+PHP_METHOD(NumPower, lu) {
     NDArray **rtns;
     zval *a, *b;
     long axis;
@@ -4284,12 +4332,12 @@ PHP_METHOD(NDArray, lu) {
 }
 
 /**
- * NDArray::matrixRank
+ * NumPower::matrixRank
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_matrix_rank, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, matrixRank) {
+PHP_METHOD(NumPower, matrixRank) {
     NDArray *rtn;
     zval *a, *b;
     long axis;
@@ -4317,13 +4365,13 @@ PHP_METHOD(NDArray, matrixRank) {
 
 
 /**
- * NDArray::dnnConv2dForward
+ * NumPower::dnnConv2dForward
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_dnn_conv2d_forward, 4, 0, 1)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, dnnConv2dForward) {
+PHP_METHOD(NumPower, dnnConv2dForward) {
     NDArray *rtn;
     NDArray *ndb = NULL;
     zval *input, *filters;
@@ -4344,13 +4392,13 @@ PHP_METHOD(NDArray, dnnConv2dForward) {
 }
 
 /**
- * NDArray::dnnConv1dForward
+ * NumPower::dnnConv1dForward
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_dnn_conv1d_forward, 4, 0, 1)
                 ZEND_ARG_INFO(0, a)
                 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, dnnConv1dForward) {
+PHP_METHOD(NumPower, dnnConv1dForward) {
     NDArray *rtn;
     NDArray *ndb = NULL;
     zval *input, *filters;
@@ -4371,14 +4419,14 @@ PHP_METHOD(NDArray, dnnConv1dForward) {
 }
 
 /**
- * NDArray::dnnConv2dBackward
+ * NumPower::dnnConv2dBackward
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_dnn_conv2d_backward, 3, 0, 1)
 ZEND_ARG_INFO(0, x)
 ZEND_ARG_INFO(0, y)
 ZEND_ARG_INFO(0, filters)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, dnnConv2dBackward) {
+PHP_METHOD(NumPower, dnnConv2dBackward) {
     NDArray **rtn;
     zval *x, *y, *filters;
     ZEND_PARSE_PARAMETERS_START(3, 3)
@@ -4400,7 +4448,7 @@ PHP_METHOD(NDArray, dnnConv2dBackward) {
 }
 
 /**
- * NDArray::convolve2d
+ * NumPower::convolve2d
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_convolve2d, 4, 0, 1)
 ZEND_ARG_INFO(0, a)
@@ -4409,7 +4457,7 @@ ZEND_ARG_INFO(0, mode)
 ZEND_ARG_INFO(0, boundary)
 ZEND_ARG_INFO(0, fill_value)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, convolve2d) {
+PHP_METHOD(NumPower, convolve2d) {
     NDArray *rtn;
     zval *a, *b;
     char *mode, *boundary;
@@ -4461,7 +4509,7 @@ PHP_METHOD(NDArray, convolve2d) {
 }
 
 /**
- * NDArray::correlate2d
+ * NumPower::correlate2d
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_correlate2d, 4, 0, 1)
     ZEND_ARG_INFO(0, a)
@@ -4470,7 +4518,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_correlate2d, 4, 0, 1)
     ZEND_ARG_INFO(0, boundary)
     ZEND_ARG_INFO(0, fill_value)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, correlate2d) {
+PHP_METHOD(NumPower, correlate2d) {
     NDArray *rtn;
     zval *a, *b;
     char *mode, *boundary;
@@ -4522,13 +4570,13 @@ PHP_METHOD(NDArray, correlate2d) {
 }
 
 /**
- * NDArray::norm
+ * NumPower::norm
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_norm, 2, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, order)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, norm) {
+PHP_METHOD(NumPower, norm) {
     NDArray *rtn;
     zval *a;
     long order = 2;
@@ -4549,12 +4597,12 @@ PHP_METHOD(NDArray, norm) {
 }
 
 /**
- * NDArray::cond
+ * NumPower::cond
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_cond, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, cond) {
+PHP_METHOD(NumPower, cond) {
     NDArray *rtn;
     zval *a;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -4573,12 +4621,12 @@ PHP_METHOD(NDArray, cond) {
 }
 
 /**
- * NDArray::inv
+ * NumPower::inv
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_inv, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, inv) {
+PHP_METHOD(NumPower, inv) {
     NDArray *rtn;
     zval *a, *b;
     long axis;
@@ -4597,12 +4645,12 @@ PHP_METHOD(NDArray, inv) {
 }
 
 /**
- * NDArray::svd
+ * NumPower::svd
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_svd, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, svd) {
+PHP_METHOD(NumPower, svd) {
     NDArray **rtns;
     zval *a, *b;
     long axis;
@@ -4623,12 +4671,12 @@ PHP_METHOD(NDArray, svd) {
 }
 
 /**
- * NDArray::det
+ * NumPower::det
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_det, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, det) {
+PHP_METHOD(NumPower, det) {
     NDArray *rtn, *nda;
     zval *a;
     ZEND_PARSE_PARAMETERS_START(1, 1)
@@ -4644,13 +4692,13 @@ PHP_METHOD(NDArray, det) {
 }
 
 /**
- * NDArray::sum
+ * NumPower::sum
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sum, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, sum) {
+PHP_METHOD(NumPower, sum) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -4678,13 +4726,13 @@ PHP_METHOD(NDArray, sum) {
 }
 
 /**
- * NDArray::min
+ * NumPower::min
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_min, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, min) {
+PHP_METHOD(NumPower, min) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -4713,13 +4761,13 @@ PHP_METHOD(NDArray, min) {
 }
 
 /**
- * NDArray::max
+ * NumPower::max
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_max, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, max) {
+PHP_METHOD(NumPower, max) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -4755,7 +4803,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_prod, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, prod) {
+PHP_METHOD(NumPower, prod) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -4786,7 +4834,7 @@ PHP_METHOD(NDArray, prod) {
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_array, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, array) {
+PHP_METHOD(NumPower, array) {
     NDArray *rtn = NULL;
     zval *a;
     long axis;
@@ -5064,166 +5112,165 @@ static const zend_function_entry class_arithmetic_methods[] = {
     PHP_FE_END
 };
 
+static const zend_function_entry class_NumPower_methods[] = {
+    ZEND_ME(NumPower, __construct, arginfo_NumPower_construct, ZEND_ACC_PUBLIC)
+
+    // EXTREMA
+    ZEND_ME(NumPower, min, arginfo_ndarray_min, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, max, arginfo_ndarray_max, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, maximum, arginfo_ndarray_maximum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, minimum, arginfo_ndarray_minimum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, argmax, arginfo_ndarray_argmax, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, argmin, arginfo_ndarray_argmin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // MANIPULATION
+    ZEND_ME(NumPower, copy, arginfo_ndarray_copy, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, flatten, arginfo_ndarray_flat, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, atleast1d, arginfo_ndarray_atleast_1d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, atleast2d, arginfo_ndarray_atleast_2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, atleast3d, arginfo_ndarray_atleast_3d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, transpose, arginfo_ndarray_transpose, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, append, arginfo_ndarray_append, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, expandDims, arginfo_ndarray_expand_dims, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, squeeze, arginfo_ndarray_squeeze, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, flip, arginfo_ndarray_flip, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, swapAxes, arginfo_ndarray_swapaxes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, rollAxis, arginfo_ndarray_rollaxis, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, moveAxis, arginfo_ndarray_moveaxis, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, verticalStack, arginfo_ndarray_vstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, horizontalStack, arginfo_ndarray_hstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, depthStack, arginfo_ndarray_dstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, columnStack, arginfo_ndarray_column_stack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, concatenate, arginfo_ndarray_concatenate, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // INDEXING
+    ZEND_ME(NumPower, diagonal, arginfo_ndarray_diagonal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // INITIALIZERS
+    ZEND_ME(NumPower, zeros, arginfo_ndarray_zeros, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, ones, arginfo_ndarray_ones, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arange, arginfo_ndarray_arange, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, identity, arginfo_ndarray_identity, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, diag, arginfo_ndarray_diag, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, full, arginfo_ndarray_full, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, array, arginfo_ndarray_array, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, fromImage, arginfo_ndarray_fromimage, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // RANDOM
+    ZEND_ME(NumPower, normal, arginfo_ndarray_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, truncatedNormal, arginfo_ndarray_truncated_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, standardNormal, arginfo_ndarray_standard_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, poisson, arginfo_ndarray_poisson, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, uniform, arginfo_ndarray_uniform, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, randomBinomial, arginfo_ndarray_binomial, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // LINALG
+    ZEND_ME(NumPower, matmul, arginfo_ndarray_matmul, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, svd, arginfo_ndarray_svd, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, det, arginfo_ndarray_det, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, dot, arginfo_ndarray_dot, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, inner, arginfo_ndarray_inner, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, outer, arginfo_ndarray_outer, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, cholesky, arginfo_ndarray_cholesky, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, qr, arginfo_ndarray_qr, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, eig, arginfo_ndarray_eig, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, cond, arginfo_ndarray_cond, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, norm, arginfo_ndarray_norm, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, trace, arginfo_ndarray_trace, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, solve, arginfo_ndarray_solve, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, inv, arginfo_ndarray_inv, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, lstsq, arginfo_ndarray_lstsq, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, lu, arginfo_ndarray_lu, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, matrixRank, arginfo_ndarray_matrix_rank, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, convolve2d, arginfo_ndarray_convolve2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, correlate2d, arginfo_ndarray_correlate2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // DNN
+    ZEND_ME(NumPower, dnnConv2dForward, arginfo_ndarray_dnn_conv2d_forward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, dnnConv2dBackward, arginfo_ndarray_dnn_conv2d_backward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, dnnConv1dForward, arginfo_ndarray_dnn_conv1d_forward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // LOGIC
+    ZEND_ME(NumPower, all, arginfo_ndarray_all, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, allClose, arginfo_ndarray_allclose, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, equal, arginfo_ndarray_equal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, greater, arginfo_ndarray_greater, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, greaterEqual, arginfo_ndarray_greaterequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, less, arginfo_ndarray_less, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, lessEqual, arginfo_ndarray_lessequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, notEqual, arginfo_ndarray_notequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // MATH
+    ZEND_ME(NumPower, abs, arginfo_ndarray_abs, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, square, arginfo_ndarray_square, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sqrt, arginfo_ndarray_sqrt, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, exp, arginfo_ndarray_exp, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, expm1, arginfo_ndarray_expm1, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, exp2, arginfo_ndarray_exp2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, log, arginfo_ndarray_log, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, log2, arginfo_ndarray_log2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, logb, arginfo_ndarray_logb, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, log10, arginfo_ndarray_log10, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, log1p, arginfo_ndarray_log1p, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sin, arginfo_ndarray_sin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, cos, arginfo_ndarray_cos, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, tan, arginfo_ndarray_tan, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arcsin, arginfo_ndarray_arcsin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arccos, arginfo_ndarray_arccos, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arctan, arginfo_ndarray_arctan, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arctan2, arginfo_ndarray_arctan2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, degrees, arginfo_ndarray_degrees, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, radians, arginfo_ndarray_radians, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sinh, arginfo_ndarray_sinh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, cosh, arginfo_ndarray_cosh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, tanh, arginfo_ndarray_tanh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arcsinh, arginfo_ndarray_arcsinh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arccosh, arginfo_ndarray_arccosh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, arctanh, arginfo_ndarray_arctanh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, rint, arginfo_ndarray_rint, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, fix, arginfo_ndarray_fix, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, floor, arginfo_ndarray_floor, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, ceil, arginfo_ndarray_ceil, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, trunc, arginfo_ndarray_trunc, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sinc, arginfo_ndarray_sinc, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, negative, arginfo_ndarray_negative, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, positive, arginfo_ndarray_positive, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sign, arginfo_ndarray_sign, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, clip, arginfo_ndarray_clip, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, round, arginfo_ndarray_round, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, rsqrt, arginfo_ndarray_rsqrt, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, reciprocal, arginfo_ndarray_reciprocal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // STATISTICS
+    ZEND_ME(NumPower, mean, arginfo_ndarray_mean, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, median, arginfo_ndarray_median, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, variance, arginfo_ndarray_variance, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, average, arginfo_ndarray_average, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, std, arginfo_ndarray_std, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, quantile, arginfo_ndarray_quantile, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+
+    // ARITHMETICS
+    ZEND_ME(NumPower, add, arginfo_ndarray_add, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, subtract, arginfo_ndarray_subtract, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, pow, arginfo_ndarray_pow, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, divide, arginfo_ndarray_divide, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, multiply, arginfo_ndarray_multiply, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, sum, arginfo_ndarray_sum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, prod, arginfo_ndarray_prod, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, mod, arginfo_ndarray_mod, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, dumpDevices, arginfo_dump_devices, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, setDevice, arginfo_setdevice, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, load, arginfo_load, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, save, arginfo_save, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    PHP_FE_END
+};
+
 static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, __construct, arginfo_construct, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, dump, arginfo_dump, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, dumpDevices, arginfo_dump_devices, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NDArray, gpu, arginfo_gpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, cpu, arginfo_cpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, isGPU, arginfo_is_gpu, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, setDevice, arginfo_setdevice, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, save, arginfo_save, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, load, arginfo_load, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // EXTREMA
-    ZEND_ME(NDArray, min, arginfo_ndarray_min, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, max, arginfo_ndarray_max, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, maximum, arginfo_ndarray_maximum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, minimum, arginfo_ndarray_minimum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, argmax, arginfo_ndarray_argmax, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, argmin, arginfo_ndarray_argmin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // MANIPULATION
-    ZEND_ME(NDArray, reshape, arginfo_reshape, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, toArray, arginfo_toArray, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, toImage, arginfo_toImage, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, copy, arginfo_ndarray_copy, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, shape, arginfo_ndarray_shape, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, flatten, arginfo_ndarray_flat, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, atleast1d, arginfo_ndarray_atleast_1d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, atleast2d, arginfo_ndarray_atleast_2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, atleast3d, arginfo_ndarray_atleast_3d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, transpose, arginfo_ndarray_transpose, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, slice, arginfo_slice, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, append, arginfo_ndarray_append, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, expandDims, arginfo_ndarray_expand_dims, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, squeeze, arginfo_ndarray_squeeze, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, flip, arginfo_ndarray_flip, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, swapAxes, arginfo_ndarray_swapaxes, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, rollAxis, arginfo_ndarray_rollaxis, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, moveAxis, arginfo_ndarray_moveaxis, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, verticalStack, arginfo_ndarray_vstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, horizontalStack, arginfo_ndarray_hstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, depthStack, arginfo_ndarray_dstack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, columnStack, arginfo_ndarray_column_stack, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, concatenate, arginfo_ndarray_concatenate, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // INDEXING
-    ZEND_ME(NDArray, diagonal, arginfo_ndarray_diagonal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // INITIALIZERS
-    ZEND_ME(NDArray, zeros, arginfo_ndarray_zeros, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, ones, arginfo_ndarray_ones, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arange, arginfo_ndarray_arange, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, identity, arginfo_ndarray_identity, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, diag, arginfo_ndarray_diag, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, full, arginfo_ndarray_full, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, fill, arginfo_fill, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, array, arginfo_ndarray_array, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, fromImage, arginfo_ndarray_fromimage, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // RANDOM
-    ZEND_ME(NDArray, normal, arginfo_ndarray_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, truncatedNormal, arginfo_ndarray_truncated_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, standardNormal, arginfo_ndarray_standard_normal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, poisson, arginfo_ndarray_poisson, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, uniform, arginfo_ndarray_uniform, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, randomBinomial, arginfo_ndarray_binomial, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // LINALG
-    ZEND_ME(NDArray, matmul, arginfo_ndarray_matmul, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, svd, arginfo_ndarray_svd, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, det, arginfo_ndarray_det, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, dot, arginfo_ndarray_dot, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, inner, arginfo_ndarray_inner, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, outer, arginfo_ndarray_outer, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, cholesky, arginfo_ndarray_cholesky, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, qr, arginfo_ndarray_qr, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, eig, arginfo_ndarray_eig, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, cond, arginfo_ndarray_cond, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, norm, arginfo_ndarray_norm, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, trace, arginfo_ndarray_trace, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, solve, arginfo_ndarray_solve, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, inv, arginfo_ndarray_inv, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, lstsq, arginfo_ndarray_lstsq, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, lu, arginfo_ndarray_lu, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, matrixRank, arginfo_ndarray_matrix_rank, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, convolve2d, arginfo_ndarray_convolve2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, correlate2d, arginfo_ndarray_correlate2d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // DNN
-    ZEND_ME(NDArray, dnnConv2dForward, arginfo_ndarray_dnn_conv2d_forward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, dnnConv2dBackward, arginfo_ndarray_dnn_conv2d_backward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, dnnConv1dForward, arginfo_ndarray_dnn_conv1d_forward, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // LOGIC
-    ZEND_ME(NDArray, all, arginfo_ndarray_all, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, allClose, arginfo_ndarray_allclose, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, equal, arginfo_ndarray_equal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, greater, arginfo_ndarray_greater, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, greaterEqual, arginfo_ndarray_greaterequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, less, arginfo_ndarray_less, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, lessEqual, arginfo_ndarray_lessequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, notEqual, arginfo_ndarray_notequal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // MATH
-    ZEND_ME(NDArray, abs, arginfo_ndarray_abs, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, square, arginfo_ndarray_square, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sqrt, arginfo_ndarray_sqrt, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, exp, arginfo_ndarray_exp, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, expm1, arginfo_ndarray_expm1, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, exp2, arginfo_ndarray_exp2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, log, arginfo_ndarray_log, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, log2, arginfo_ndarray_log2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, logb, arginfo_ndarray_logb, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, log10, arginfo_ndarray_log10, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, log1p, arginfo_ndarray_log1p, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sin, arginfo_ndarray_sin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, cos, arginfo_ndarray_cos, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, tan, arginfo_ndarray_tan, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arcsin, arginfo_ndarray_arcsin, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arccos, arginfo_ndarray_arccos, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arctan, arginfo_ndarray_arctan, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arctan2, arginfo_ndarray_arctan2, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, degrees, arginfo_ndarray_degrees, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, radians, arginfo_ndarray_radians, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sinh, arginfo_ndarray_sinh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, cosh, arginfo_ndarray_cosh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, tanh, arginfo_ndarray_tanh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arcsinh, arginfo_ndarray_arcsinh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arccosh, arginfo_ndarray_arccosh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, arctanh, arginfo_ndarray_arctanh, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, rint, arginfo_ndarray_rint, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, fix, arginfo_ndarray_fix, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, floor, arginfo_ndarray_floor, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, ceil, arginfo_ndarray_ceil, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, trunc, arginfo_ndarray_trunc, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sinc, arginfo_ndarray_sinc, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, negative, arginfo_ndarray_negative, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, positive, arginfo_ndarray_positive, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sign, arginfo_ndarray_sign, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, clip, arginfo_ndarray_clip, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, round, arginfo_ndarray_round, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, rsqrt, arginfo_ndarray_rsqrt, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, reciprocal, arginfo_ndarray_reciprocal, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // STATISTICS
-    ZEND_ME(NDArray, mean, arginfo_ndarray_mean, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, median, arginfo_ndarray_median, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, variance, arginfo_ndarray_variance, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, average, arginfo_ndarray_average, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, std, arginfo_ndarray_std, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, quantile, arginfo_ndarray_quantile, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-
-    // ARITHMETICS
-    ZEND_ME(NDArray, add, arginfo_ndarray_add, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, subtract, arginfo_ndarray_subtract, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, pow, arginfo_ndarray_pow, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, divide, arginfo_ndarray_divide, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, multiply, arginfo_ndarray_multiply, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, sum, arginfo_ndarray_sum, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, prod, arginfo_ndarray_prod, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
-    ZEND_ME(NDArray, mod, arginfo_ndarray_mod, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
 
     ZEND_ME(NDArray, size, arginfo_size, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, count, arginfo_count, ZEND_ACC_PUBLIC)
@@ -5239,12 +5286,36 @@ static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, offsetUnset, arginfo_offsetunset, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, __serialize, arginfo_serialize, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, __unserialize, arginfo_unserialize, ZEND_ACC_PUBLIC)
+
+    ZEND_ME(NDArray, reshape, arginfo_reshape, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, toArray, arginfo_toArray, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, toImage, arginfo_toImage, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, slice, arginfo_slice, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, shape, arginfo_ndarray_shape, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, fill, arginfo_fill, ZEND_ACC_PUBLIC)
     ZEND_FE_END
 };
 
 static zend_class_entry *register_class_NDArray(zend_class_entry *class_entry_Iterator, zend_class_entry *class_entry_Countable, zend_class_entry *class_entry_ArrayAccess) {
     zend_class_entry ce, *class_entry;
     INIT_CLASS_ENTRY(ce, "NDArray", class_NDArray_methods);
+    ndarray_objects_init(&ce);
+    ce.create_object = ndarray_create_object;
+    class_entry = zend_register_internal_class(&ce);
+    zend_class_implements(class_entry, 3, class_entry_Iterator, class_entry_Countable, class_entry_ArrayAccess);
+
+    zval property_id_default_value;
+    ZVAL_UNDEF(&property_id_default_value);
+    zend_string *property_id_name = zend_string_init("id", sizeof("id") - 1, 1);
+    zend_declare_typed_property(class_entry, property_id_name, &property_id_default_value, ZEND_ACC_PRIVATE, NULL, (zend_type) ZEND_TYPE_INIT_MASK(MAY_BE_LONG));
+    zend_string_release(property_id_name);
+
+    return class_entry;
+}
+
+static zend_class_entry *register_class_NumPower(zend_class_entry *class_entry_Iterator, zend_class_entry *class_entry_Countable, zend_class_entry *class_entry_ArrayAccess) {
+    zend_class_entry ce, *class_entry;
+    INIT_CLASS_ENTRY(ce, "NumPower", class_NumPower_methods);
     ndarray_objects_init(&ce);
     ce.create_object = ndarray_create_object;
     class_entry = zend_register_internal_class(&ce);
@@ -5274,6 +5345,9 @@ static zend_class_entry *register_class_ArithmeticOperand(zend_class_entry *clas
 PHP_MINIT_FUNCTION(ndarray) {
     phpsci_ce_NDArray = register_class_NDArray(zend_ce_iterator, zend_ce_countable, zend_ce_arrayaccess);
     phpsci_ce_ArithmeticOperand = register_class_ArithmeticOperand(zend_ce_iterator, zend_ce_countable, zend_ce_arrayaccess);
+    phpsci_ce_NumPower = register_class_NumPower(zend_ce_iterator, zend_ce_countable, zend_ce_arrayaccess);
+    REGISTER_LONG_CONSTANT("NUMPOWER_CPU", 0, CONST_CS | CONST_PERSISTENT);
+    REGISTER_LONG_CONSTANT("NUMPOWER_CUDA", 1, CONST_CS | CONST_PERSISTENT);
     return SUCCESS;
 }
 

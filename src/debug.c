@@ -240,14 +240,13 @@ NDArray_DumpDevices() {
         printf("  Compute capability: %d.%d\n", deviceProp.major, deviceProp.minor);
         printf("  Total global memory: %zu bytes\n", deviceProp.totalGlobalMem);
         printf("  Max threads per block: %d\n", deviceProp.maxThreadsPerBlock);
+        printf("  Warp size: %d\n", deviceProp.warpSize);
+        printf("  Multi processor count: %d\n", deviceProp.multiProcessorCount);
         printf("  Max threads in X-dimension of block: %d\n", deviceProp.maxThreadsDim[0]);
         printf("  Max threads in Y-dimension of block: %d\n", deviceProp.maxThreadsDim[1]);
         printf("  Max threads in Z-dimension of block: %d\n", deviceProp.maxThreadsDim[2]);
         printf("  Max grid size in X-dimension: %d\n", deviceProp.maxGridSize[0]);
         printf("  Max grid size in Y-dimension: %d\n", deviceProp.maxGridSize[1]);
-        printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
-        printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
-        printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
         printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
         printf("---------------------------------------------------------------------------\n");
     }
