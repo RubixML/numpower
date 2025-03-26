@@ -16,7 +16,7 @@ NumPower was designed from the ground up to utilize AVX2 and the GPU to further 
 NumPower aims to manage memory more efficiently than a matrix in PHP arrays
 
 <p align="center">
-<img width="500" height="125" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=125&separator=%3C&lines=use+NumPower;%3C%24a+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24b+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24result+%3D+NumPower%3A%3Amatmul(%24aGpu%2C+%24bGpu);%3Cecho+%24result;" alt="Typing code" />
+<img width="500" height="127" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=127&separator=%3C&lines=use+NumPower;%3C%24a+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24b+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24result+%3D+NumPower%3A%3Amatmul(%24aGpu%2C+%24bGpu);%3Cecho+%24result;" alt="Typing code" />
 </p>
 
 ## Requirements
