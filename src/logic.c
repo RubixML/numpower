@@ -12,7 +12,7 @@
 
 #endif
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
 #include <immintrin.h>
 #endif
 
@@ -26,7 +26,7 @@ float
 NDArray_All(NDArray *a) {
     int i;
     float *array = NDArray_F32DATA(a);
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
     __m256 zero = _mm256_set1_ps(0.0f);
     for (i = 0; i < NDArray_NUMELEMENTS(a) - 7; i += 8) {
         __m256 elements = _mm256_loadu_ps(&array[i]);
@@ -122,7 +122,7 @@ NDArray_Greater(NDArray* nda, NDArray* ndb) {
                                    NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         // Process 8 elements at a time using AVX2
         i = 0;
         for (; i < NDArray_NUMELEMENTS(a_broad) - 7; i += 8) {
@@ -222,7 +222,7 @@ NDArray_Less(NDArray* nda, NDArray* ndb) {
                                 NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         // Process 8 elements at a time using AVX2
         i = 0;
         for (; i < NDArray_NUMELEMENTS(nda) - 7; i += 8) {
@@ -327,7 +327,7 @@ NDArray_LessEqual(NDArray* nda, NDArray* ndb) {
                                       NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         // Process 8 elements at a time using AVX2
         i = 0;
         for (; i < NDArray_NUMELEMENTS(a_broad) - 7; i += 8) {
@@ -428,7 +428,7 @@ NDArray_GreaterEqual(NDArray* nda, NDArray* ndb) {
                                          NDArray_NUMELEMENTS(b_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         // Process 8 elements at a time using AVX2
         i = 0;
         for (; i < NDArray_NUMELEMENTS(a_broad) - 7; i += 8) {
