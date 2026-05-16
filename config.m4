@@ -16,7 +16,7 @@ if test "$PHP_CUDA" != "no"; then
       PHP_ADD_LIBRARY(cublas,,NDARRAY_SHARED_LIBADD)
       AC_MSG_RESULT([CUBLAS detected ])
       PHP_ADD_MAKEFILE_FRAGMENT($abs_srcdir/Makefile.frag, $abs_builddir)
-      CFLAGS+=" -lcublas -lcudart -lOpenCL -lclBLAS"
+      CFLAGS+=" -lcublas -lcudart"
     ],[
         AC_MSG_RESULT([wrong cublas version or library not found.])
     ])
