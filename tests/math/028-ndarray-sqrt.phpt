@@ -7,7 +7,8 @@ print_r(NumPower::sqrt($a)->toArray());
 print_r(NumPower::sqrt($a[0])->toArray());
 print_r(NumPower::sqrt([[0],[-0.5]])->toArray());
 ?>
---EXPECT--
+--EXPECTF--
+%A
 Array
 (
     [0] => Array
@@ -23,11 +24,13 @@ Array
         )
 
 )
+%A
 Array
 (
     [0] => NAN
     [1] => 12.247448921204
 )
+%A
 Array
 (
     [0] => Array
