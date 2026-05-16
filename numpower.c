@@ -5174,8 +5174,8 @@ PHP_METHOD(NumPower, array) {
     ZEND_PARSE_PARAMETERS_END();
 
     if (ZEND_NUM_ARGS() < 2) {
-        dataType = "float64";
-        dataTypeLen = sizeof("float64") - 1;
+        dataType = "float32";
+        dataTypeLen = sizeof("float32") - 1;
     }
 
     if      (!strcmp(dataType, "float4"))   ndarrayDataType = NDARRAY_TYPE_FLOAT4;
