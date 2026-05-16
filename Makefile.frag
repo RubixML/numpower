@@ -100,7 +100,13 @@ install-cuda:
 # -mavx2 and -march=native in CFLAGS_CLEAN must be passed via -Xcompiler for nvcc;
 # they are already present in NVCC_ARCH_FLAGS, so strip them here to avoid the
 # "nvcc fatal: Unknown option '-mavx2'" error.
+#
+# -march=native is also removed from NVCC_ARCH_FLAGS for this target: PHP 8.3+
+# adds -D_GNU_SOURCE which, together with -march=native, causes GCC 11 to pull in
+# serializeintrin.h (__builtin_ia32_serialize) — a builtin that NVCC cannot
+# resolve during preprocessing.
 cuda-modules: NVCC_SAFE_FLAGS = $(filter-out -march=native,$(filter-out -mavx2,$(CFLAGS_CLEAN)))
+cuda-modules: NVCC_ARCH_FLAGS = -Xcompiler -mavx2
 cuda-modules:
 	rm -rf ./.libs
 	mkdir -p ./.libs
