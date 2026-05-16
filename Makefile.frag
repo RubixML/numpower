@@ -106,7 +106,12 @@ install-cuda:
 # serializeintrin.h (__builtin_ia32_serialize) — a builtin that NVCC cannot
 # resolve during preprocessing.
 cuda-modules: NVCC_SAFE_FLAGS = $(filter-out -march=native,$(filter-out -mavx2,$(CFLAGS_CLEAN)))
-cuda-modules: NVCC_ARCH_FLAGS = -Xcompiler -mavx2
+# Completely suppress CPU arch flags for nvcc: -mavx2 (via -Xcompiler) combined
+# with -D_GNU_SOURCE (present in PHP 8.3+ CFLAGS) causes GCC 11 to pull in
+# serializeintrin.h, which uses __builtin_ia32_serialize — a builtin that NVCC
+# cannot resolve in its preprocessing phase.  These flags only affect host-side
+# code optimisation and are not needed for a PHP extension.
+cuda-modules: NVCC_ARCH_FLAGS =
 cuda-modules:
 	rm -rf ./.libs
 	mkdir -p ./.libs
