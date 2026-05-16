@@ -177,6 +177,7 @@ int NDArray_AssignArray(NDArray *dst, NDArray *src);
 int NDArray_CompareLists(int const *l1, int const *l2, int n);
 void NDArray_CreateMultiSortedStridePerm(int narrays, NDArray **arrays, int ndim, int *out_strideperm);
 void NDArray_CreateSortedStridePerm(int ndim, int const *strides, NDArrayStrideSortItem *out_strideperm);
+NDArray *NDArray_AsType(NDArray *src, const char *target_type);
 
 #ifdef __cplusplus
 }

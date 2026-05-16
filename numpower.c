@@ -385,6 +385,95 @@ typedef struct {
     int value;
 } NumPowerObject;
 
+static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray *ndb,
+                                        const char **result_type_out)
+{
+    int dev_a = NDArray_DEVICE(nda);
+    int dev_b = NDArray_DEVICE(ndb);
+
+    if (dev_a != dev_b) {
+        zend_throw_error(NULL,
+            "Device mismatch, both NDArray MUST be in the same device.");
+        return NULL;
+    }
+
+    int both_gpu = (dev_a == NDARRAY_DEVICE_GPU);
+
+    if (both_gpu &&
+        (!is_type(NDArray_TYPE(nda), NDARRAY_TYPE_FLOAT32) ||
+         !is_type(NDArray_TYPE(ndb), NDARRAY_TYPE_FLOAT32))) {
+        /* GPU native arithmetic only supports float32+float32.
+           For other dtype combinations (e.g. float16+float64) we follow PyTorch semantics:
+           copy both arrays to CPU, promote types, compute, then move result back to GPU. */
+        NDArray *cpu_a = NDArray_ToCPU(nda);
+        NDArray *cpu_b = NDArray_ToCPU(ndb);
+        if (cpu_a == NULL || cpu_b == NULL) {
+            if (cpu_a) NDArray_FREE(cpu_a);
+            if (cpu_b) NDArray_FREE(cpu_b);
+            return NULL;
+        }
+        NDArray *cpu_rtn = ndarray_promote_and_op(opcode, cpu_a, cpu_b, result_type_out);
+        NDArray_FREE(cpu_a);
+        NDArray_FREE(cpu_b);
+        if (cpu_rtn == NULL) return NULL;
+        NDArray *gpu_rtn = NDArray_ToGPU(cpu_rtn);
+        NDArray_FREE(cpu_rtn);
+        return gpu_rtn;
+    }
+
+    const char *result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
+    const char *comp_type   = compute_dtype_for_arithmetic(result_type);
+    if (result_type_out) *result_type_out = result_type;
+
+    NDArray *nda_cast = NULL, *ndb_cast = NULL;
+
+    if (!is_type(NDArray_TYPE(nda), comp_type)) {
+        nda_cast = NDArray_AsType(nda, comp_type);
+        if (nda_cast == NULL) return NULL;
+    }
+    if (!is_type(NDArray_TYPE(ndb), comp_type)) {
+        ndb_cast = NDArray_AsType(ndb, comp_type);
+        if (ndb_cast == NULL) {
+            if (nda_cast) NDArray_FREE(nda_cast);
+            return NULL;
+        }
+    }
+
+    NDArray *a = nda_cast ? nda_cast : nda;
+    NDArray *b = ndb_cast ? ndb_cast : ndb;
+    int use_double = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
+
+    NDArray *rtn = NULL;
+    switch (opcode) {
+    case ZEND_ADD:
+        rtn = use_double ? NDArray_Add_Double(a, b)      : NDArray_Add_Float(a, b);      break;
+    case ZEND_SUB:
+        rtn = use_double ? NDArray_Subtract_Double(a, b) : NDArray_Subtract_Float(a, b); break;
+    case ZEND_MUL:
+        rtn = use_double ? NDArray_Multiply_Double(a, b) : NDArray_Multiply_Float(a, b); break;
+    case ZEND_DIV:
+        rtn = use_double ? NDArray_Divide_Double(a, b)   : NDArray_Divide_Float(a, b);   break;
+    case ZEND_POW:
+        rtn = use_double ? NDArray_Pow_Double(a, b)      : NDArray_Pow_Float(a, b);      break;
+    case ZEND_MOD:
+        rtn = use_double ? NDArray_Mod_Double(a, b)      : NDArray_Mod_Float(a, b);      break;
+    default:
+        break;
+    }
+
+    if (nda_cast) NDArray_FREE(nda_cast);
+    if (ndb_cast) NDArray_FREE(ndb_cast);
+
+    /* Cast back to result_type if computation used a wider type (e.g. float16→float32→float16) */
+    if (rtn != NULL && !is_type(comp_type, result_type)) {
+        NDArray *rtn_cast = NDArray_AsType(rtn, result_type);
+        NDArray_FREE(rtn);
+        rtn = rtn_cast;
+    }
+
+    return rtn;
+}
+
 static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
 
     /* Return FAILURE early for opcodes we don't handle so PHP can fall back
@@ -397,8 +486,6 @@ static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, z
             return FAILURE;
     }
 
-    zend_object *obj = Z_OBJ_P(op1);
-
     NDArray *nda = ZVAL_TO_NDARRAY(op1);
     NDArray *ndb = ZVAL_TO_NDARRAY(op2);
 
@@ -407,54 +494,24 @@ static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, z
     }
 
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
-    }
-
-    NDArray *rtn = NULL;
-    switch(opcode) {
-    case ZEND_ADD:
-        if (NDArray_TYPE(nda) == NDARRAY_TYPE_FLOAT64) {
-            rtn = NDArray_Add_Double(nda, ndb);
-        } else {
-            rtn = NDArray_Add_Float(nda, ndb);
-        }
-            rtn->uuid = -1;
-        break;
-    case ZEND_SUB:
-        rtn = NDArray_Subtract_Float(nda, ndb);
-            rtn->uuid = -1;
-        break;
-    case ZEND_MUL:
-        rtn = NDArray_Multiply_Float(nda, ndb);
-            rtn->uuid = -1;
-        break;
-    case ZEND_DIV:
-        rtn = NDArray_Divide_Float(nda, ndb);
-            rtn->uuid = -1;
-        break;
-    case ZEND_POW:
-        rtn = NDArray_Pow_Float(nda, ndb);
-            rtn->uuid = -1;
-        break;
-    case ZEND_MOD:
-        rtn = NDArray_Mod_Float(nda, ndb);
-            rtn->uuid = -1;
-        break;
-    default:
+        zend_throw_error(NULL, "Can't broadcast arrays with incompatible shapes.");
+        CHECK_INPUT_AND_FREE(op1, nda);
+        CHECK_INPUT_AND_FREE(op2, ndb);
         return FAILURE;
     }
 
+    NDArray *rtn = ndarray_promote_and_op(opcode, nda, ndb, NULL);
+
     CHECK_INPUT_AND_FREE(op1, nda);
     CHECK_INPUT_AND_FREE(op2, ndb);
-    if (GC_REFCOUNT(obj) > 1) {
-        rtn->uuid = nda->uuid;
-        rtn->data = nda->data;
+
+    if (rtn == NULL) {
+        return FAILURE;
     }
+
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, result);
-    if (rtn != NULL) {
-        return SUCCESS;
-    }
-    return FAILURE;
+    return SUCCESS;
 }
 
 static int arithmetic_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
@@ -3632,7 +3689,6 @@ ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, subtract) {
     NDArray *rtn = NULL;
     zval *a, *b;
-    long axis;
     ZEND_PARSE_PARAMETERS_START(2, 2)
     Z_PARAM_ZVAL(a)
     Z_PARAM_ZVAL(b)
@@ -3647,12 +3703,16 @@ PHP_METHOD(NumPower, subtract) {
         return;
     }
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
+        return;
     }
-    rtn = NDArray_Subtract_Float(nda, ndb);
-    rtn->uuid = -1;
+    rtn = ndarray_promote_and_op(ZEND_SUB, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
     CHECK_INPUT_AND_FREE(b, ndb);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -3666,7 +3726,6 @@ ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, mod) {
     NDArray *rtn = NULL;
     zval *a, *b;
-    long axis;
     ZEND_PARSE_PARAMETERS_START(2, 2)
     Z_PARAM_ZVAL(a)
     Z_PARAM_ZVAL(b)
@@ -3681,11 +3740,16 @@ PHP_METHOD(NumPower, mod) {
         return;
     }
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
+        return;
     }
-    rtn = NDArray_Mod_Float(nda, ndb);
+    rtn = ndarray_promote_and_op(ZEND_MOD, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(a, ndb);
+    CHECK_INPUT_AND_FREE(b, ndb);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -3717,19 +3781,18 @@ PHP_METHOD(NumPower, pow) {
         return;
     }
 
-    if (!NDArray_ShapeCompare(nda, ndb)) {
-        zend_throw_error(NULL, "Incompatible shapes");
+    if (!NDArray_IsBroadcastable(nda, ndb)) {
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
         return;
     }
 
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
-    }
-
-    rtn = NDArray_Pow_Float(nda, ndb);
-    rtn->uuid = -1;
+    rtn = ndarray_promote_and_op(ZEND_POW, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
     CHECK_INPUT_AND_FREE(b, ndb);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -3762,14 +3825,16 @@ PHP_METHOD(NumPower, multiply) {
     }
 
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
+        return;
     }
 
-    rtn = NDArray_Multiply_Float(nda, ndb);
-
+    rtn = ndarray_promote_and_op(ZEND_MUL, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
     CHECK_INPUT_AND_FREE(b, ndb);
-
+    if (rtn == NULL) return;
     rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
@@ -3784,7 +3849,6 @@ ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, divide) {
     NDArray *rtn = NULL;
     zval *a, *b;
-    long axis;
     ZEND_PARSE_PARAMETERS_START(2, 2)
     Z_PARAM_ZVAL(a)
     Z_PARAM_ZVAL(b)
@@ -3795,15 +3859,20 @@ PHP_METHOD(NumPower, divide) {
         return;
     }
     if (ndb == NULL) {
+        CHECK_INPUT_AND_FREE(a, nda);
         return;
     }
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
+        return;
     }
-    rtn = NDArray_Divide_Float(nda, ndb);
-    rtn->uuid = -1;
+    rtn = ndarray_promote_and_op(ZEND_DIV, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
     CHECK_INPUT_AND_FREE(b, ndb);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -3836,14 +3905,17 @@ PHP_METHOD(NumPower, add) {
     }
 
     if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can´t broadcast array.");
+        zend_throw_error(NULL, "Can't broadcast array.");
+        CHECK_INPUT_AND_FREE(a, nda);
+        CHECK_INPUT_AND_FREE(b, ndb);
+        return;
     }
 
-    rtn = NDArray_Add_Float(nda, ndb);
-    rtn->uuid = -1;
+    rtn = ndarray_promote_and_op(ZEND_ADD, nda, ndb, NULL);
     CHECK_INPUT_AND_FREE(a, nda);
     CHECK_INPUT_AND_FREE(b, ndb);
-
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 

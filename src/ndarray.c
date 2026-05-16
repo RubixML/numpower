@@ -1106,15 +1106,25 @@ convertStridedFLoat64ArrayToPHPArray(double *data, int *strides, int *dimensions
 zval
 NDArray_ToPHPArray(NDArray *target) {
     zval phpArray;
-    if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT32) {
+    if (is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT32)) {
         phpArray = convertStridedFLoat32ArrayToPHPArray(NDArray_F32DATA(target), NDArray_STRIDES(target),
                                                         NDArray_SHAPE(target), NDArray_NDIM(target),
                                                         NDArray_ELSIZE(target));
-    } else {
+    } else if (is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT64)) {
         phpArray = convertStridedFLoat64ArrayToPHPArray(NDArray_F64DATA(target), NDArray_STRIDES(target),
                                                         NDArray_SHAPE(target), NDArray_NDIM(target),
                                                         NDArray_ELSIZE(target));
-
+    } else {
+        /* For float16, float8, float4, float128, and integer types: convert to float64 for display */
+        NDArray *f64 = NDArray_AsType(target, NDARRAY_TYPE_FLOAT64);
+        if (f64 == NULL) {
+            array_init(&phpArray);
+            return phpArray;
+        }
+        phpArray = convertStridedFLoat64ArrayToPHPArray(NDArray_F64DATA(f64), NDArray_STRIDES(f64),
+                                                        NDArray_SHAPE(f64), NDArray_NDIM(f64),
+                                                        NDArray_ELSIZE(f64));
+        NDArray_FREE(f64);
     }
     return phpArray;
 }
@@ -1207,6 +1217,43 @@ NDArray_ToCPU(NDArray *target) {
 }
 
 /**
+ * Cast NDArray to a different dtype, returning a new CPU NDArray.
+ *
+ * @param src         Source array
+ * @param target_type Target dtype string
+ * @return New NDArray with elements converted to target_type, or NULL on error
+ */
+NDArray *
+NDArray_AsType(NDArray *src, const char *target_type)
+{
+    if (NDArray_DEVICE(src) == NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL, "Type casting of GPU arrays is not supported. Move to CPU first.");
+        return NULL;
+    }
+    if (is_type(NDArray_TYPE(src), target_type)) {
+        return NDArray_Copy(src, NDARRAY_DEVICE_CPU);
+    }
+    int ndim = NDArray_NDIM(src);
+    int *shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
+    if (ndim > 0) {
+        memcpy(shape, NDArray_SHAPE(src), sizeof(int) * ndim);
+    } else {
+        shape[0] = 1;
+    }
+    NDArray *rtn = NDArray_Empty(shape, ndim, target_type, NDARRAY_DEVICE_CPU);
+    if (rtn == NULL) {
+        efree(shape);
+        return NULL;
+    }
+    long n = NDArray_NUMELEMENTS(src);
+    for (long i = 0; i < n; i++) {
+        double val = ndarray_element_to_double(NDArray_TYPE(src), NDArray_DATA(src), (size_t)i);
+        ndarray_set_from_double(target_type, NDArray_DATA(rtn), (size_t)i, val);
+    }
+    return rtn;
+}
+
+/**
  * Return 1 if a.shape == b.shape or 0
  *
  * @param a
@@ -1289,10 +1336,9 @@ NDArray_IsBroadcastable(const NDArray *array1, const NDArray *array2) {
  */
 NDArray *
 NDArray_Broadcast(NDArray *a, NDArray *b) {
-    if (NDArray_TYPE(a) != NDArray_TYPE(b)) {
+    if (!is_type(NDArray_TYPE(a), NDArray_TYPE(b))) {
         zend_throw_error(NULL, "NDArray_Broadcast: Type mismatch.");
         return NULL;
-
     }
     int i;
     NDArray *src, *dst, *rtn;

@@ -197,15 +197,12 @@ NDArray_Add_Float(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
-
-    // Check if the element size of the input arrays match
-    //if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
-      //  return NULL;
-    //}
 
     // Create a new NDArray to store the result
     NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
@@ -230,7 +227,7 @@ NDArray_Add_Float(NDArray* a, NDArray* b) {
     result->refcount = 1;
     result->device = NDArray_DEVICE(a_broad);
 
-    // Perform element-wise subtraction
+    // Perform element-wise addition
     result->strides = memcpy(result->strides, a_broad->strides, a_broad->ndim * sizeof(int));
     result->dimensions = memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
     float *resultData = (float *) result->data;
@@ -316,21 +313,17 @@ NDArray* NDArray_Add_Double(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
-    if (NDArray_TYPE(a) != NDArray_TYPE(b)) {
+    if (!is_type(NDArray_TYPE(a), NDArray_TYPE(b))) {
         zend_throw_error(NULL, "Type mismatch, both NDArray MUST be the same type.");
         return NULL;
-
     }
-
-    // Check if the element size of the input arrays match
-    //if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
-        //return NULL;
-    //}
 
     // Create a new NDArray to store the result
     NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
@@ -355,7 +348,7 @@ NDArray* NDArray_Add_Double(NDArray* a, NDArray* b) {
     result->refcount = 1;
     result->device = NDArray_DEVICE(a_broad);
 
-    // Perform element-wise subtraction
+    // Perform element-wise addition
     result->strides = memcpy(result->strides, a_broad->strides, a_broad->ndim * sizeof(int));
     result->dimensions = memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
     double *resultData = (double *) result->data;
@@ -453,13 +446,19 @@ NDArray_Multiply_Float(NDArray* a, NDArray* b) {
         a_broad = a;
     }
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
     // Check if the element size of the input arrays match
     if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "NDArray_Multiply_Float: operands must be float32.");
         return NULL;
     }
 
@@ -586,13 +585,19 @@ NDArray_Subtract_Float(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
     // Check if the element size of the input arrays match
     if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "NDArray_Subtract_Float: operands must be float32.");
         return NULL;
     }
 
@@ -705,20 +710,17 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
-    if (NDArray_TYPE(a) != NDArray_TYPE(b)) {
+    if (!is_type(NDArray_TYPE(a), NDArray_TYPE(b))) {
         zend_throw_error(NULL, "Types mismatch.");
         return NULL;
     }
-
-    // Check if the element size of the input arrays match
-    //if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
-      //  return NULL;
-    //}
 
     // Create a new NDArray to store the result
     NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
@@ -727,7 +729,7 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
     result->ndim = a_broad->ndim;
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
-        if (NDArray_TYPE(a_broad) == NDARRAY_TYPE_FLOAT32) {
+        if (is_type(NDArray_TYPE(a_broad), NDARRAY_TYPE_FLOAT32)) {
             vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
         } else {
             vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(double));
@@ -736,11 +738,10 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
-        if (NDArray_TYPE(a_broad) == NDARRAY_TYPE_FLOAT32) {
+        if (is_type(NDArray_TYPE(a_broad), NDARRAY_TYPE_FLOAT32)) {
             result->data = (char *) emalloc(a_broad->descriptor->numElements * sizeof(float));
         } else {
             result->data = (char *) emalloc(a_broad->descriptor->numElements * sizeof(double));
-
         }
     }
     result->base = NULL;
@@ -764,7 +765,7 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
                             NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-        if (NDArray_TYPE(a_broad) == NDARRAY_TYPE_FLOAT32) {
+        if (is_type(NDArray_TYPE(a_broad), NDARRAY_TYPE_FLOAT32)) {
             float *resultData = (float *) result->data;
             float *aData = (float *) a_broad->data;
             float *bData = (float *) b_broad->data;
@@ -866,13 +867,19 @@ NDArray_Divide_Float(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
     // Check if the element size of the input arrays match
     if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "NDArray_Divide_Float: operands must be float32.");
         return NULL;
     }
 
@@ -992,13 +999,19 @@ NDArray_Mod_Float(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
     // Check if the element size of the input arrays match
     if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "NDArray_Mod_Float: operands must be float32.");
         return NULL;
     }
 
@@ -1117,13 +1130,19 @@ NDArray_Pow_Float(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
     // Check if the element size of the input arrays match
     if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "NDArray_Pow_Float: operands must be float32.");
         return NULL;
     }
 
@@ -1219,20 +1238,17 @@ NDArray* NDArray_Pow_Double(NDArray* a, NDArray* b) {
     }
 
     if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
         zend_throw_error(NULL, "Can't broadcast arrays.");
         return NULL;
     }
 
-    if (NDArray_TYPE(a) != NDArray_TYPE(b)) {
+    if (!is_type(NDArray_TYPE(a), NDArray_TYPE(b))) {
         zend_throw_error(NULL, "Types mismatch.");
         return NULL;
     }
-
-    // Check if the element size of the input arrays match
-    //if (a->descriptor->elsize != sizeof(float) || b->descriptor->elsize != sizeof(float)) {
-        // Element size mismatch, return an error or handle it accordingly
-      //  return NULL;
-    //}
 
     // Create a new NDArray to store the result
     NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
@@ -1327,4 +1343,261 @@ double NDArray_Sum_Double(NDArray* a) {
         }
     }
     return value;
+}
+
+NDArray *
+NDArray_Multiply_Double(NDArray *a, NDArray *b)
+{
+    NDArray *broadcasted = NULL;
+    NDArray *a_temp = NULL, *b_temp = NULL;
+
+    if (NDArray_DEVICE(a) != NDArray_DEVICE(b) && NDArray_NDIM(a) != 0 && NDArray_NDIM(b) != 0) {
+        zend_throw_error(NULL, "Device mismatch, both NDArray MUST be in the same device.");
+        return NULL;
+    }
+
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) == 0) {
+        int *shape = ecalloc(1, sizeof(int));
+        NDArray *rtn = NDArray_Empty(shape, 0, NDARRAY_TYPE_FLOAT64, NDARRAY_DEVICE_CPU);
+        NDArray_F64DATA(rtn)[0] = NDArray_F64DATA(a)[0] * NDArray_F64DATA(b)[0];
+        return rtn;
+    }
+
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(b));
+        copy(NDArray_SHAPE(b), n_shape, NDArray_NDIM(b));
+        a = NDArray_Zeros(n_shape, NDArray_NDIM(b), NDArray_TYPE(b), NDArray_DEVICE(b));
+        a = NDArray_FillDouble(a, NDArray_F64DATA(a_temp)[0]);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
+        copy(NDArray_SHAPE(a), n_shape, NDArray_NDIM(a));
+        b = NDArray_Zeros(n_shape, NDArray_NDIM(a), NDArray_TYPE(a), NDArray_DEVICE(a));
+        b = NDArray_FillDouble(b, NDArray_F64DATA(b_temp)[0]);
+    }
+
+    NDArray *a_broad = NULL, *b_broad = NULL;
+
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b);
+        a_broad = broadcasted;
+        b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a);
+        b_broad = broadcasted;
+        a_broad = a;
+    } else {
+        b_broad = b;
+        a_broad = a;
+    }
+
+    if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "Can't broadcast arrays.");
+        return NULL;
+    }
+
+    NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
+    result->strides = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->dimensions = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->ndim = a_broad->ndim;
+    result->device = NDARRAY_DEVICE_CPU;
+    result->data = (char *) emalloc(a_broad->descriptor->numElements * sizeof(double));
+    result->base = NULL;
+    result->flags = 0;
+    result->descriptor = (NDArrayDescriptor *) emalloc(sizeof(NDArrayDescriptor));
+    result->descriptor->type = NDARRAY_TYPE_FLOAT64;
+    result->descriptor->elsize = sizeof(double);
+    result->descriptor->numElements = a_broad->descriptor->numElements;
+    result->refcount = 1;
+
+    result->strides = memcpy(result->strides, a_broad->strides, a_broad->ndim * sizeof(int));
+    result->dimensions = memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
+
+    double *resultData = (double *) result->data;
+    double *aData = (double *) a_broad->data;
+    double *bData = (double *) b_broad->data;
+    int numElements = a_broad->descriptor->numElements;
+    NDArrayIterator_INIT(result);
+
+    for (int i = 0; i < numElements; i++) {
+        resultData[i] = aData[i] * bData[i];
+    }
+
+    if (a_temp != NULL) NDArray_FREE(a);
+    if (b_temp != NULL) NDArray_FREE(b);
+    if (broadcasted != NULL) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray *
+NDArray_Divide_Double(NDArray *a, NDArray *b)
+{
+    NDArray *a_temp = NULL, *b_temp = NULL;
+
+    if (NDArray_DEVICE(a) != NDArray_DEVICE(b) && NDArray_NDIM(a) != 0 && NDArray_NDIM(b) != 0) {
+        zend_throw_error(NULL, "Device mismatch, both NDArray MUST be in the same device.");
+        return NULL;
+    }
+
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) == 0) {
+        int *shape = ecalloc(1, sizeof(int));
+        NDArray *rtn = NDArray_Zeros(shape, 0, NDARRAY_TYPE_FLOAT64, NDARRAY_DEVICE_CPU);
+        NDArray_F64DATA(rtn)[0] = NDArray_F64DATA(a)[0] / NDArray_F64DATA(b)[0];
+        return rtn;
+    }
+
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(b));
+        copy(NDArray_SHAPE(b), n_shape, NDArray_NDIM(b));
+        a = NDArray_Zeros(n_shape, NDArray_NDIM(b), NDArray_TYPE(b), NDArray_DEVICE(b));
+        a = NDArray_FillDouble(a, NDArray_F64DATA(a_temp)[0]);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
+        copy(NDArray_SHAPE(a), n_shape, NDArray_NDIM(a));
+        b = NDArray_Zeros(n_shape, NDArray_NDIM(a), NDArray_TYPE(a), NDArray_DEVICE(a));
+        b = NDArray_FillDouble(b, NDArray_F64DATA(b_temp)[0]);
+    }
+
+    NDArray *broadcasted = NULL;
+    NDArray *a_broad = NULL, *b_broad = NULL;
+
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b);
+        a_broad = broadcasted;
+        b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a);
+        b_broad = broadcasted;
+        a_broad = a;
+    } else {
+        b_broad = b;
+        a_broad = a;
+    }
+
+    if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "Can't broadcast arrays.");
+        return NULL;
+    }
+
+    NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
+    result->strides = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->dimensions = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->device = NDARRAY_DEVICE_CPU;
+    result->ndim = a_broad->ndim;
+    result->data = (char *) emalloc(a_broad->descriptor->numElements * sizeof(double));
+    result->base = NULL;
+    result->flags = 0;
+    result->descriptor = (NDArrayDescriptor *) emalloc(sizeof(NDArrayDescriptor));
+    result->descriptor->type = NDARRAY_TYPE_FLOAT64;
+    result->descriptor->elsize = sizeof(double);
+    result->descriptor->numElements = a_broad->descriptor->numElements;
+    result->refcount = 1;
+
+    result->strides = memcpy(result->strides, a_broad->strides, a_broad->ndim * sizeof(int));
+    result->dimensions = memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
+
+    double *resultData = (double *) result->data;
+    double *aData = (double *) a_broad->data;
+    double *bData = (double *) b_broad->data;
+    int numElements = a_broad->descriptor->numElements;
+    NDArrayIterator_INIT(result);
+
+    for (int i = 0; i < numElements; i++) {
+        resultData[i] = aData[i] / bData[i];
+    }
+
+    if (a_temp != NULL) NDArray_FREE(a);
+    if (b_temp != NULL) NDArray_FREE(b);
+    if (broadcasted != NULL) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray *
+NDArray_Mod_Double(NDArray *a, NDArray *b)
+{
+    NDArray *a_temp = NULL, *b_temp = NULL;
+
+    if (NDArray_DEVICE(a) != NDArray_DEVICE(b) && NDArray_NDIM(a) != 0 && NDArray_NDIM(b) != 0) {
+        zend_throw_error(NULL, "Device mismatch, both NDArray MUST be in the same device.");
+        return NULL;
+    }
+
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(b));
+        copy(NDArray_SHAPE(b), n_shape, NDArray_NDIM(b));
+        a = NDArray_Zeros(n_shape, NDArray_NDIM(b), NDArray_TYPE(b), NDArray_DEVICE(b));
+        a = NDArray_FillDouble(a, NDArray_F64DATA(a_temp)[0]);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b;
+        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
+        copy(NDArray_SHAPE(a), n_shape, NDArray_NDIM(a));
+        b = NDArray_Zeros(n_shape, NDArray_NDIM(a), NDArray_TYPE(a), NDArray_DEVICE(a));
+        b = NDArray_FillDouble(b, NDArray_F64DATA(b_temp)[0]);
+    }
+
+    NDArray *broadcasted = NULL;
+    NDArray *a_broad = NULL, *b_broad = NULL;
+
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b);
+        a_broad = broadcasted;
+        b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a);
+        b_broad = broadcasted;
+        a_broad = a;
+    } else {
+        b_broad = b;
+        a_broad = a;
+    }
+
+    if (b_broad == NULL || a_broad == NULL) {
+        if (a_temp != NULL) NDArray_FREE(a);
+        if (b_temp != NULL) NDArray_FREE(b);
+        if (broadcasted != NULL) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "Can't broadcast arrays.");
+        return NULL;
+    }
+
+    NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
+    result->strides = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->dimensions = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->device = NDARRAY_DEVICE_CPU;
+    result->ndim = a_broad->ndim;
+    result->data = (char *) emalloc(a_broad->descriptor->numElements * sizeof(double));
+    result->base = NULL;
+    result->flags = 0;
+    result->descriptor = (NDArrayDescriptor *) emalloc(sizeof(NDArrayDescriptor));
+    result->descriptor->type = NDARRAY_TYPE_FLOAT64;
+    result->descriptor->elsize = sizeof(double);
+    result->descriptor->numElements = a_broad->descriptor->numElements;
+    result->refcount = 1;
+
+    result->strides = memcpy(result->strides, a_broad->strides, a_broad->ndim * sizeof(int));
+    result->dimensions = memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
+
+    double *resultData = (double *) result->data;
+    double *aData = (double *) a_broad->data;
+    double *bData = (double *) b_broad->data;
+    int numElements = a_broad->descriptor->numElements;
+    NDArrayIterator_INIT(result);
+
+    for (int i = 0; i < numElements; i++) {
+        resultData[i] = fmod(aData[i], bData[i]);
+    }
+
+    if (a_temp != NULL) NDArray_FREE(a);
+    if (b_temp != NULL) NDArray_FREE(b);
+    if (broadcasted != NULL) NDArray_FREE(broadcasted);
+    return result;
 }

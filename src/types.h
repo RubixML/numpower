@@ -31,4 +31,10 @@ int type_needs_string_io(const char *type);
 /* Returns 1 if the type is one of the validated dtype strings */
 int type_is_valid(const char *type);
 
+/* PyTorch-compatible type promotion: returns the higher-ranked dtype of a and b */
+const char *promote_dtype(const char *a, const char *b);
+
+/* Returns the dtype to use for arithmetic computation (e.g., float16 → float32) */
+const char *compute_dtype_for_arithmetic(const char *result_dtype);
+
 #endif /* PHPSCI_NDARRAY_TYPES_H */

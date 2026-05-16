@@ -53,4 +53,7 @@ void ndarray_set_from_double(const char *type, char *data, size_t index, double 
    precision loss.                                                           */
 void ndarray_set_from_string(const char *type, char *data, size_t index, const char *str);
 
+/* Read the element at element index [index] in [data] as a double. */
+double ndarray_element_to_double(const char *type, const char *data, size_t index);
+
 #endif /* PHPSCI_NDARRAY_TYPES_EXTRA_H */

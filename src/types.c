@@ -39,3 +39,32 @@ int type_needs_string_io(const char *type) {
 int type_is_valid(const char *type) {
     return get_type_size(type) > 0;
 }
+
+const char *promote_dtype(const char *a, const char *b)
+{
+    /* Float promotion hierarchy matching PyTorch */
+    static const char *const ranks[] = {
+        "float4", "float8", "float16", "float32", "float64", "float128", NULL
+    };
+    int ra = -1, rb = -1;
+    for (int i = 0; ranks[i] != NULL; i++) {
+        if (!strcmp(a, ranks[i])) ra = i;
+        if (!strcmp(b, ranks[i])) rb = i;
+    }
+    /* If types not found in float hierarchy, return 'a' as fallback */
+    if (ra < 0 && rb < 0) return a;
+    if (ra < 0) return b;
+    if (rb < 0) return a;
+    return (ra >= rb) ? a : b;
+}
+
+const char *compute_dtype_for_arithmetic(const char *result_dtype)
+{
+    /* float16 and below need to be computed in float32 since there's no native CPU fp16 arithmetic */
+    if (!strcmp(result_dtype, "float4")  ||
+        !strcmp(result_dtype, "float8")  ||
+        !strcmp(result_dtype, "float16")) {
+        return "float32";
+    }
+    return result_dtype;
+}

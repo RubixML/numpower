@@ -342,6 +342,62 @@ void ndarray_set_from_double(const char *type, char *data, size_t index, double 
     }
 }
 
+double ndarray_element_to_double(const char *type, const char *data, size_t index)
+{
+    if (strcmp(type, "float4") == 0) {
+        uint8_t nibble = (uint8_t)(((const uint8_t *)data)[index] & 0x0Fu);
+        return ndarray_fp4_to_double(nibble);
+    } else if (strcmp(type, "float8") == 0) {
+        uint8_t fp8 = ((const uint8_t *)data)[index];
+        return ndarray_fp8_to_double(fp8);
+    } else if (strcmp(type, "float16") == 0) {
+        uint16_t fp16;
+        memcpy(&fp16, (const uint16_t *)data + index, 2);
+        return ndarray_fp16_to_double(fp16);
+    } else if (strcmp(type, "float32") == 0) {
+        float v;
+        memcpy(&v, (const float *)data + index, 4);
+        return (double)v;
+    } else if (strcmp(type, "float64") == 0) {
+        double v;
+        memcpy(&v, (const double *)data + index, 8);
+        return v;
+    } else if (strcmp(type, "float128") == 0) {
+        ndarray_fp128_t v;
+        memcpy(&v, (const ndarray_fp128_t *)data + index, NDARRAY_FP128_SIZE);
+        return ndarray_fp128_to_double(v);
+    } else if (strcmp(type, "int8") == 0) {
+        return (double)(int8_t)((const uint8_t *)data)[index];
+    } else if (strcmp(type, "uint8") == 0) {
+        return (double)((const uint8_t *)data)[index];
+    } else if (strcmp(type, "int16") == 0) {
+        int16_t v;
+        memcpy(&v, (const int16_t *)data + index, 2);
+        return (double)v;
+    } else if (strcmp(type, "uint16") == 0) {
+        uint16_t v;
+        memcpy(&v, (const uint16_t *)data + index, 2);
+        return (double)v;
+    } else if (strcmp(type, "int32") == 0) {
+        int32_t v;
+        memcpy(&v, (const int32_t *)data + index, 4);
+        return (double)v;
+    } else if (strcmp(type, "uint32") == 0) {
+        uint32_t v;
+        memcpy(&v, (const uint32_t *)data + index, 4);
+        return (double)v;
+    } else if (strcmp(type, "int64") == 0) {
+        int64_t v;
+        memcpy(&v, (const int64_t *)data + index, 8);
+        return (double)v;
+    } else if (strcmp(type, "uint64") == 0) {
+        uint64_t v;
+        memcpy(&v, (const uint64_t *)data + index, 8);
+        return (double)v;
+    }
+    return 0.0;
+}
+
 void ndarray_set_from_string(const char *type, char *data, size_t index, const char *str)
 {
     if (strcmp(type, "float128") == 0) {
