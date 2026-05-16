@@ -75,13 +75,9 @@ jobs:
             echo "::warning::cublas not found; extension built without GPU support"
           fi
 
-      - name: Install extension & verify
-        run: |
-          sudo make install
-          PHP_INI_SCAN=$(php --ini | grep "Scan for additional" | sed 's/.*: //')
-          echo "extension=ndarray.so" | sudo tee "${PHP_INI_SCAN}/99-ndarray.ini"
-          php -m | grep -i ndarray
-
+      # make test generates tmp-php.ini from the system ini scan dir (including gd.so),
+      # then loads the extension directly from ./modules/ — no `make install` needed.
+      # REPORT_EXIT_STATUS=1 is required: without it run-tests.php always exits 0.
       - name: Run tests
         run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
 
@@ -160,13 +156,6 @@ jobs:
           else
             echo "::warning::cublas not found; extension built without GPU support"
           fi
-
-      - name: Install extension & verify
-        run: |
-          sudo make install
-          PHP_INI_SCAN=$(php --ini | grep "Scan for additional" | sed 's/.*: //')
-          echo "extension=ndarray.so" | sudo tee "${PHP_INI_SCAN}/99-ndarray.ini"
-          php -m | grep -i ndarray
 
       - name: Run tests
         run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
