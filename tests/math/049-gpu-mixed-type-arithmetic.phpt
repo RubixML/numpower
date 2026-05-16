@@ -1,5 +1,9 @@
 --TEST--
 GPU arithmetic with mixed types promotes to the higher type (PyTorch semantics)
+--SKIPIF--
+<?php
+try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
+?>
 --FILE--
 <?php
 // float16 GPU + float64 GPU => float64 result on GPU
