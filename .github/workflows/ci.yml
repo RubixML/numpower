@@ -66,11 +66,17 @@ jobs:
           ./configure ${{ matrix.cuda && '--with-cuda' || '' }}
           make -j$(nproc)
 
-      - name: Report CUDA detection
+      # When cublas is detected, the standard PHP build links ndarray.so without
+      # the .cu objects (cuda_math.cu / cuda_dnn.cu) — only install-cuda does that,
+      # and it targets the system extension dir.  cuda-modules rebuilds everything
+      # with nvcc and drops the result into modules/ndarray.so so that make test
+      # picks it up without a system install.
+      - name: Link CUDA objects into extension
         if: matrix.cuda
         run: |
           if grep -q "HAVE_CUBLAS 1" config.h; then
-            echo "cublas detected — CUDA code paths enabled"
+            echo "cublas detected — rebuilding modules/ndarray.so with CUDA objects"
+            make cuda-modules
           else
             echo "::warning::cublas not found; extension built without GPU support"
           fi
@@ -148,11 +154,12 @@ jobs:
           ./configure ${{ matrix.cuda && '--with-cuda' || '' }}
           make -j$(nproc)
 
-      - name: Report CUDA detection
+      - name: Link CUDA objects into extension
         if: matrix.cuda
         run: |
           if grep -q "HAVE_CUBLAS 1" config.h; then
-            echo "cublas detected — CUDA code paths enabled"
+            echo "cublas detected — rebuilding modules/ndarray.so with CUDA objects"
+            make cuda-modules
           else
             echo "::warning::cublas not found; extension built without GPU support"
           fi
