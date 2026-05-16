@@ -120,7 +120,7 @@ print_array_float32(float* buffer, int ndims, int* shape, int* strides, int cur_
 
         // Print the closing bracket for this dimension
         sprintf(str + strlen(str), "]");
-        if (index[cur_dim-1] < shape[ndims - 2] - 1) {
+        if (cur_dim > 0 && index[cur_dim-1] < shape[ndims - 2] - 1) {
             sprintf(str + strlen(str), "\n ");
         }
     } else {
@@ -177,11 +177,6 @@ print_array_float32(float* buffer, int ndims, int* shape, int* strides, int cur_
         if (cur_dim != 0 && index[cur_dim-1] < shape[cur_dim-1] - 1) {
             sprintf(str + strlen(str), "\n");
         }
-    }
-
-    // Add a newline if this is the outermost dimension
-    if (cur_dim == 0) {
-        sprintf(str + strlen(str), "\n");
     }
 
     return str;
@@ -259,7 +254,7 @@ print_array_float64(double* buffer, int ndims, int* shape, int* strides, int cur
 
         // Print the closing bracket for this dimension
         sprintf(str + strlen(str), "]");
-        if (index[cur_dim-1] < shape[ndims - 2] - 1) {
+        if (cur_dim > 0 && index[cur_dim-1] < shape[ndims - 2] - 1) {
             sprintf(str + strlen(str), "\n ");
         }
     } else {
@@ -316,11 +311,6 @@ print_array_float64(double* buffer, int ndims, int* shape, int* strides, int cur
         if (cur_dim != 0 && index[cur_dim-1] < shape[cur_dim-1] - 1) {
             sprintf(str + strlen(str), "\n");
         }
-    }
-
-    // Add a newline if this is the outermost dimension
-    if (cur_dim == 0) {
-        sprintf(str + strlen(str), "\n");
     }
 
     return str;
@@ -462,7 +452,6 @@ static char *print_array_generic(
         if (cur_dim != 0 && index[cur_dim - 1] < shape[cur_dim - 1] - 1) strcat(str, "\n");
     }
 
-    if (cur_dim == 0) strcat(str, "\n");
     return str;
 }
 
