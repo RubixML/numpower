@@ -789,14 +789,15 @@ final class NumPower {
     public static function columnStack(array $arrays): NumPower {}
 
     /**
-     * Creates a new NumPower from a PHP array.
+     * Creates a new NumPower from a PHP array with an optional data type.
      *
-     * It is the equivalent of `new NumPower($array);`
+     * It is the equivalent of `new NDArray($array, $dtype);`
      *
      * @param array|float|int $array
+     * @param string $dtype Data type: float4, float8, float16, float32, float64, float128, int8, uint8, int16, uint16, int32, uint32, int64, uint64 (default: float64)
      * @return NumPower
      */
-    public static function array(array|float|int $array): NumPower {}
+    public static function array(array|float|int $array, string $dtype = 'float64'): NumPower {}
 
     /**
      * This function returns a square array, where the main diagonal consists of ones and all other

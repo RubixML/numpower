@@ -5086,23 +5086,62 @@ PHP_METHOD(NumPower, prod) {
 
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_array, 0)
 ZEND_ARG_INFO(0, a)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float64")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, array) {
-    NDArray *rtn = NULL;
+    NDArray *nda = NULL;
     zval *a;
-    long axis;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    char *dataType = NULL;
+    size_t dataTypeLen;
+    const char *ndarrayDataType;
+
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_ZVAL(a)
+    Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
+
+    if (ZEND_NUM_ARGS() < 2) {
+        dataType = "float64";
+        dataTypeLen = sizeof("float64") - 1;
+    }
+
+    if      (!strcmp(dataType, "float4"))   ndarrayDataType = NDARRAY_TYPE_FLOAT4;
+    else if (!strcmp(dataType, "float8"))   ndarrayDataType = NDARRAY_TYPE_FLOAT8;
+    else if (!strcmp(dataType, "float16"))  ndarrayDataType = NDARRAY_TYPE_FLOAT16;
+    else if (!strcmp(dataType, "float32"))  ndarrayDataType = NDARRAY_TYPE_FLOAT32;
+    else if (!strcmp(dataType, "float64"))  ndarrayDataType = NDARRAY_TYPE_FLOAT64;
+    else if (!strcmp(dataType, "float128")) ndarrayDataType = NDARRAY_TYPE_FLOAT128;
+    else if (!strcmp(dataType, "int8"))     ndarrayDataType = NDARRAY_TYPE_INT8;
+    else if (!strcmp(dataType, "uint8"))    ndarrayDataType = NDARRAY_TYPE_UINT8;
+    else if (!strcmp(dataType, "int16"))    ndarrayDataType = NDARRAY_TYPE_INT16;
+    else if (!strcmp(dataType, "uint16"))   ndarrayDataType = NDARRAY_TYPE_UINT16;
+    else if (!strcmp(dataType, "int32"))    ndarrayDataType = NDARRAY_TYPE_INT32;
+    else if (!strcmp(dataType, "uint32"))   ndarrayDataType = NDARRAY_TYPE_UINT32;
+    else if (!strcmp(dataType, "int64"))    ndarrayDataType = NDARRAY_TYPE_INT64;
+    else if (!strcmp(dataType, "uint64"))   ndarrayDataType = NDARRAY_TYPE_UINT64;
+    else {
+        zend_throw_error(NULL,
+            "Invalid data type '%s'. Supported: float4, float8, float16, float32, float64, "
+            "float128, int8, uint8, int16, uint16, int32, uint32, int64, uint64", dataType);
+        return;
+    }
+
+    if (Z_TYPE_P(a) == IS_OBJECT) {
+        zend_class_entry *ce = Z_OBJCE_P(a);
+        if (instanceof_function(ce, phpsci_ce_NDArray)) {
+            ZVAL_COPY(return_value, a);
+            return;
+        }
+    }
+
+    // NDArrayFactory_createFromZval adds the array to the buffer (uuid is set)
+    nda = NDArrayFactory_createFromZval(a, ndarrayDataType);
     if (nda == NULL) {
         return;
     }
-    if (nda->uuid != -1) {
-        ZVAL_COPY(return_value, a);
-    } else {
-        ndarray_init_new_object(nda, return_value);
-    }
+    object_init_ex(return_value, phpsci_ce_NDArray);
+    ZVAL_LONG(OBJ_PROP_NUM(Z_OBJ_P(return_value), 0), NDArray_UUID(nda));
 }
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slice, 0, 0, IS_MIXED, 0)
