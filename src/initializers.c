@@ -511,27 +511,19 @@ NDArray_Empty(int *shape, int ndim, const char *type, int device) {
         return rtn;
     }
 
-    if (is_type(type, NDARRAY_TYPE_FLOAT32)) {
-        if (device == NDARRAY_DEVICE_CPU) {
-            rtn->device = NDARRAY_DEVICE_CPU;
-            rtn->data = emalloc(NDArray_NUMELEMENTS(rtn) * sizeof(float));
-        } else {
-#ifdef HAVE_CUBLAS
-            rtn->device = NDARRAY_DEVICE_GPU;
-            vmalloc((void **) &rtn->data, NDArray_NUMELEMENTS(rtn) * sizeof(float));
-#endif
-        }
-    } else {
-        if (device == NDARRAY_DEVICE_CPU) {
-            rtn->device = NDARRAY_DEVICE_CPU;
-            rtn->data = emalloc(NDArray_NUMELEMENTS(rtn) * sizeof(double));
-        } else {
-#ifdef HAVE_CUBLAS
-            rtn->device = NDARRAY_DEVICE_GPU;
-            vmalloc((void **) &rtn->data, NDArray_NUMELEMENTS(rtn) * sizeof(double));
-#endif
-        }
+    int elsize = get_type_size(type);
+    if (elsize == 0) return NULL;
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        rtn->device = NDARRAY_DEVICE_CPU;
+        rtn->data = emalloc((size_t)NDArray_NUMELEMENTS(rtn) * (size_t)elsize);
     }
+#ifdef HAVE_CUBLAS
+    else {
+        rtn->device = NDARRAY_DEVICE_GPU;
+        vmalloc((void **)&rtn->data, (size_t)NDArray_NUMELEMENTS(rtn) * (size_t)elsize);
+    }
+#endif
     return rtn;
 }
 
@@ -560,24 +552,18 @@ NDArray_Zeros(int *shape, int ndim, const char *type, const int device) {
         return rtn;
     }
 
+    int elsize = get_type_size(type);
+    if (elsize == 0) return NULL;
+
+    size_t total = (size_t)rtn->descriptor->numElements * (size_t)elsize;
+
     if (device == NDARRAY_DEVICE_CPU) {
-        if (is_type(type, NDARRAY_TYPE_FLOAT64)) {
-            rtn->data = ecalloc(rtn->descriptor->numElements, sizeof(double));
-        }
-        if (is_type(type, NDARRAY_TYPE_FLOAT32)) {
-            rtn->data = ecalloc(rtn->descriptor->numElements, sizeof(float));
-        }
+        rtn->data = ecalloc(rtn->descriptor->numElements, (size_t)elsize);
     }
 #ifdef HAVE_CUBLAS
     if (device == NDARRAY_DEVICE_GPU) {
-        if (is_type(type, NDARRAY_TYPE_FLOAT64)) {
-            vmalloc((void**)(&rtn->data), rtn->descriptor->numElements * sizeof(double));
-            cudaMemset(rtn->data, 0, rtn->descriptor->numElements * sizeof(double));
-        }
-        if (is_type(type, NDARRAY_TYPE_FLOAT32)) {
-            vmalloc((void**)(&rtn->data), rtn->descriptor->numElements * sizeof(float));
-            cudaMemset(rtn->data, 0, rtn->descriptor->numElements * sizeof(float));
-        }
+        vmalloc((void **)(&rtn->data), total);
+        cudaMemset(rtn->data, 0, total);
     }
 #endif
     return rtn;

@@ -1,10 +1,34 @@
 #ifndef PHPSCI_NDARRAY_TYPES_H
 #define PHPSCI_NDARRAY_TYPES_H
 
-static const char* NDARRAY_TYPE_FLOAT32 = "float32";
-static const char* NDARRAY_TYPE_FLOAT64 = "float64";
+#include "ndarray_types.h"
 
+/* All supported dtype strings */
+static const char* NDARRAY_TYPE_FLOAT4   = "float4";
+static const char* NDARRAY_TYPE_FLOAT8   = "float8";
+static const char* NDARRAY_TYPE_FLOAT16  = "float16";
+static const char* NDARRAY_TYPE_FLOAT32  = "float32";
+static const char* NDARRAY_TYPE_FLOAT64  = "float64";
+static const char* NDARRAY_TYPE_FLOAT128 = "float128";
+static const char* NDARRAY_TYPE_INT8     = "int8";
+static const char* NDARRAY_TYPE_UINT8    = "uint8";
+static const char* NDARRAY_TYPE_INT16    = "int16";
+static const char* NDARRAY_TYPE_UINT16   = "uint16";
+static const char* NDARRAY_TYPE_INT32    = "int32";
+static const char* NDARRAY_TYPE_UINT32   = "uint32";
+static const char* NDARRAY_TYPE_INT64    = "int64";
+static const char* NDARRAY_TYPE_UINT64   = "uint64";
+
+/* Returns element size in bytes, or 0 for unknown types */
 int get_type_size(const char *type);
+
+/* Returns 1 if type_a and type_b are the same dtype string */
 int is_type(const char *type_a, const char *type_b);
 
-#endif //PHPSCI_NDARRAY_TYPES_H
+/* Returns 1 if the type needs string-based I/O from PHP (no native PHP representation) */
+int type_needs_string_io(const char *type);
+
+/* Returns 1 if the type is one of the validated dtype strings */
+int type_is_valid(const char *type);
+
+#endif /* PHPSCI_NDARRAY_TYPES_H */

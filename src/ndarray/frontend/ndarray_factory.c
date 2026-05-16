@@ -6,8 +6,11 @@
 // ce, phpsci_ce_NDArray
 #include "../../../php_numpower.h"
 
-// NDARRAY_TYPE_FLOAT32, NDARRAY_TYPE_FLOAT64
+// NDARRAY_TYPE_FLOAT32, NDARRAY_TYPE_FLOAT64, …
 #include "../../types.h"
+
+// ndarray_set_from_double, ndarray_set_from_string
+#include "../../ndarray_types.h"
 
 // buffer_get
 #include "../../buffer.h"
@@ -144,28 +147,12 @@ static double zval_to_double_safe(zval *val) {
     }
 }
 
-/**
- * @brief Store a double value into the NDArray at the given index
- *
- * Stores a double value into the raw memory buffer of the NDArray
- * after converting it to the appropriate internal type (float32 or float64).
- *
- * @param[in,out] ndarray Pointer to the NDArray structure. Must be properly initialized.
- * @param[in]     index   Zero-based index into the array. Caller must ensure it's in bounds.
- * @param[in]     value   The value to store, which will be cast according to the array's dtype.
- *
- * @throws Error If the dtype of the NDArray is not supported (e.g., not float32 or float64).
- */
 static void set_ndarray_value(NDArray *ndarray, int index, double value) {
-    if (strcmp(NDArray_TYPE(ndarray), NDARRAY_TYPE_FLOAT32) == 0) {
-        float *data = (float *)NDArray_DATA(ndarray);
-        data[index] = (float)value;
-    } else if (strcmp(NDArray_TYPE(ndarray), NDARRAY_TYPE_FLOAT64) == 0) {
-        double *data = (double *)NDArray_DATA(ndarray);
-        data[index] = value;
-    } else {
-        zend_throw_error(NULL, "Invalid data type. Supported types are: float32, float64");
-    }
+    ndarray_set_from_double(NDArray_TYPE(ndarray), (char *)NDArray_DATA(ndarray), (size_t)index, value);
+}
+
+static void set_ndarray_value_string(NDArray *ndarray, int index, const char *str) {
+    ndarray_set_from_string(NDArray_TYPE(ndarray), (char *)NDArray_DATA(ndarray), (size_t)index, str);
 }
 
 /**
@@ -176,18 +163,47 @@ static void set_ndarray_value(NDArray *ndarray, int index, double value) {
  * @param[in,out] firstIndex  A pointer to the first index
  */
 void _fillFromZendArray(NDArray *ndarray, zend_array *zendArray, int *firstIndex) {
-    zval *element;
+    zval       *element;
+    const char *type = NDArray_TYPE(ndarray);
 
     ZEND_HASH_FOREACH_VAL(zendArray, element)
     {
         ZVAL_DEREF(element);
         if (Z_TYPE_P(element) == IS_ARRAY) {
             _fillFromZendArray(ndarray, Z_ARRVAL_P(element), firstIndex);
-        } else {
-            double value = zval_to_double_safe(element);
-            set_ndarray_value(ndarray, *firstIndex, value);
-            ++(*firstIndex);
+            continue;
         }
+
+        /* String path: lossless for exotic / large-integer types */
+        if (Z_TYPE_P(element) == IS_STRING && type_needs_string_io(type)) {
+            set_ndarray_value_string(ndarray, *firstIndex, Z_STRVAL_P(element));
+            ++(*firstIndex);
+            continue;
+        }
+
+        /* Integer path: avoid double-rounding for large int64/uint64 values. */
+        if (Z_TYPE_P(element) == IS_LONG &&
+            (!strcmp(type, "int64") || !strcmp(type, "uint64") ||
+             !strcmp(type, "int32") || !strcmp(type, "uint32") ||
+             !strcmp(type, "int16") || !strcmp(type, "uint16") ||
+             !strcmp(type, "int8")  || !strcmp(type, "uint8"))) {
+            zend_long lv = Z_LVAL_P(element);
+            if (!strcmp(type, "int64") || !strcmp(type, "uint64")) {
+                char tmp[32];
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)lv);
+                ndarray_set_from_string(type, (char *)NDArray_DATA(ndarray), (size_t)*firstIndex, tmp);
+            } else {
+                ndarray_set_from_double(type, (char *)NDArray_DATA(ndarray), (size_t)*firstIndex, (double)lv);
+            }
+            ++(*firstIndex);
+            continue;
+        }
+
+        /* Default path: convert via double */
+        double value = zval_to_double_safe(element);
+        if (EG(exception)) return;
+        set_ndarray_value(ndarray, *firstIndex, value);
+        ++(*firstIndex);
     } ZEND_HASH_FOREACH_END();
 }
 
@@ -383,26 +399,87 @@ int getObjectUuid(zval *obj) {
  * 
  * @return A pointer to the newly created NDArray, or NULL if the zval is not an array.
  */
+/* Create a 0-dim (scalar) NDArray of [type] from a double value */
+static NDArray *_createScalarFromDouble(double val, const char *type) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) return NULL;
+
+    NDArray *rtn = safe_emalloc(1, sizeof(NDArray), 0);
+    rtn->uuid       = -1;
+    rtn->ndim       = 0;
+    rtn->descriptor = emalloc(sizeof(NDArrayDescriptor));
+    rtn->descriptor->numElements = 1;
+    rtn->descriptor->elsize      = elsize;
+    rtn->descriptor->type        = type;
+    rtn->data       = emalloc((size_t)elsize);
+    rtn->device     = NDARRAY_DEVICE_CPU;
+    rtn->strides    = emalloc(sizeof(int));
+    rtn->dimensions = emalloc(sizeof(int));
+    rtn->iterator   = NULL;
+    rtn->base       = NULL;
+    rtn->refcount   = 1;
+    ndarray_set_from_double(type, rtn->data, 0, val);
+    add_to_buffer(rtn);
+    return rtn;
+}
+
+/* Create a 0-dim (scalar) NDArray of [type] from a string (lossless for exotic types) */
+static NDArray *_createScalarFromString(const char *str, const char *type) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) return NULL;
+
+    NDArray *rtn = safe_emalloc(1, sizeof(NDArray), 0);
+    rtn->uuid       = -1;
+    rtn->ndim       = 0;
+    rtn->descriptor = emalloc(sizeof(NDArrayDescriptor));
+    rtn->descriptor->numElements = 1;
+    rtn->descriptor->elsize      = elsize;
+    rtn->descriptor->type        = type;
+    rtn->data       = emalloc((size_t)elsize);
+    rtn->device     = NDARRAY_DEVICE_CPU;
+    rtn->strides    = emalloc(sizeof(int));
+    rtn->dimensions = emalloc(sizeof(int));
+    rtn->iterator   = NULL;
+    rtn->base       = NULL;
+    rtn->refcount   = 1;
+    ndarray_set_from_string(type, rtn->data, 0, str);
+    add_to_buffer(rtn);
+    return rtn;
+}
+
 NDArray *NDArrayFactory_createFromZval(zval *obj, const char *type) {
     if (Z_TYPE_P(obj) == IS_ARRAY) {
         return _createFromZendArray(Z_ARRVAL_P(obj), type);
     }
 
-    if (Z_TYPE_P(obj) == IS_LONG && type == NDARRAY_TYPE_FLOAT32) {
+    /* Legacy fast paths kept for float32 / float64 */
+    if (Z_TYPE_P(obj) == IS_LONG && is_type(type, NDARRAY_TYPE_FLOAT32)) {
         return _createFloat32FromLongScalar(Z_LVAL_P(obj));
     }
-
-    if (Z_TYPE_P(obj) == IS_DOUBLE && type == NDARRAY_TYPE_FLOAT32) {
+    if (Z_TYPE_P(obj) == IS_DOUBLE && is_type(type, NDARRAY_TYPE_FLOAT32)) {
         return _createFloat32FromDoubleScalar(Z_DVAL_P(obj));
     }
-
-    if (Z_TYPE_P(obj) == IS_LONG && type == NDARRAY_TYPE_FLOAT64) {
+    if (Z_TYPE_P(obj) == IS_LONG && is_type(type, NDARRAY_TYPE_FLOAT64)) {
         return _createDouble64FromLongScalar(Z_LVAL_P(obj));
     }
-
-    if (Z_TYPE_P(obj) == IS_DOUBLE && type == NDARRAY_TYPE_FLOAT64) {
+    if (Z_TYPE_P(obj) == IS_DOUBLE && is_type(type, NDARRAY_TYPE_FLOAT64)) {
         return _createDouble64FromDoubleScalar(Z_DVAL_P(obj));
     }
+
+    /* Generic scalar path for all other types */
+    if (Z_TYPE_P(obj) == IS_LONG) {
+        return _createScalarFromDouble((double)Z_LVAL_P(obj), type);
+    }
+    if (Z_TYPE_P(obj) == IS_DOUBLE) {
+        return _createScalarFromDouble(Z_DVAL_P(obj), type);
+    }
+    if (Z_TYPE_P(obj) == IS_STRING) {
+        if (type_needs_string_io(type)) {
+            return _createScalarFromString(Z_STRVAL_P(obj), type);
+        }
+        return _createScalarFromDouble(zval_to_double_safe(obj), type);
+    }
+
     if (Z_TYPE_P(obj) == IS_OBJECT) {
         zend_class_entry *ce = Z_OBJCE_P(obj);
         if (instanceof_function(ce, phpsci_ce_NDArray)) {
@@ -411,7 +488,6 @@ NDArray *NDArrayFactory_createFromZval(zval *obj, const char *type) {
 #ifdef HAVE_GD
         zend_string *class_name = Z_OBJ_P(obj)->ce->name;
         if (strcmp(ZSTR_VAL(class_name), "GdImage") == 0) {
-
             NDArray *ndarray = NDArray_FromGD(obj, false);
             add_to_buffer(ndarray);
             return ndarray;
@@ -419,7 +495,7 @@ NDArray *NDArrayFactory_createFromZval(zval *obj, const char *type) {
 #endif
     }
 
-    zend_throw_error(NULL, "Argument must be an array if numerics, float, int, GdImage or NDArray.");
+    zend_throw_error(NULL, "Argument must be an array of numerics, float, int, string, GdImage or NDArray.");
     return NULL;
 }
 
