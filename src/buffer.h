@@ -9,7 +9,9 @@ struct MemoryStack {
     NDArray** buffer;   // Dynamic array to store NDArray pointers
     int bufferSize;     // Current size of the buffer
     int numElements;
-    int lastFreed;
+    int *freeList;      // Stack of freed UUIDs available for reuse
+    int freeListSize;   // Capacity of freeList
+    int freeListTop;    // Index of next slot to pop (-1 = empty)
     int totalGPUAllocated;
     int totalAllocated;
     int totalFreed;

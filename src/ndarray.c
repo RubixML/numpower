@@ -720,16 +720,19 @@ char *NDArray_Print(NDArray *array, int do_return) {
 
     if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT64)) {
         str = print_matrix_float64(NDArray_F64DATA(array), NDArray_NDIM(array), NDArray_SHAPE(array),
-                                   NDArray_STRIDES(array), NDArray_NUMELEMENTS(array), NDArray_DEVICE(array));
-    }
-
-    if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT32)) {
+                                   NDArray_STRIDES(array), (int)NDArray_NUMELEMENTS(array), NDArray_DEVICE(array));
+    } else if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT32)) {
         str = print_matrix_float32(NDArray_F32DATA(array), NDArray_NDIM(array), NDArray_SHAPE(array),
+                                   NDArray_STRIDES(array), (int)NDArray_NUMELEMENTS(array), NDArray_DEVICE(array));
+    } else {
+        str = print_matrix_generic(NDArray_TYPE(array), (const char *)NDArray_DATA(array),
+                                   NDArray_NDIM(array), NDArray_SHAPE(array),
                                    NDArray_STRIDES(array), NDArray_NUMELEMENTS(array), NDArray_DEVICE(array));
     }
 
     if (do_return == 0) {
         printf("%s", str);
+        efree(str);
         return NULL;
     }
 
@@ -1193,10 +1196,12 @@ NDArray_ToCPU(NDArray *target) {
     new_shape = emalloc(sizeof(int) * NDArray_NDIM(target));
     memcpy(new_shape, NDArray_SHAPE(target), sizeof(int) * NDArray_NDIM(target));
 
-    NDArray *rtn = NDArray_Empty(new_shape, n_ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+    NDArray *rtn = NDArray_Empty(new_shape, n_ndim, NDArray_TYPE(target), NDARRAY_DEVICE_CPU);
     rtn->device = NDARRAY_DEVICE_CPU;
 #ifdef HAVE_CUBLAS
-    cudaMemcpy(rtn->data, NDArray_F32DATA(target), NDArray_NUMELEMENTS(target) * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(rtn->data, NDArray_DATA(target),
+               (size_t)NDArray_NUMELEMENTS(target) * (size_t)NDArray_ELSIZE(target),
+               cudaMemcpyDeviceToHost);
 #endif
     return rtn;
 }

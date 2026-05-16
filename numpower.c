@@ -162,12 +162,25 @@ PHP_METHOD(NDArray, __construct) {
         dataTypeLen = sizeof("float32") - 1;
     }
 
-    if (dataTypeLen == 7 && memcmp(dataType, "float32", 7) == 0) {
-        ndarrayDataType = NDARRAY_TYPE_FLOAT32;
-    } else if (dataTypeLen == 7 && memcmp(dataType, "float64", 7) == 0) {
-        ndarrayDataType = NDARRAY_TYPE_FLOAT64;
-    } else {
-        zend_throw_error(NULL, "Invalid data type. Supported types are: float32, float64");
+    if      (!strcmp(dataType, "float4"))   ndarrayDataType = NDARRAY_TYPE_FLOAT4;
+    else if (!strcmp(dataType, "float8"))   ndarrayDataType = NDARRAY_TYPE_FLOAT8;
+    else if (!strcmp(dataType, "float16"))  ndarrayDataType = NDARRAY_TYPE_FLOAT16;
+    else if (!strcmp(dataType, "float32"))  ndarrayDataType = NDARRAY_TYPE_FLOAT32;
+    else if (!strcmp(dataType, "float64"))  ndarrayDataType = NDARRAY_TYPE_FLOAT64;
+    else if (!strcmp(dataType, "float128")) ndarrayDataType = NDARRAY_TYPE_FLOAT128;
+    else if (!strcmp(dataType, "int8"))     ndarrayDataType = NDARRAY_TYPE_INT8;
+    else if (!strcmp(dataType, "uint8"))    ndarrayDataType = NDARRAY_TYPE_UINT8;
+    else if (!strcmp(dataType, "int16"))    ndarrayDataType = NDARRAY_TYPE_INT16;
+    else if (!strcmp(dataType, "uint16"))   ndarrayDataType = NDARRAY_TYPE_UINT16;
+    else if (!strcmp(dataType, "int32"))    ndarrayDataType = NDARRAY_TYPE_INT32;
+    else if (!strcmp(dataType, "uint32"))   ndarrayDataType = NDARRAY_TYPE_UINT32;
+    else if (!strcmp(dataType, "int64"))    ndarrayDataType = NDARRAY_TYPE_INT64;
+    else if (!strcmp(dataType, "uint64"))   ndarrayDataType = NDARRAY_TYPE_UINT64;
+    else {
+        zend_throw_error(NULL,
+            "Invalid data type '%s'. Supported: float4, float8, float16, float32, float64, "
+            "float128, int8, uint8, int16, uint16, int32, uint32, int64, uint64", dataType);
+        return;
     }
 
     NDArray* array = NDArrayFactory_createFromZval(input, ndarrayDataType);
@@ -374,12 +387,22 @@ typedef struct {
 
 static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
 
+    /* Return FAILURE early for opcodes we don't handle so PHP can fall back
+       to __toString for string concatenation instead of crashing on ZVAL_TO_NDARRAY. */
+    switch (opcode) {
+        case ZEND_ADD: case ZEND_SUB: case ZEND_MUL:
+        case ZEND_DIV: case ZEND_POW: case ZEND_MOD:
+            break;
+        default:
+            return FAILURE;
+    }
+
     zend_object *obj = Z_OBJ_P(op1);
 
     NDArray *nda = ZVAL_TO_NDARRAY(op1);
     NDArray *ndb = ZVAL_TO_NDARRAY(op2);
 
-    if (nda == NULL | ndb == NULL) {
+    if (nda == NULL || ndb == NULL) {
         return FAILURE;
     }
 

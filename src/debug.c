@@ -4,6 +4,9 @@
 #include "debug.h"
 #include "../config.h"
 #include "ndarray.h"
+#include "ndarray_types.h"
+#include "types.h"
+#include <string.h>
 
 #ifdef HAVE_CUBLAS
 #include <cuda_runtime.h>
@@ -373,6 +376,122 @@ print_matrix_float64(double* buffer, int ndims, int* shape, int* strides, int nu
     if (device == NDARRAY_DEVICE_GPU) {
         efree(tmp_buffer);
     }
+#endif
+    return rtn;
+}
+
+/* ── Generic array printer for all non-float32/float64 dtypes ─────────────
+   Uses ndarray_element_to_string() so it handles every supported type.   */
+
+static char *print_array_generic(
+    const char *type,
+    const char *data,
+    int ndims, int *shape, int *strides,
+    int cur_dim, int *index,
+    long num_elements, int *padded)
+{
+    char elem_buf[64];
+    int  i, j, t;
+    int  reverse_run = 0;
+
+    if (num_elements == 0) {
+        char *s = (char *)emalloc(3);
+        strcpy(s, "[]");
+        return s;
+    }
+
+    /* Allocate a buffer large enough for this sub-array.
+       Each element needs at most 48 chars + separators. */
+    size_t max_sz = (size_t)num_elements * 52 + (size_t)ndims * 8 + 64;
+    if (max_sz < 256) max_sz = 256;
+    char *str = (char *)emalloc(max_sz);
+    if (!str) return NULL;
+    str[0] = '\0';
+
+    if (ndims == 0) {
+        ndarray_element_to_string(type, data, 0, elem_buf, sizeof(elem_buf));
+        snprintf(str, max_sz, "%s\n", elem_buf);
+        return str;
+    }
+
+    if (cur_dim == ndims - 1) {
+        strcat(str, "[");
+        for (i = 0; i < shape[cur_dim]; i++) {
+            index[cur_dim] = i;
+            int offset = 0;
+            for (int k = 0; k < ndims; k++) offset += index[k] * strides[k];
+            ndarray_element_to_string(type, data, (size_t)offset, elem_buf, sizeof(elem_buf));
+            strcat(str, elem_buf);
+            if (i < shape[cur_dim] - 1) strcat(str, ", ");
+            if ((i + 1) % 10 == 0 && i < shape[cur_dim] - 1) {
+                strcat(str, "\n");
+                for (t = 0; t < ndims; t++) strcat(str, " ");
+            }
+            if (shape[cur_dim] > 20 && i > 1 && reverse_run == 0) {
+                i = shape[cur_dim] - 4;
+                reverse_run = 1;
+                strcat(str, "... ");
+            }
+        }
+        strcat(str, "]");
+        if (cur_dim > 0 && index[cur_dim - 1] < shape[ndims - 2] - 1) strcat(str, "\n ");
+    } else {
+        strcat(str, "[");
+        for (i = 0; i < shape[cur_dim]; i++) {
+            index[cur_dim] = i;
+            char *child = print_array_generic(type, data, ndims, shape, strides,
+                                              cur_dim + 1, index, num_elements, padded);
+            strcat(str, child);
+            efree(child);
+            if (i < shape[cur_dim] - 1) {
+                for (j = 0; j < cur_dim; j++) strcat(str, " ");
+            }
+            if (ndims > 1 && shape[ndims - 1] * shape[ndims - 2] > 500 && shape[cur_dim] > 10) {
+                if (i >= 2 && reverse_run == 0) {
+                    i = shape[cur_dim] - 4;
+                    reverse_run = 1;
+                    strcat(str, "...\n");
+                    if (i < shape[cur_dim] - 1) {
+                        for (j = 1; j < ndims; j++) strcat(str, " ");
+                    }
+                    *padded = 1;
+                }
+            }
+        }
+        strcat(str, "]");
+        if (cur_dim != 0 && index[cur_dim - 1] < shape[cur_dim - 1] - 1) strcat(str, "\n");
+    }
+
+    if (cur_dim == 0) strcat(str, "\n");
+    return str;
+}
+
+char *print_matrix_generic(
+    const char *type,
+    const char *data,
+    int ndims, int *shape, int *strides,
+    long num_elements, int device)
+{
+    const char *tmp = data;
+    char       *gpu_buf = NULL;
+    int         elsize = get_type_size(type);
+
+    if (device == NDARRAY_DEVICE_GPU) {
+#ifdef HAVE_CUBLAS
+        gpu_buf = (char *)emalloc((size_t)num_elements * (size_t)elsize);
+        cudaMemcpy(gpu_buf, data, (size_t)num_elements * (size_t)elsize, cudaMemcpyDeviceToHost);
+        tmp = gpu_buf;
+#endif
+    }
+
+    int *index = (int *)emalloc((size_t)(ndims > 0 ? ndims : 1) * sizeof(int));
+    memset(index, 0, (size_t)(ndims > 0 ? ndims : 1) * sizeof(int));
+    int  padded = 0;
+    char *rtn = print_array_generic(type, tmp, ndims, shape, strides, 0, index, num_elements, &padded);
+    efree(index);
+
+#ifdef HAVE_CUBLAS
+    if (gpu_buf) efree(gpu_buf);
 #endif
     return rtn;
 }
