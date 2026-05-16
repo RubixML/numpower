@@ -22,7 +22,7 @@
 #include <cblas.h>
 #endif
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
 #include <immintrin.h>
 #endif
 
@@ -244,7 +244,7 @@ NDArray_Add_Float(NDArray* a, NDArray* b) {
                             NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         int i;
         __m256 vec1, vec2, sub;
 
@@ -501,7 +501,7 @@ NDArray_Multiply_Float(NDArray* a, NDArray* b) {
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         int i = 0;
         __m256 vec1, vec2, mul;
 
@@ -633,7 +633,7 @@ NDArray_Subtract_Float(NDArray* a, NDArray* b) {
                             NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         int i;
         __m256 vec1, vec2, sub;
 
@@ -769,7 +769,7 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
             float *aData = (float *) a_broad->data;
             float *bData = (float *) b_broad->data;
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
             int i;
             __m256 vec1, vec2, sub;
     
@@ -914,7 +914,7 @@ NDArray_Divide_Float(NDArray* a, NDArray* b) {
                           NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         int i;
         __m256 vec1, vec2, sub;
 
@@ -1039,7 +1039,7 @@ NDArray_Mod_Float(NDArray* a, NDArray* b) {
                        NDArray_NUMELEMENTS(a_broad));
 #endif
     } else {
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
         int i;
         __m256 vec1, vec2, vout;
 

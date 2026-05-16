@@ -30,7 +30,7 @@
 #include "../gpu_alloc.h"
 #endif
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
 #include <immintrin.h>
 #endif
 
@@ -1087,7 +1087,7 @@ NDArray_Cholesky(NDArray *a) {
         zend_throw_error(NULL, "Error calculating the cholesky decomposition. (Is $a not positive definite?)");
         return NULL;
     }
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
     int blockSize = 8; // AVX2 can process 8 single-precision floats at a time
     for (int i = 0; i < NDArray_SHAPE(a)[0]; i++) {
         // Perform AVX2 loop for blocks of 8 elements

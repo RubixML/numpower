@@ -10,7 +10,7 @@
 #include "Zend/zend_API.h"
 #include <Zend/zend_types.h>
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
 
 #include <immintrin.h>
 
@@ -185,7 +185,7 @@ NDArray_ToGD(NDArray *a, NDArray *n_alpha, zval *output) {
     int red, green, blue, alpha;
     gdImagePtr im = gdImageCreateTrueColor_(NDArray_SHAPE(a)[2], NDArray_SHAPE(a)[1]);
 
-#ifdef HAVE_AVX2
+#if HAVE_AVX2
     __m256i alpha_values;
     int elsize = NDArray_ELSIZE(a);
     __m256i alpha_mask = _mm256_set_epi32(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);

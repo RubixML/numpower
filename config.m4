@@ -4,6 +4,8 @@ PHP_ARG_ENABLE([ndarray],
     [Enable ndarray support])],
   [no])
 
+AC_CANONICAL_HOST
+
 PHP_ARG_WITH(cuda, for CUDA support,
 [  --with-cuda           Include CUDA support], [no], [no])
 
@@ -15,47 +17,28 @@ if test "$PHP_CUDA" != "no"; then
       AC_MSG_RESULT([CUBLAS detected ])
       PHP_ADD_MAKEFILE_FRAGMENT($abs_srcdir/Makefile.frag, $abs_builddir)
       CFLAGS+=" -lcublas -lcudart -lOpenCL -lclBLAS"
-      AC_CHECK_HEADER([immintrin.h],
-              [
-                AC_DEFINE(HAVE_AVX2,1,[Have AV2/SSE support])
-                AC_MSG_RESULT([AVX2/SSE detected ])
-                CXX+=" -mavx2 -march=native "
-              ],[
-                AC_DEFINE(HAVE_AVX2,0,[Have AV2/SSE support])
-                AC_MSG_RESULT([AVX2/SSE not found ])
-              ], [
-
-              ]
-          )
     ],[
         AC_MSG_RESULT([wrong cublas version or library not found.])
+    ])
+fi
+
+case $host_cpu in
+    i?86|x86_64|amd64)
         AC_CHECK_HEADER([immintrin.h],
             [
-              AC_DEFINE(HAVE_AVX2,1,[Have AV2/SSE support])
-              AC_MSG_RESULT([AVX2/SSE detected ])
+              AC_DEFINE(HAVE_AVX2,1,[Have AVX2/SSE support])
+              AC_MSG_RESULT([AVX2/SSE detected])
               CFLAGS+=" -mavx2 -march=native "
             ],[
-              AC_DEFINE(HAVE_AVX2,0,[Have AV2/SSE support])
-              AC_MSG_RESULT([AVX2/SSE not found ])
-            ], [
-
-            ]
-        )
-    ])
-else
-    AC_CHECK_HEADER([immintrin.h],
-        [
-          AC_DEFINE(HAVE_AVX2,1,[Have AV2/SSE support])
-          AC_MSG_RESULT([AVX2/SSE detected ])
-          CFLAGS+=" -mavx2 -march=native "
-        ],[
-          AC_DEFINE(HAVE_AVX2,0,[Have AV2/SSE support])
-          AC_MSG_RESULT([AVX2/SSE not found ])
-        ], [
-
-        ]
-    )
-fi
+              AC_DEFINE(HAVE_AVX2,0,[Have AVX2/SSE support])
+              AC_MSG_RESULT([AVX2/SSE not found])
+            ], [])
+        ;;
+    *)
+        AC_DEFINE(HAVE_AVX2,0,[Have AVX2/SSE support])
+        AC_MSG_RESULT([AVX2/SSE not available on $host_cpu])
+        ;;
+esac
 
 
 if test "$PHP_GD" != "no"; then
