@@ -14,8 +14,8 @@ concurrency:
 
 jobs:
   # =========================================================================
-  # Required matrix: Ubuntu LTS (22.04 / 24.04) × PHP (8.1–8.4) × CPU / CUDA
-  # All 16 combinations must pass before a PR can be merged into main.
+  # Full matrix: Ubuntu (22.04 / 24.04 / 26.04) × PHP (8.1–8.5) × CPU / CUDA
+  # All 30 combinations must pass before a PR can be merged into main.
   # =========================================================================
   test:
     name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / ${{ matrix.cuda && 'CUDA' || 'CPU' }}"
@@ -24,8 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:   [ubuntu-22.04, ubuntu-24.04]
-        php:  ['8.1', '8.2', '8.3', '8.4']
+        os:   [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+        php:  ['8.1', '8.2', '8.3', '8.4', '8.5']
         cuda: [false, true]
 
     steps:
@@ -53,7 +53,7 @@ jobs:
             libfreetype6-dev \
             libxpm-dev
 
-      # nvidia-cuda-toolkit provides libcublas + development headers on Ubuntu 22/24.
+      # nvidia-cuda-toolkit provides libcublas + development headers on Ubuntu 22/24/26.
       # GPU tests are skipped at runtime (no hardware on standard runners); this job
       # validates that the CUDA build path compiles and links correctly.
       - name: Install CUDA toolkit
@@ -96,95 +96,12 @@ jobs:
           if-no-files-found: ignore
 
   # =========================================================================
-  # Experimental matrix: ubuntu-26.04 (runner may not exist yet) + PHP 8.5
-  # (may still be in RC).  Failures here are informational — they never block
-  # a PR merge.
-  # =========================================================================
-  test-experimental:
-    name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / ${{ matrix.cuda && 'CUDA' || 'CPU' }} [exp]"
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
-
-    strategy:
-      fail-fast: false
-      matrix:
-        # All ubuntu-26.04 combinations
-        os:   [ubuntu-26.04]
-        php:  ['8.1', '8.2', '8.3', '8.4', '8.5']
-        cuda: [false, true]
-        include:
-          # PHP 8.5 on stable OSes
-          - {os: ubuntu-22.04, php: '8.5', cuda: false}
-          - {os: ubuntu-22.04, php: '8.5', cuda: true}
-          - {os: ubuntu-24.04, php: '8.5', cuda: false}
-          - {os: ubuntu-24.04, php: '8.5', cuda: true}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup PHP ${{ matrix.php }}
-        uses: shivammathur/setup-php@v2
-        with:
-          php-version: ${{ matrix.php }}
-          extensions: gd
-          tools: none
-          coverage: none
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            build-essential \
-            autoconf \
-            liblapacke-dev \
-            libopenblas-dev \
-            libjpeg-dev \
-            libpng-dev \
-            libwebp-dev \
-            libfreetype6-dev \
-            libxpm-dev
-
-      - name: Install CUDA toolkit
-        if: matrix.cuda
-        run: sudo apt-get install -y nvidia-cuda-toolkit
-
-      - name: Build extension
-        run: |
-          phpize
-          ./configure ${{ matrix.cuda && '--with-cuda' || '' }}
-          make -j$(nproc)
-
-      - name: Link CUDA objects into extension
-        if: matrix.cuda
-        run: |
-          if grep -q "HAVE_CUBLAS 1" config.h; then
-            echo "cublas detected — rebuilding modules/ndarray.so with CUDA objects"
-            make cuda-modules
-          else
-            echo "::warning::cublas not found; extension built without GPU support"
-          fi
-
-      - name: Run tests
-        run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
-
-      - name: Upload failure diffs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: "diffs-php${{ matrix.php }}-${{ matrix.os }}-${{ matrix.cuda && 'cuda' || 'cpu' }}-exp"
-          path: "**/*.diff"
-          if-no-files-found: ignore
-
-  # =========================================================================
   # Gate job — the ONLY required status check for branch protection.
   #
   # Configure in GitHub → Settings → Branches → Protection rules for "main":
   #   ✓ Require status checks to pass before merging
   #   ✓ Add status check: "All required tests passed"
   #   ✓ Require branches to be up to date before merging
-  #
-  # Experimental failures never reach this job because test-experimental is
-  # not listed in `needs`.
   # =========================================================================
   all-pass:
     name: All required tests passed
@@ -199,4 +116,4 @@ jobs:
             echo "Required test matrix failed or was cancelled: $result"
             exit 1
           fi
-          echo "All 16 required combinations passed."
+          echo "All 30 required combinations passed."
