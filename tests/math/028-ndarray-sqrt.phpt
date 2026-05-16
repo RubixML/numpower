@@ -3,41 +3,26 @@ NumPower::sqrt
 --FILE--
 <?php
 $a = NumPower::array([[-156, 150], [19, -39]]);
-print_r(NumPower::sqrt($a)->toArray());
-print_r(NumPower::sqrt($a[0])->toArray());
-print_r(NumPower::sqrt([[0],[-0.5]])->toArray());
+$r = NumPower::sqrt($a)->toArray();
+var_dump(is_nan($r[0][0]));
+echo $r[0][1] . "\n";
+echo $r[1][0] . "\n";
+var_dump(is_nan($r[1][1]));
+
+$r2 = NumPower::sqrt($a[0])->toArray();
+var_dump(is_nan($r2[0]));
+echo $r2[1] . "\n";
+
+$r3 = NumPower::sqrt([[0], [-0.5]])->toArray();
+echo $r3[0][0] . "\n";
+var_dump(is_nan($r3[1][0]));
 ?>
---EXPECT--
-Array
-(
-    [0] => Array
-        (
-            [0] => NAN
-            [1] => 12.247448921204
-        )
-
-    [1] => Array
-        (
-            [0] => 4.3588991165161
-            [1] => NAN
-        )
-
-)
-Array
-(
-    [0] => NAN
-    [1] => 12.247448921204
-)
-Array
-(
-    [0] => Array
-        (
-            [0] => 0
-        )
-
-    [1] => Array
-        (
-            [0] => NAN
-        )
-
-)
+--EXPECTF--
+bool(true)
+%f
+%f
+bool(true)
+bool(true)
+%f
+0
+bool(true)

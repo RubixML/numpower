@@ -1,5 +1,9 @@
 --TEST--
 NDArray::size() returns correct element count for arrays residing in GPU VRAM
+--SKIPIF--
+<?php
+try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
+?>
 --FILE--
 <?php
 // 1-D float32 on GPU

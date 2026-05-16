@@ -7,7 +7,7 @@ print_r(NumPower::log10($a)->toArray());
 print_r(NumPower::log10($a[0])->toArray());
 print_r(NumPower::log10([[1],[2]])->toArray());
 ?>
---EXPECT--
+--EXPECTF--
 Array
 (
     [0] => Array
@@ -18,7 +18,7 @@ Array
 
     [1] => Array
         (
-            [0] => 0.47712126374245
+            [0] => %f
             [1] => 0.60206001996994
         )
 

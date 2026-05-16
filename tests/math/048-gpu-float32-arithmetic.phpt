@@ -1,5 +1,9 @@
 --TEST--
 GPU arithmetic operations on float32 arrays
+--SKIPIF--
+<?php
+try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
+?>
 --FILE--
 <?php
 $a  = new NDArray([[1,2],[3,4]], 'float32');

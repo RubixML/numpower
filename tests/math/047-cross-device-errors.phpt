@@ -1,5 +1,9 @@
 --TEST--
 Cross-device arithmetic throws consistent device mismatch errors; same-device GPU ops work
+--SKIPIF--
+<?php
+try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
+?>
 --FILE--
 <?php
 $a  = new NDArray([[1,2],[3,4]], 'float32');
