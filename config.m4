@@ -28,6 +28,7 @@ PHP_CHECK_LIBRARY(quadmath, powq,
   [
     AC_DEFINE(HAVE_QUADMATH, 1, [Have libquadmath for full __float128 transcendental functions])
     PHP_ADD_LIBRARY(quadmath,, NDARRAY_SHARED_LIBADD)
+    CFLAGS+=" -lquadmath "
     AC_MSG_RESULT([libquadmath detected: full float128 pow/fmod precision enabled])
   ],[
     AC_MSG_RESULT([libquadmath found but quadmath.h not in search path: float128 pow/fmod will use long double fallback])
