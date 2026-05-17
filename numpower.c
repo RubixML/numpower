@@ -250,7 +250,24 @@ PHP_METHOD(NDArray, gpu) {
     if (ndarray == NULL) {
         return;
     }
-    
+
+    /* Already on the GPU: no allocation, no cudaMemcpy, no buffer copy.
+       For ndim > 0 the legacy API returns an NDArray, so we hand $this
+       back unchanged. For ndim == 0 the legacy API collapses the array
+       into a scalar zval; we read that scalar directly from the existing
+       array (which is a single DeviceToHost word and is unavoidable —
+       PHP needs the value — but no buffer is duplicated). */
+    if (NDArray_DEVICE(ndarray) == NDARRAY_DEVICE_GPU) {
+        if (NDArray_NDIM(ndarray) > 0) {
+            ZVAL_COPY(return_value, obj_zval);
+        } else if (is_type(NDArray_TYPE(ndarray), NDARRAY_TYPE_FLOAT64)) {
+            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(ndarray));
+        } else {
+            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(ndarray));
+        }
+        return;
+    }
+
     rtn = NDArray_ToGPU(ndarray);
 
     ndarray_init_new_object(rtn, return_value);
@@ -793,6 +810,18 @@ PHP_METHOD(NDArray, cpu) {
     ZEND_PARSE_PARAMETERS_END();
     NDArray* array = ZVAL_TO_NDARRAY(obj_zval);
     if (array == NULL) {
+        return;
+    }
+    /* Already on the CPU: no allocation, no copy. See PHP_METHOD(NDArray, gpu)
+       for the rationale around the ndim == 0 branch. */
+    if (NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
+        if (NDArray_NDIM(array) > 0) {
+            ZVAL_COPY(return_value, obj_zval);
+        } else if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT64)) {
+            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(array));
+        } else {
+            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(array));
+        }
         return;
     }
     rtn = NDArray_ToCPU(array);

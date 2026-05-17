@@ -27,11 +27,14 @@ int is_type(const char *type_a, const char *type_b) {
 int type_needs_string_io(const char *type) {
     /* Types not natively representable in PHP (int64/uint64 may need strings
        for values outside PHP_INT range; float4/8/16/128 always need strings
-       for full fidelity). */
+       for full fidelity). int64 is included so that string inputs like
+       "9223372036854775807" go through strtoll instead of being routed via
+       double, which silently rounds away the bottom bits past 2^53. */
     if (!strcmp(type, "float4"))   return 1;
     if (!strcmp(type, "float8"))   return 1;
     if (!strcmp(type, "float16"))  return 1;
     if (!strcmp(type, "float128")) return 1;
+    if (!strcmp(type, "int64"))    return 1;
     if (!strcmp(type, "uint64"))   return 1;
     return 0;
 }

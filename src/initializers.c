@@ -957,9 +957,11 @@ NDArray_CreateFromLongScalar(long scalar) {
 NDArray*
 NDArray_Copy(NDArray *a, int device) {
     NDArray *rtn;
+    size_t nbytes = (size_t)NDArray_NUMELEMENTS(a) * (size_t)NDArray_ELSIZE(a);
     if (device == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
         rtn = emalloc(sizeof(NDArray));
+        rtn->uuid = -1;
         rtn->dimensions = emalloc(sizeof(int) * NDArray_NDIM(a));
         memcpy(rtn->dimensions, NDArray_SHAPE(a), NDArray_NDIM(a) * sizeof(int));
         rtn->strides = emalloc(sizeof(int) * NDArray_NDIM(a));
@@ -969,11 +971,9 @@ NDArray_Copy(NDArray *a, int device) {
         rtn->flags = 0;
         rtn->base = NULL;
         rtn->ndim = NDArray_NDIM(a);
-        vmalloc((void **) &rtn->data, NDArray_NUMELEMENTS(a) * NDArray_ELSIZE(a));
-        if (NDArray_TYPE(a) == NDARRAY_TYPE_FLOAT32) {
-            cudaMemcpy(NDArray_F32DATA(rtn), NDArray_F32DATA(a), NDArray_NUMELEMENTS(a) * NDArray_ELSIZE(a), cudaMemcpyDeviceToDevice);
-        } else if (NDArray_TYPE(a) == NDARRAY_TYPE_FLOAT64) {
-            cudaMemcpy(NDArray_F64DATA(rtn), NDArray_F64DATA(a), NDArray_NUMELEMENTS(a) * NDArray_ELSIZE(a), cudaMemcpyDeviceToDevice);
+        vmalloc((void **) &rtn->data, nbytes);
+        if (nbytes > 0) {
+            cudaMemcpy(rtn->data, NDArray_DATA(a), nbytes, cudaMemcpyDeviceToDevice);
         }
         rtn->descriptor = emalloc(sizeof(NDArrayDescriptor));
         rtn->descriptor->numElements = NDArray_NUMELEMENTS(a);
@@ -986,6 +986,7 @@ NDArray_Copy(NDArray *a, int device) {
 #endif
     } else {
         rtn = emalloc(sizeof(NDArray));
+        rtn->uuid = -1;
         if (NDArray_NDIM(a) > 0) {
             rtn->dimensions = (int*)emalloc(sizeof(int) * NDArray_NDIM(a));
             memcpy(rtn->dimensions, NDArray_SHAPE(a), NDArray_NDIM(a) * sizeof(int));
@@ -1000,8 +1001,8 @@ NDArray_Copy(NDArray *a, int device) {
         rtn->flags = 0;
         rtn->ndim = NDArray_NDIM(a);
         rtn->base = NULL;
-        rtn->data = emalloc(NDArray_NUMELEMENTS(a) * NDArray_ELSIZE(a));
-        memcpy(NDArray_DATA(rtn), NDArray_DATA(a), NDArray_NUMELEMENTS(a) * NDArray_ELSIZE(a));
+        rtn->data = emalloc(nbytes);
+        memcpy(NDArray_DATA(rtn), NDArray_DATA(a), nbytes);
         rtn->descriptor = Create_Descriptor(NDArray_NUMELEMENTS(a), NDArray_ELSIZE(a), NDArray_TYPE(a));
         NDArrayIterator_INIT(rtn);
         return rtn;
