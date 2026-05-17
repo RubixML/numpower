@@ -43,6 +43,25 @@ int type_is_valid(const char *type) {
     return get_type_size(type) > 0;
 }
 
+const char *type_canonicalize(const char *type) {
+    if (type == NULL) return NULL;
+    if (!strcmp(type, "float4"))   return NDARRAY_TYPE_FLOAT4;
+    if (!strcmp(type, "float8"))   return NDARRAY_TYPE_FLOAT8;
+    if (!strcmp(type, "float16"))  return NDARRAY_TYPE_FLOAT16;
+    if (!strcmp(type, "float32"))  return NDARRAY_TYPE_FLOAT32;
+    if (!strcmp(type, "float64"))  return NDARRAY_TYPE_FLOAT64;
+    if (!strcmp(type, "float128")) return NDARRAY_TYPE_FLOAT128;
+    if (!strcmp(type, "int8"))     return NDARRAY_TYPE_INT8;
+    if (!strcmp(type, "uint8"))    return NDARRAY_TYPE_UINT8;
+    if (!strcmp(type, "int16"))    return NDARRAY_TYPE_INT16;
+    if (!strcmp(type, "uint16"))   return NDARRAY_TYPE_UINT16;
+    if (!strcmp(type, "int32"))    return NDARRAY_TYPE_INT32;
+    if (!strcmp(type, "uint32"))   return NDARRAY_TYPE_UINT32;
+    if (!strcmp(type, "int64"))    return NDARRAY_TYPE_INT64;
+    if (!strcmp(type, "uint64"))   return NDARRAY_TYPE_UINT64;
+    return NULL;
+}
+
 const char *promote_dtype(const char *a, const char *b)
 {
     /* Float promotion hierarchy matching PyTorch */

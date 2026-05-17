@@ -158,6 +158,10 @@ NDArray* NDArray_Maximum(NDArray *a, NDArray *b);
 NDArray * NDArray_Minimum(NDArray *a, NDArray *b);
 NDArray* NDArray_MaxAxis(NDArray* target, int axis);
 zval NDArray_ToPHPArray(NDArray *target);
+/* Convert an NDArray scalar (0-dim) into a PHP zval of the appropriate native
+   type for the dtype: IS_STRING for float128/uint64, IS_LONG for int/uint
+   (other than uint64), IS_DOUBLE for float4..float64. Handles GPU memory. */
+void NDArray_ScalarToZval(NDArray *array, zval *return_value);
 int *NDArray_ToIntVector(NDArray *nda);
 NDArray *NDArray_ToGPU(NDArray *target);
 NDArray *NDArray_ToCPU(NDArray *target);

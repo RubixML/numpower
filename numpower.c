@@ -226,11 +226,7 @@ void ndarray_init_new_object(NDArray* array, zval* return_value) {
         object_init_ex(return_value, phpsci_ce_NDArray);
         ZVAL_LONG(OBJ_PROP_NUM(Z_OBJ_P(return_value), 0), NDArray_UUID(array));
     } else {
-        if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT64) {
-            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(array));
-        } else {
-            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(array));
-        }
+        NDArray_ScalarToZval(array, return_value);
         NDArray_FREE(array);
     }
 }
@@ -260,10 +256,8 @@ PHP_METHOD(NDArray, gpu) {
     if (NDArray_DEVICE(ndarray) == NDARRAY_DEVICE_GPU) {
         if (NDArray_NDIM(ndarray) > 0) {
             ZVAL_COPY(return_value, obj_zval);
-        } else if (is_type(NDArray_TYPE(ndarray), NDARRAY_TYPE_FLOAT64)) {
-            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(ndarray));
         } else {
-            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(ndarray));
+            NDArray_ScalarToZval(ndarray, return_value);
         }
         return;
     }
@@ -757,12 +751,7 @@ PHP_METHOD(NDArray, toArray) {
         return;
     }
     if (NDArray_NDIM(array) == 0) {
-        if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT32) {
-            RETURN_DOUBLE(NDArray_F32DATA(array)[0]);
-        } else if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT64) {
-            RETURN_DOUBLE(NDArray_F64DATA(array)[0]);
-        }
-        NDArray_FREE(array);
+        NDArray_ScalarToZval(array, return_value);
         return;
     }
 
@@ -817,10 +806,8 @@ PHP_METHOD(NDArray, cpu) {
     if (NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
         if (NDArray_NDIM(array) > 0) {
             ZVAL_COPY(return_value, obj_zval);
-        } else if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT64)) {
-            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(array));
         } else {
-            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(array));
+            NDArray_ScalarToZval(array, return_value);
         }
         return;
     }
@@ -5402,6 +5389,80 @@ PHP_METHOD(NDArray, offsetGet) {
     return;
 }
 
+/* Scalar fast path for offsetSet: writes a single PHP scalar value into
+ * every element of [slice] using the dtype-aware ndarray_set_from_* hooks.
+ *
+ * Why this exists: ZVAL_TO_NDARRAY(IS_LONG) routes through
+ * NDArray_CreateFromLongScalar which casts to float32 (≈ 7 decimal digits).
+ * For int64 / uint64 / float128 targets that's a precision-destroying
+ * round-trip — PHP_INT_MAX (9.22e18) overflows the float32 mantissa and
+ * comes back as PHP_INT_MIN. This path stays in the target dtype the whole
+ * way.
+ */
+static int ndarray_fill_from_php_scalar(NDArray *slice, zval *value) {
+    const char *dtype = NDArray_TYPE(slice);
+    long  n     = NDArray_NUMELEMENTS(slice);
+    int   elsize = NDArray_ELSIZE(slice);
+    if (n <= 0) return 1;
+
+    char *target_data;
+    char *gpu_tmp = NULL;
+    if (NDArray_DEVICE(slice) == NDARRAY_DEVICE_GPU) {
+        gpu_tmp = emalloc((size_t)n * (size_t)elsize);
+        target_data = gpu_tmp;
+    } else {
+        target_data = (char *)NDArray_DATA(slice);
+    }
+
+    int is_int64_like = (!strcmp(dtype, "int64") || !strcmp(dtype, "uint64"));
+
+    if (Z_TYPE_P(value) == IS_STRING) {
+        const char *str = Z_STRVAL_P(value);
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_string(dtype, target_data, (size_t)i, str);
+        }
+    } else if (Z_TYPE_P(value) == IS_LONG) {
+        zend_long lv = Z_LVAL_P(value);
+        if (is_int64_like) {
+            /* Avoid double-rounding of long values for int64/uint64 dtypes. */
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)lv);
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_string(dtype, target_data, (size_t)i, tmp);
+            }
+        } else {
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_double(dtype, target_data, (size_t)i, (double)lv);
+            }
+        }
+    } else if (Z_TYPE_P(value) == IS_DOUBLE) {
+        double dv = Z_DVAL_P(value);
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, dv);
+        }
+    } else if (Z_TYPE_P(value) == IS_TRUE) {
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, 1.0);
+        }
+    } else if (Z_TYPE_P(value) == IS_FALSE) {
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, 0.0);
+        }
+    } else {
+        if (gpu_tmp) efree(gpu_tmp);
+        return 0; /* signal: caller should fall through */
+    }
+
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(slice) == NDARRAY_DEVICE_GPU) {
+        cudaMemcpy(NDArray_DATA(slice), gpu_tmp,
+                   (size_t)n * (size_t)elsize, cudaMemcpyHostToDevice);
+        efree(gpu_tmp);
+    }
+#endif
+    return 1;
+}
+
 PHP_METHOD(NDArray, offsetSet) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     zval *offset;
@@ -5421,10 +5482,27 @@ PHP_METHOD(NDArray, offsetSet) {
             zend_throw_error(NULL, "Index out of bounds");
             return;
         }
-        NDArray* nd_value = ZVAL_TO_NDARRAY(value);
         ndarray->iterator->currentIndex = (int)zval_get_long(offset);
         NDArray *rtn = NDArrayIterator_GET(ndarray);
         NDArrayIterator_REWIND(ndarray);
+
+        /* Scalar/string fast path stays in the target's dtype end-to-end. */
+        if (Z_TYPE_P(value) == IS_LONG   || Z_TYPE_P(value) == IS_DOUBLE ||
+            Z_TYPE_P(value) == IS_STRING || Z_TYPE_P(value) == IS_TRUE   ||
+            Z_TYPE_P(value) == IS_FALSE) {
+            if (ndarray_fill_from_php_scalar(rtn, value)) {
+                NDArray_FREE(rtn);
+                return;
+            }
+        }
+
+        /* Fallback: array / NDArray source — wrap and let NDArray_Overwrite
+           handle byte-copy or cast through double. */
+        NDArray* nd_value = ZVAL_TO_NDARRAY(value);
+        if (nd_value == NULL) {
+            NDArray_FREE(rtn);
+            return;
+        }
         NDArray_Overwrite(rtn, nd_value);
         NDArray_FREE(rtn);
         CHECK_INPUT_AND_FREE(value, nd_value);
@@ -5434,8 +5512,18 @@ PHP_METHOD(NDArray, offsetSet) {
     }
 }
 
+/* Wire format emitted by __serialize:
+ *   ['__ndarray__' => 1, 'dtype' => 'float128', 'shape' => [3], 'data' => [...]]
+ *
+ * The dtype field lets __unserialize reconstruct the original array with full
+ * precision — without it, the receiver defaults to float32 and silently
+ * round-trips float128/uint64/int64 through double, dropping bits.
+ *
+ * Backward compatibility: __unserialize first checks for the '__ndarray__'
+ * marker. If absent, it falls back to treating the payload as a plain PHP
+ * array and constructing a float32 NDArray (the historical lossy behaviour).
+ */
 PHP_METHOD(NDArray, __serialize) {
-    zval rtn;
     zval *obj_zval = getThis();
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
@@ -5447,23 +5535,73 @@ PHP_METHOD(NDArray, __serialize) {
         zend_throw_error(NULL, "NDArray must be on CPU RAM before it can be converted to a PHP array.");
         return;
     }
-    if (NDArray_NDIM(array) == 0) {
-        RETURN_DOUBLE(NDArray_F32DATA(array)[0]);
-        NDArray_FREE(array);
-        return;
+
+    array_init(return_value);
+
+    add_assoc_long(return_value, "__ndarray__", 1);
+    add_assoc_string(return_value, "dtype", (char *)NDArray_TYPE(array));
+
+    zval shape_arr;
+    array_init(&shape_arr);
+    for (int i = 0; i < NDArray_NDIM(array); i++) {
+        add_next_index_long(&shape_arr, (zend_long)NDArray_SHAPE(array)[i]);
     }
-    rtn = NDArray_ToPHPArray(array);
-    RETURN_ZVAL(&rtn, 0, 0);
+    add_assoc_zval(return_value, "shape", &shape_arr);
+
+    zval data_zv;
+    if (NDArray_NDIM(array) == 0) {
+        NDArray_ScalarToZval(array, &data_zv);
+    } else {
+        data_zv = NDArray_ToPHPArray(array);
+    }
+    add_assoc_zval(return_value, "data", &data_zv);
 }
 
 PHP_METHOD(NDArray, __unserialize) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
-    long offset;
     zval *data;
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ZVAL(data)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* New format: {'__ndarray__': 1, 'dtype': str, 'shape': [...], 'data': mixed} */
+    if (Z_TYPE_P(data) == IS_ARRAY) {
+        HashTable *ht = Z_ARRVAL_P(data);
+        zval *marker = zend_hash_str_find(ht, "__ndarray__", sizeof("__ndarray__") - 1);
+        zval *dtype  = zend_hash_str_find(ht, "dtype",       sizeof("dtype") - 1);
+        zval *payload = zend_hash_str_find(ht, "data",       sizeof("data") - 1);
+
+        if (marker != NULL && dtype != NULL && payload != NULL &&
+            Z_TYPE_P(dtype) == IS_STRING) {
+            /* Canonicalise: descriptor->type is stored by reference, so we
+               must use the static NDARRAY_TYPE_* pointer rather than the
+               soon-to-be-freed Z_STRVAL_P buffer. */
+            const char *canonical = type_canonicalize(Z_STRVAL_P(dtype));
+            if (canonical == NULL) {
+                zend_throw_error(NULL,
+                    "Unknown dtype '%s' in serialised NDArray payload",
+                    Z_STRVAL_P(dtype));
+                return;
+            }
+            NDArray *nda = NDArrayFactory_createFromZval(payload, canonical);
+            if (nda == NULL) {
+                if (!EG(exception)) {
+                    zend_throw_error(NULL,
+                        "Failed to reconstruct NDArray from unserialised payload");
+                }
+                return;
+            }
+            /* NDArrayFactory_createFromZval already called add_to_buffer. */
+            ZVAL_LONG(OBJ_PROP_NUM(obj, 0), NDArray_UUID(nda));
+            return;
+        }
+    }
+
+    /* Legacy format: plain PHP array, default to float32 (lossy for non-fp32 dtypes). */
     NDArray *nda = ZVAL_TO_NDARRAY(data);
+    if (nda == NULL) {
+        return;
+    }
     add_to_buffer(nda);
     ZVAL_LONG(OBJ_PROP_NUM(obj, 0), NDArray_UUID(nda));
 }

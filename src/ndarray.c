@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include "ndarray.h"
 #include "debug.h"
 #include "iterators.h"
@@ -731,7 +732,7 @@ char *NDArray_Print(NDArray *array, int do_return) {
     }
 
     if (do_return == 0) {
-        printf("%s", str);
+        php_printf("%s", str);
         efree(str);
         return NULL;
     }
@@ -1037,66 +1038,111 @@ NDArray_Max(NDArray *target) {
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "misc-no-recursion"
 
-/**
- * @param data
- * @param strides
- * @param dimensions
- * @param ndim
- * @return
- */
-zval
-convertStridedFLoat32ArrayToPHPArray(float *data, int *strides, int *dimensions, int ndim, int elsize) {
-    zval phpArray;
-    int i;
-
-    array_init_size(&phpArray, ndim);
-
-    for (i = 0; i < dimensions[0]; i++) {
-        if (ndim > 1) {
-            int j;
-            zval subArray;
-
-            float *subData = data + (i * (strides[0] / elsize));
-            int *subStrides = strides + 1;
-            int *subDimensions = dimensions + 1;
-
-            subArray = convertStridedFLoat32ArrayToPHPArray(subData, subStrides, subDimensions, ndim - 1, elsize);
-
-            add_index_zval(&phpArray, i, &subArray);
-        } else {
-            add_index_double(&phpArray, i, *(data + (i * (*strides / elsize))));
-        }
-    }
-    return phpArray;
-}
-
-zval
-convertStridedFLoat64ArrayToPHPArray(double *data, int *strides, int *dimensions, int ndim, int elsize) {
-    zval phpArray;
-    int i;
-
-    array_init_size(&phpArray, ndim);
-
-    for (i = 0; i < dimensions[0]; i++) {
-        if (ndim > 1) {
-            int j;
-            zval subArray;
-
-            double *subData = data + (i * (strides[0] / elsize));
-            int *subStrides = strides + 1;
-            int *subDimensions = dimensions + 1;
-
-            subArray = convertStridedFLoat64ArrayToPHPArray(subData, subStrides, subDimensions, ndim - 1, elsize);
-
-            add_index_zval(&phpArray, i, &subArray);
-        } else {
-            add_index_double(&phpArray, i, *(data + (i * (*strides / elsize))));
-        }
-    }
-    return phpArray;
-}
+/* The legacy convertStridedFLoat32/64ArrayToPHPArray helpers used to live
+   here. They were replaced by convertStridedTypedArrayToPHPArray (below),
+   which handles every dtype via raw byte reads instead of going through a
+   typed pointer cast. No external callers existed. */
 
 #pragma clang diagnostic pop
+
+/**
+ * Insert a single element from raw bytes into [arr] under [index] with the
+ * correct PHP zval type for the dtype:
+ *   float128, uint64               -> IS_STRING
+ *   int8/16/32/64, uint8/16/32     -> IS_LONG
+ *   float4/8/16/32/64              -> IS_DOUBLE
+ *
+ * @param arr         PHP array zval (must be array_init'd)
+ * @param index       PHP array index for the value
+ * @param type        NDArray dtype string
+ * @param data        Pointer to the contiguous data buffer base
+ * @param byte_offset Byte offset of the element inside [data]
+ * @param elsize      Element size in bytes for the dtype
+ */
+static void
+add_typed_index_from_bytes(zval *arr, int index, const char *type,
+                           const char *data, size_t byte_offset, int elsize)
+{
+    char str_buf[64];
+
+    if (is_type(type, NDARRAY_TYPE_FLOAT128) || is_type(type, NDARRAY_TYPE_UINT64)) {
+        ndarray_element_to_string(type, data, byte_offset, str_buf, sizeof(str_buf));
+        add_index_string(arr, index, str_buf);
+    } else if (is_type(type, NDARRAY_TYPE_INT8)) {
+        int8_t v = (int8_t)((const uint8_t *)(data + byte_offset))[0];
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_UINT8)) {
+        uint8_t v = ((const uint8_t *)(data + byte_offset))[0];
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_INT16)) {
+        int16_t v; memcpy(&v, data + byte_offset, 2);
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_UINT16)) {
+        uint16_t v; memcpy(&v, data + byte_offset, 2);
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_INT32)) {
+        int32_t v; memcpy(&v, data + byte_offset, 4);
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_UINT32)) {
+        uint32_t v; memcpy(&v, data + byte_offset, 4);
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_INT64)) {
+        int64_t v; memcpy(&v, data + byte_offset, 8);
+        add_index_long(arr, index, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_FLOAT4)) {
+        uint8_t nibble = (uint8_t)((const uint8_t *)(data + byte_offset))[0] & 0x0Fu;
+        add_index_double(arr, index, ndarray_fp4_to_double(nibble));
+    } else if (is_type(type, NDARRAY_TYPE_FLOAT8)) {
+        uint8_t v = ((const uint8_t *)(data + byte_offset))[0];
+        add_index_double(arr, index, ndarray_fp8_to_double(v));
+    } else if (is_type(type, NDARRAY_TYPE_FLOAT16)) {
+        uint16_t v; memcpy(&v, data + byte_offset, 2);
+        add_index_double(arr, index, ndarray_fp16_to_double(v));
+    } else if (is_type(type, NDARRAY_TYPE_FLOAT32)) {
+        float v; memcpy(&v, data + byte_offset, 4);
+        add_index_double(arr, index, (double)v);
+    } else if (is_type(type, NDARRAY_TYPE_FLOAT64)) {
+        double v; memcpy(&v, data + byte_offset, 8);
+        add_index_double(arr, index, v);
+    } else {
+        /* Unknown dtype: emit 0.0 so we never read past [data + byte_offset]. */
+        add_index_double(arr, index, 0.0);
+    }
+    (void)elsize;
+}
+
+/**
+ * Dtype-aware recursive walk that emits a PHP array reflecting the source
+ * NDArray's strided layout. Each leaf element is encoded with the PHP type
+ * mandated for its dtype (see add_typed_index_from_bytes).
+ */
+static zval
+convertStridedTypedArrayToPHPArray(const char *type, const char *data,
+                                   int *strides, int *dimensions,
+                                   int ndim, int elsize)
+{
+    zval phpArray;
+    int  i;
+    array_init_size(&phpArray, dimensions[0]);
+
+    /* ptrdiff_t so negative-stride views (reverse iteration) work correctly
+       even though no current op produces them. Defensive — matches the
+       original convertStridedFLoat*ArrayToPHPArray pattern that used signed
+       arithmetic via the typed pointer. */
+    for (i = 0; i < dimensions[0]; i++) {
+        if (ndim > 1) {
+            const char *subData = data + (ptrdiff_t)i * (ptrdiff_t)strides[0];
+            zval subArray = convertStridedTypedArrayToPHPArray(
+                type, subData, strides + 1, dimensions + 1, ndim - 1, elsize);
+            add_index_zval(&phpArray, i, &subArray);
+        } else {
+            ptrdiff_t byte_offset = (ptrdiff_t)i * (ptrdiff_t)strides[0];
+            add_typed_index_from_bytes(&phpArray, i, type, data,
+                                       (size_t)byte_offset, elsize);
+        }
+    }
+    return phpArray;
+}
 
 /**
  * Convert a NDArray to PHP Array
@@ -1106,27 +1152,79 @@ convertStridedFLoat64ArrayToPHPArray(double *data, int *strides, int *dimensions
 zval
 NDArray_ToPHPArray(NDArray *target) {
     zval phpArray;
-    if (is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT32)) {
-        phpArray = convertStridedFLoat32ArrayToPHPArray(NDArray_F32DATA(target), NDArray_STRIDES(target),
-                                                        NDArray_SHAPE(target), NDArray_NDIM(target),
-                                                        NDArray_ELSIZE(target));
-    } else if (is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT64)) {
-        phpArray = convertStridedFLoat64ArrayToPHPArray(NDArray_F64DATA(target), NDArray_STRIDES(target),
-                                                        NDArray_SHAPE(target), NDArray_NDIM(target),
-                                                        NDArray_ELSIZE(target));
-    } else {
-        /* For float16, float8, float4, float128, and integer types: convert to float64 for display */
-        NDArray *f64 = NDArray_AsType(target, NDARRAY_TYPE_FLOAT64);
-        if (f64 == NULL) {
-            array_init(&phpArray);
-            return phpArray;
-        }
-        phpArray = convertStridedFLoat64ArrayToPHPArray(NDArray_F64DATA(f64), NDArray_STRIDES(f64),
-                                                        NDArray_SHAPE(f64), NDArray_NDIM(f64),
-                                                        NDArray_ELSIZE(f64));
-        NDArray_FREE(f64);
+    if (target == NULL || NDArray_NDIM(target) == 0) {
+        array_init(&phpArray);
+        return phpArray;
     }
+    phpArray = convertStridedTypedArrayToPHPArray(
+        NDArray_TYPE(target),
+        (const char *)NDArray_DATA(target),
+        NDArray_STRIDES(target),
+        NDArray_SHAPE(target),
+        NDArray_NDIM(target),
+        NDArray_ELSIZE(target));
     return phpArray;
+}
+
+/**
+ * Convert a 0-dim NDArray scalar value to a PHP zval, choosing the right
+ * native PHP type for the dtype. Reads from GPU memory when needed.
+ */
+void
+NDArray_ScalarToZval(NDArray *array, zval *return_value) {
+    const char *type   = NDArray_TYPE(array);
+    int         elsize = NDArray_ELSIZE(array);
+    /* 32 bytes covers every supported dtype (max is float128 = 16 bytes) on
+       every platform. Fixed size keeps stack layout deterministic. */
+    char        host_buf[32];
+    const char *data;
+    char        str_buf[64];
+
+    if (NDArray_DEVICE(array) == NDARRAY_DEVICE_GPU) {
+#ifdef HAVE_CUBLAS
+        if (elsize > (int)sizeof(host_buf)) {
+            /* Defensive: should never happen with current dtypes, but rather
+               than overflow the buffer we fall back to reading 0. */
+            memset(host_buf, 0, sizeof(host_buf));
+        } else {
+            cudaMemcpy(host_buf, NDArray_DATA(array), (size_t)elsize,
+                       cudaMemcpyDeviceToHost);
+        }
+        data = host_buf;
+#else
+        data = (const char *)NDArray_DATA(array);
+#endif
+    } else {
+        data = (const char *)NDArray_DATA(array);
+    }
+
+    if (is_type(type, NDARRAY_TYPE_FLOAT128) || is_type(type, NDARRAY_TYPE_UINT64)) {
+        ndarray_element_to_string(type, data, 0, str_buf, sizeof(str_buf));
+        ZVAL_STRING(return_value, str_buf);
+    } else if (is_type(type, NDARRAY_TYPE_INT8)) {
+        ZVAL_LONG(return_value, (zend_long)(int8_t)((const uint8_t *)data)[0]);
+    } else if (is_type(type, NDARRAY_TYPE_UINT8)) {
+        ZVAL_LONG(return_value, (zend_long)((const uint8_t *)data)[0]);
+    } else if (is_type(type, NDARRAY_TYPE_INT16)) {
+        int16_t v; memcpy(&v, data, 2);
+        ZVAL_LONG(return_value, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_UINT16)) {
+        uint16_t v; memcpy(&v, data, 2);
+        ZVAL_LONG(return_value, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_INT32)) {
+        int32_t v; memcpy(&v, data, 4);
+        ZVAL_LONG(return_value, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_UINT32)) {
+        uint32_t v; memcpy(&v, data, 4);
+        ZVAL_LONG(return_value, (zend_long)v);
+    } else if (is_type(type, NDARRAY_TYPE_INT64)) {
+        int64_t v; memcpy(&v, data, 8);
+        ZVAL_LONG(return_value, (zend_long)v);
+    } else {
+        /* float4, float8, float16, float32, float64 */
+        double v = ndarray_element_to_double(type, data, 0);
+        ZVAL_DOUBLE(return_value, v);
+    }
 }
 
 /**
@@ -1548,10 +1646,44 @@ double NDArray_GetDoubleScalar(NDArray *a) {
  */
 int
 NDArray_Overwrite(NDArray *target, NDArray *values) {
-
+    /* Scalar broadcast: fill every element of [target] with the [values]
+       scalar, casting through the dtype's set-from-double / set-from-string
+       hook so non-float32 targets stay byte-correct. */
     if (NDArray_NDIM(values) == 0) {
-        NDArray_FillFloat(target, NDArray_GetFloatScalar(values));
-        return 1;
+        const char *src_type = NDArray_TYPE(values);
+        const char *dst_type = NDArray_TYPE(target);
+
+        if (NDArray_DEVICE(values) != NDARRAY_DEVICE_CPU) {
+            zend_throw_error(NULL,
+                "Scalar source for NDArray overwrite must be on CPU.");
+            return 0;
+        }
+        double scalar = ndarray_element_to_double(src_type,
+                                                  (const char *)NDArray_DATA(values), 0);
+
+        long n = NDArray_NUMELEMENTS(target);
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_double(dst_type,
+                                        (char *)NDArray_DATA(target),
+                                        (size_t)i, scalar);
+            }
+            return 1;
+        }
+#ifdef HAVE_CUBLAS
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_GPU) {
+            int elsize = NDArray_ELSIZE(target);
+            size_t bytes = (size_t)n * (size_t)elsize;
+            char *tmp = emalloc(bytes);
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_double(dst_type, tmp, (size_t)i, scalar);
+            }
+            cudaMemcpy(target->data, tmp, bytes, cudaMemcpyHostToDevice);
+            efree(tmp);
+            return 1;
+        }
+#endif
+        return 0;
     }
 
     if (NDArray_DEVICE(target) != NDArray_DEVICE(values)) {
@@ -1564,19 +1696,42 @@ NDArray_Overwrite(NDArray *target, NDArray *values) {
         return 0;
     }
 
-    if (NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
-        memcpy(NDArray_F32DATA(target), NDArray_F32DATA(values),
-               sizeof(NDArray_ELSIZE(values)) * NDArray_NUMELEMENTS(values));
-        return 1;
-    }
+    size_t bytes = (size_t)NDArray_NUMELEMENTS(values) * (size_t)NDArray_ELSIZE(values);
+
+    /* Same dtype: byte-level copy (fast path, lossless). */
+    if (is_type(NDArray_TYPE(target), NDArray_TYPE(values))) {
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
+            memcpy(NDArray_DATA(target), NDArray_DATA(values), bytes);
+            return 1;
+        }
 #ifdef HAVE_CUBLAS
-    if (NDArray_DEVICE(target) == NDARRAY_DEVICE_GPU) {
-        vmemcpyd2d(values->data, target->data,
-                            sizeof(NDArray_ELSIZE(values)) * NDArray_NUMELEMENTS(values));
-        return 1;
-    }
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_GPU) {
+            vmemcpyd2d((char *)values->data, (char *)target->data, (unsigned int)bytes);
+            return 1;
+        }
 #endif
-    return 0;
+        return 0;
+    }
+
+    /* Different dtype: convert through double per element. CPU-only.
+       (We don't have GPU cross-dtype kernels for non-float32 dtypes; the
+       caller is expected to .cpu() first, mirroring the policy in
+       NDArray_AsType.) */
+    if (NDArray_DEVICE(target) != NDARRAY_DEVICE_CPU) {
+        zend_throw_error(NULL,
+            "Cross-dtype NDArray overwrite is only supported on CPU.");
+        return 0;
+    }
+    long n = NDArray_NUMELEMENTS(values);
+    for (long i = 0; i < n; i++) {
+        double v = ndarray_element_to_double(NDArray_TYPE(values),
+                                             (const char *)NDArray_DATA(values),
+                                             (size_t)i);
+        ndarray_set_from_double(NDArray_TYPE(target),
+                                (char *)NDArray_DATA(target),
+                                (size_t)i, v);
+    }
+    return 1;
 }
 
 /**
