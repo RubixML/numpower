@@ -441,22 +441,35 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
 
     NDArray *a = nda_cast ? nda_cast : nda;
     NDArray *b = ndb_cast ? ndb_cast : ndb;
-    int use_double = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
+    int use_double  = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
+    int use_float128 = is_type(comp_type, NDARRAY_TYPE_FLOAT128);
 
     NDArray *rtn = NULL;
     switch (opcode) {
     case ZEND_ADD:
-        rtn = use_double ? NDArray_Add_Double(a, b)      : NDArray_Add_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Add_Float128(a, b)
+            : use_double   ? NDArray_Add_Double(a, b)
+                           : NDArray_Add_Float(a, b);      break;
     case ZEND_SUB:
-        rtn = use_double ? NDArray_Subtract_Double(a, b) : NDArray_Subtract_Float(a, b); break;
+        rtn = use_float128 ? NDArray_Subtract_Float128(a, b)
+            : use_double   ? NDArray_Subtract_Double(a, b)
+                           : NDArray_Subtract_Float(a, b); break;
     case ZEND_MUL:
-        rtn = use_double ? NDArray_Multiply_Double(a, b) : NDArray_Multiply_Float(a, b); break;
+        rtn = use_float128 ? NDArray_Multiply_Float128(a, b)
+            : use_double   ? NDArray_Multiply_Double(a, b)
+                           : NDArray_Multiply_Float(a, b); break;
     case ZEND_DIV:
-        rtn = use_double ? NDArray_Divide_Double(a, b)   : NDArray_Divide_Float(a, b);   break;
+        rtn = use_float128 ? NDArray_Divide_Float128(a, b)
+            : use_double   ? NDArray_Divide_Double(a, b)
+                           : NDArray_Divide_Float(a, b);   break;
     case ZEND_POW:
-        rtn = use_double ? NDArray_Pow_Double(a, b)      : NDArray_Pow_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Pow_Float128(a, b)
+            : use_double   ? NDArray_Pow_Double(a, b)
+                           : NDArray_Pow_Float(a, b);      break;
     case ZEND_MOD:
-        rtn = use_double ? NDArray_Mod_Double(a, b)      : NDArray_Mod_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Mod_Float128(a, b)
+            : use_double   ? NDArray_Mod_Double(a, b)
+                           : NDArray_Mod_Float(a, b);      break;
     default:
         break;
     }
@@ -740,10 +753,14 @@ PHP_METHOD(NDArray, toArray) {
         return;
     }
     if (NDArray_NDIM(array) == 0) {
-        if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT32) {
+        if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT32)) {
             RETURN_DOUBLE(NDArray_F32DATA(array)[0]);
-        } else if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT64) {
+        } else if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT64)) {
             RETURN_DOUBLE(NDArray_F64DATA(array)[0]);
+        } else if (is_type(NDArray_TYPE(array), NDARRAY_TYPE_FLOAT128)) {
+            char buf[64];
+            ndarray_fp128_to_string(NDArray_F128DATA(array)[0], buf, sizeof(buf));
+            RETURN_STRING(buf);
         }
         NDArray_FREE(array);
         return;

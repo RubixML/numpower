@@ -861,6 +861,13 @@ NDArray* NDArray_FillDouble(NDArray *a, double fill_value) {
     return a;
 }
 
+NDArray* NDArray_FillFloat128(NDArray *a, ndarray_fp128_t fill_value) {
+    for (int i = 0; i < NDArray_NUMELEMENTS(a); i++) {
+        NDArray_F128DATA(a)[i] = fill_value;
+    }
+    return a;
+}
+
 /**
  * @param a
  * @return

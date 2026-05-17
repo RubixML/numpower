@@ -1096,6 +1096,28 @@ convertStridedFLoat64ArrayToPHPArray(double *data, int *strides, int *dimensions
     return phpArray;
 }
 
+zval
+convertStridedFLoat128ArrayToPHPArray(ndarray_fp128_t *data, int *strides, int *dimensions, int ndim, int elsize) {
+    zval phpArray;
+    array_init_size(&phpArray, ndim);
+    for (int i = 0; i < dimensions[0]; i++) {
+        if (ndim > 1) {
+            zval subArray;
+            ndarray_fp128_t *subData = data + (i * (strides[0] / elsize));
+            int *subStrides     = strides + 1;
+            int *subDimensions  = dimensions + 1;
+            subArray = convertStridedFLoat128ArrayToPHPArray(subData, subStrides, subDimensions, ndim - 1, elsize);
+            add_index_zval(&phpArray, i, &subArray);
+        } else {
+            char buf[64];
+            ndarray_fp128_t val = *(data + (i * (*strides / elsize)));
+            ndarray_fp128_to_string(val, buf, sizeof(buf));
+            add_index_string(&phpArray, i, buf);
+        }
+    }
+    return phpArray;
+}
+
 #pragma clang diagnostic pop
 
 /**
@@ -1114,8 +1136,12 @@ NDArray_ToPHPArray(NDArray *target) {
         phpArray = convertStridedFLoat64ArrayToPHPArray(NDArray_F64DATA(target), NDArray_STRIDES(target),
                                                         NDArray_SHAPE(target), NDArray_NDIM(target),
                                                         NDArray_ELSIZE(target));
+    } else if (is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT128)) {
+        phpArray = convertStridedFLoat128ArrayToPHPArray(NDArray_F128DATA(target), NDArray_STRIDES(target),
+                                                         NDArray_SHAPE(target), NDArray_NDIM(target),
+                                                         NDArray_ELSIZE(target));
     } else {
-        /* For float16, float8, float4, float128, and integer types: convert to float64 for display */
+        /* For float16, float8, float4, and integer types: convert to float64 for display */
         NDArray *f64 = NDArray_AsType(target, NDARRAY_TYPE_FLOAT64);
         if (f64 == NULL) {
             array_init(&phpArray);

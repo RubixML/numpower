@@ -2,6 +2,7 @@
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include <string.h>
+#include <math.h>
 #include "arithmetics.h"
 #include "../../config.h"
 #include "../initializers.h"
@@ -9,6 +10,10 @@
 #include "../types.h"
 #include "../manipulation.h"
 #include "double_math.h"
+
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+#  include <quadmath.h>
+#endif
 
 #ifdef HAVE_CUBLAS
 #include <cuda_runtime.h>
@@ -1599,5 +1604,193 @@ NDArray_Mod_Double(NDArray *a, NDArray *b)
     if (a_temp != NULL) NDArray_FREE(a);
     if (b_temp != NULL) NDArray_FREE(b);
     if (broadcasted != NULL) NDArray_FREE(broadcasted);
+    return result;
+}
+
+/* ── float128 element-wise arithmetic helpers ─────────────────────────────── */
+
+static NDArray *alloc_fp128_result(NDArray *a_broad) {
+    NDArray *result = (NDArray *) emalloc(sizeof(NDArray));
+    result->strides    = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->dimensions = (int *) emalloc(a_broad->ndim * sizeof(int));
+    result->ndim       = a_broad->ndim;
+    result->data       = (char *) emalloc(a_broad->descriptor->numElements * NDARRAY_FP128_SIZE);
+    result->base       = NULL;
+    result->flags      = 0;
+    result->device     = NDARRAY_DEVICE_CPU;
+    result->descriptor = (NDArrayDescriptor *) emalloc(sizeof(NDArrayDescriptor));
+    result->descriptor->type        = NDARRAY_TYPE_FLOAT128;
+    result->descriptor->elsize      = NDARRAY_FP128_SIZE;
+    result->descriptor->numElements = a_broad->descriptor->numElements;
+    result->refcount   = 1;
+    memcpy(result->strides,    a_broad->strides,    a_broad->ndim * sizeof(int));
+    memcpy(result->dimensions, a_broad->dimensions, a_broad->ndim * sizeof(int));
+    NDArrayIterator_INIT(result);
+    return result;
+}
+
+static NDArray *fp128_broadcast_scalar(NDArray *scalar, NDArray *other) {
+    int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(other));
+    copy(NDArray_SHAPE(other), n_shape, NDArray_NDIM(other));
+    NDArray *expanded = NDArray_Zeros(n_shape, NDArray_NDIM(other),
+                                     NDARRAY_TYPE_FLOAT128, NDARRAY_DEVICE_CPU);
+    ndarray_fp128_t val;
+    memcpy(&val, scalar->data, NDARRAY_FP128_SIZE);
+    return NDArray_FillFloat128(expanded, val);
+}
+
+NDArray* NDArray_Add_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) rd[i] = ad[i] + bd[i];
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray* NDArray_Subtract_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) rd[i] = ad[i] - bd[i];
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray* NDArray_Multiply_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) rd[i] = ad[i] * bd[i];
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray* NDArray_Divide_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) rd[i] = ad[i] / bd[i];
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) {
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+        rd[i] = fmodq(ad[i], bd[i]);
+#else
+        rd[i] = (ndarray_fp128_t)fmodl((long double)ad[i], (long double)bd[i]);
+#endif
+    }
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+NDArray* NDArray_Pow_Float128(NDArray* a, NDArray* b) {
+    NDArray *a_temp = NULL, *b_temp = NULL;
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a; a = fp128_broadcast_scalar(a, b);
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b; b = fp128_broadcast_scalar(b, a);
+    }
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b); a_broad = broadcasted; b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a); b_broad = broadcasted; a_broad = a;
+    } else { a_broad = a; b_broad = b; }
+    NDArray *result = alloc_fp128_result(a_broad);
+    ndarray_fp128_t *rd = NDArray_F128DATA(result);
+    ndarray_fp128_t *ad = NDArray_F128DATA(a_broad);
+    ndarray_fp128_t *bd = NDArray_F128DATA(b_broad);
+    for (int i = 0; i < result->descriptor->numElements; i++) {
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+        rd[i] = powq(ad[i], bd[i]);
+#else
+        rd[i] = (ndarray_fp128_t)powl((long double)ad[i], (long double)bd[i]);
+#endif
+    }
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
     return result;
 }

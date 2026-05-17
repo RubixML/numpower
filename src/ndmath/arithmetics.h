@@ -26,6 +26,14 @@ NDArray* NDArray_Divide_Double(NDArray* a, NDArray* b);
 NDArray* NDArray_Mod_Double(NDArray* a, NDArray* b);
 double NDArray_Sum_Double(NDArray* a);
 
+//Float128
+NDArray* NDArray_Add_Float128(NDArray* a, NDArray* b);
+NDArray* NDArray_Subtract_Float128(NDArray* a, NDArray* b);
+NDArray* NDArray_Multiply_Float128(NDArray* a, NDArray* b);
+NDArray* NDArray_Divide_Float128(NDArray* a, NDArray* b);
+NDArray* NDArray_Pow_Float128(NDArray* a, NDArray* b);
+NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b);
+
 NDArray* NDArray_Add(NDArray* a, NDArray* b);
 
 #endif //PHPSCI_NDARRAY_ARITHMETICS_H

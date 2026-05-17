@@ -8,6 +8,7 @@ extern "C" {
 #include "stddef.h"
 #include <Zend/zend_types.h>
 #include <stdbool.h>
+#include "ndarray_types.h"
 
 #define NDARRAY_MAX_DIMS 128
 #define NDARRAY_ARRAY_C_CONTIGUOUS    0x0001
@@ -18,6 +19,7 @@ extern "C" {
 #define NDArray_DESCRIPTOR(a) ((NDArrayDescriptor *)((a)->descriptor))
 #define NDArray_F64DATA(a) ((double *)((a)->data))
 #define NDArray_F32DATA(a) ((float *)((a)->data))
+#define NDArray_F128DATA(a) ((ndarray_fp128_t *)((a)->data))
 #define NDArray_NDIM(a) ((int)((a)->ndim))
 #define NDArray_FLAGS(a) ((int)((a)->flags))
 #define NDArray_SHAPE(a) ((int *)((a)->dimensions))
