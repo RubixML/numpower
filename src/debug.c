@@ -468,7 +468,11 @@ char *print_matrix_generic(
     if (device == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
         gpu_buf = (char *)emalloc((size_t)num_elements * (size_t)elsize);
-        cudaMemcpy(gpu_buf, data, (size_t)num_elements * (size_t)elsize, cudaMemcpyDeviceToHost);
+        /* fp128 lives on GPU as double-double (hi, lo) — go through the typed
+           D2H helper so it's reassembled into native __float128 bytes for the
+           generic stringifier. Other dtypes use the same byte layout on both
+           devices, so the helper degenerates to a plain cudaMemcpy. */
+        NDArray_TypedD2H(gpu_buf, data, num_elements, type);
         tmp = gpu_buf;
 #endif
     }
