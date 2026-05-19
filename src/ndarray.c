@@ -1482,8 +1482,8 @@ static int ndarray_cast_on_gpu(NDArray *src, NDArray *dst) {
     if (is_fp4_dst || is_fp8_dst) {
         float *stage = NULL;
         vmalloc((void **)&stage, sizeof(float) * (size_t)n);
-        /* Source → float32. We've already handled fp4/fp8 sources and f16
-           source above, so the remaining sources are int*/uint*/float32/64. */
+        /* Source -> float32. We've already handled fp4/fp8 sources and f16
+           source above, so the remaining sources are int/uint/float32/float64. */
         if (!strcmp(s, "float32")) {
             cudaMemcpy(stage, NDArray_DATA(src), sizeof(float) * (size_t)n,
                        cudaMemcpyDeviceToDevice);
