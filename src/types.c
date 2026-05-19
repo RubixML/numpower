@@ -62,31 +62,111 @@ const char *type_canonicalize(const char *type) {
     return NULL;
 }
 
+/* Category constants for promote_dtype */
+#define DTYPE_CAT_UNKNOWN  0
+#define DTYPE_CAT_UINT     1
+#define DTYPE_CAT_INT      2
+#define DTYPE_CAT_FLOAT    3
+
+static int dtype_category(const char *t) {
+    if (!strcmp(t, "uint8")  || !strcmp(t, "uint16") ||
+        !strcmp(t, "uint32") || !strcmp(t, "uint64")) return DTYPE_CAT_UINT;
+    if (!strcmp(t, "int8")   || !strcmp(t, "int16")  ||
+        !strcmp(t, "int32")  || !strcmp(t, "int64"))  return DTYPE_CAT_INT;
+    if (!strcmp(t, "float4")  || !strcmp(t, "float8")  || !strcmp(t, "float16") ||
+        !strcmp(t, "float32") || !strcmp(t, "float64") || !strcmp(t, "float128"))
+        return DTYPE_CAT_FLOAT;
+    return DTYPE_CAT_UNKNOWN;
+}
+
+/* Width in bits; used inside the same numeric category to pick the wider type. */
+static int dtype_width_bits(const char *t) {
+    if (!strcmp(t, "float4"))   return 4;
+    if (!strcmp(t, "float8"))   return 8;
+    if (!strcmp(t, "float16"))  return 16;
+    if (!strcmp(t, "float32"))  return 32;
+    if (!strcmp(t, "float64"))  return 64;
+    if (!strcmp(t, "float128")) return 128;
+    if (!strcmp(t, "int8"))     return 8;
+    if (!strcmp(t, "uint8"))    return 8;
+    if (!strcmp(t, "int16"))    return 16;
+    if (!strcmp(t, "uint16"))   return 16;
+    if (!strcmp(t, "int32"))    return 32;
+    if (!strcmp(t, "uint32"))   return 32;
+    if (!strcmp(t, "int64"))    return 64;
+    if (!strcmp(t, "uint64"))   return 64;
+    return 0;
+}
+
 const char *promote_dtype(const char *a, const char *b)
 {
-    /* Float promotion hierarchy matching PyTorch */
-    static const char *const ranks[] = {
-        "float4", "float8", "float16", "float32", "float64", "float128", NULL
-    };
-    int ra = -1, rb = -1;
-    for (int i = 0; ranks[i] != NULL; i++) {
-        if (!strcmp(a, ranks[i])) ra = i;
-        if (!strcmp(b, ranks[i])) rb = i;
+    /* Type promotion matching PyTorch:
+       - float wins over int/uint
+       - within float / int / uint, the wider type wins
+       - int8 + uint8 → int16 (matches PyTorch)
+       - intN + uintN → intM where M = N*2 (e.g. int32 + uint32 → int64).
+         For int64 + uint64 there is no wider int that fits both; PyTorch
+         picks float32 in that pathological case.
+       - Equal types → return that type.                                       */
+    if (!strcmp(a, b)) return a;
+
+    int ca = dtype_category(a), cb = dtype_category(b);
+
+    /* Mixed unknown → fall back to a. */
+    if (ca == DTYPE_CAT_UNKNOWN && cb == DTYPE_CAT_UNKNOWN) return a;
+    if (ca == DTYPE_CAT_UNKNOWN) return b;
+    if (cb == DTYPE_CAT_UNKNOWN) return a;
+
+    /* Float wins over int/uint regardless of width. */
+    if (ca == DTYPE_CAT_FLOAT && cb != DTYPE_CAT_FLOAT) return a;
+    if (cb == DTYPE_CAT_FLOAT && ca != DTYPE_CAT_FLOAT) return b;
+
+    /* Same category → pick wider. */
+    if (ca == cb) {
+        int wa = dtype_width_bits(a), wb = dtype_width_bits(b);
+        return wa >= wb ? a : b;
     }
-    /* If types not found in float hierarchy, return 'a' as fallback */
-    if (ra < 0 && rb < 0) return a;
-    if (ra < 0) return b;
-    if (rb < 0) return a;
-    return (ra >= rb) ? a : b;
+
+    /* int + uint of same width: promote to next signed int wide enough to hold both. */
+    int wa = dtype_width_bits(a), wb = dtype_width_bits(b);
+    int wmax = wa > wb ? wa : wb;
+    if (wa == wb) {
+        switch (wmax) {
+            case 8:  return "int16";
+            case 16: return "int32";
+            case 32: return "int64";
+            case 64: return "float32"; /* nothing wider in int family; PyTorch picks float */
+        }
+    }
+    /* int wider than uint, or vice versa: signed needs to fit, prefer the int type if wider. */
+    if (ca == DTYPE_CAT_INT  && wa >  wb) return a;
+    if (cb == DTYPE_CAT_INT  && wb >  wa) return b;
+    /* uint wider than int → need signed type strictly wider than the uint. */
+    int wuint = (ca == DTYPE_CAT_UINT) ? wa : wb;
+    switch (wuint) {
+        case 8:  return "int16";
+        case 16: return "int32";
+        case 32: return "int64";
+        case 64: return "float32";
+    }
+    return a;
 }
 
 const char *compute_dtype_for_arithmetic(const char *result_dtype)
 {
-    /* float16 and below need to be computed in float32 since there's no native CPU fp16 arithmetic */
-    if (!strcmp(result_dtype, "float4")  ||
-        !strcmp(result_dtype, "float8")  ||
-        !strcmp(result_dtype, "float16")) {
-        return "float32";
+    /* Map any dtype to a float compute type. The arithmetic kernels are only
+       implemented for float32 / float64 / float128, so non-float dtypes are
+       upcast and the dispatcher casts the result back to result_dtype.
+       Cast-back is value-preserving for all integer values that fit in the
+       chosen compute type's mantissa (53 bits for float64); int64/uint64
+       values above 2^53 round, matching PyTorch behavior when forced through
+       a 64-bit float. */
+    if (!strcmp(result_dtype, "float128")) return "float128";
+    if (!strcmp(result_dtype, "float64"))  return "float64";
+    if (!strcmp(result_dtype, "int32")  || !strcmp(result_dtype, "uint32") ||
+        !strcmp(result_dtype, "int64")  || !strcmp(result_dtype, "uint64")) {
+        return "float64";
     }
-    return result_dtype;
+    /* float4, float8, float16, float32, int8, uint8, int16, uint16 → float32 */
+    return "float32";
 }

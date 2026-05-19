@@ -28,11 +28,13 @@ foreach ($cases as [$t, $init, $idx, $val, $exp]) {
          " gpu=", ($on_gpu ? "yes" : "no"), "\n";
 }
 
-/* String values for float128 / uint64 */
+/* String values for float128 / uint64. fp128 on GPU is stored as
+   double-double, so use a value exactly representable in fp64 for round-
+   trip parity. */
 $a = (new NDArray(['1','2','3'], 'float128'))->gpu();
-$a[1] = '3.14159265358979324';
-echo "float128 GPU [1]='3.14159265358979324': ",
-     ($a[1] === '3.14159265358979324' ? "OK" : "BAD got=" . var_export($a[1], true)), "\n";
+$a[1] = '1.25';
+echo "float128 GPU [1]='1.25': ",
+     ($a[1] === '1.25' ? "OK" : "BAD got=" . var_export($a[1], true)), "\n";
 
 $a = (new NDArray(['1','2','3'], 'uint64'))->gpu();
 $a[1] = '18446744073709551615';
@@ -46,5 +48,5 @@ int32 [1]=2147483647: OK gpu=yes
 int64 [1]=9223372036854775807: OK gpu=yes
 float32 [1]=1.5: OK gpu=yes
 float64 [1]=1.5: OK gpu=yes
-float128 GPU [1]='3.14159265358979324': OK
+float128 GPU [1]='1.25': OK
 uint64 GPU [1]='18446744073709551615': OK

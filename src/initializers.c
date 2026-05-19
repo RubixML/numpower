@@ -861,6 +861,17 @@ NDArray* NDArray_FillDouble(NDArray *a, double fill_value) {
     return a;
 }
 
+NDArray* NDArray_FillFloat128(NDArray *a, ndarray_fp128_t fill_value) {
+    if (NDArray_DEVICE(a) != NDARRAY_DEVICE_CPU) {
+        zend_throw_error(NULL, "NDArray_FillFloat128: float128 is CPU-only.");
+        return NULL;
+    }
+    for (int i = 0; i < NDArray_NUMELEMENTS(a); i++) {
+        NDArray_F128DATA(a)[i] = fill_value;
+    }
+    return a;
+}
+
 /**
  * @param a
  * @return

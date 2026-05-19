@@ -1,10 +1,15 @@
 #include "ndarray_types.h"
+#include "../config.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <inttypes.h>
+
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+#  include <quadmath.h>
+#endif
 
 /* ══════════════════════════════════════════════════════════════════════════
    float4 – E2M1 format (1 sign | 2 exponent | 1 mantissa), bias = 1
@@ -186,8 +191,13 @@ double ndarray_fp128_to_double(ndarray_fp128_t val) {
 }
 
 void ndarray_fp128_to_string(ndarray_fp128_t val, char *buf, size_t bufsize) {
-#if NDARRAY_HAVE_FLOAT128
-    /* Convert via long double to get ~18-19 significant digits. */
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+    /* libquadmath supplies %Qg which renders all 113 mantissa bits (~34
+       decimal digits). Use it when available so fp128 round-trips show the
+       full precision the CPU compute actually retains. */
+    quadmath_snprintf(buf, bufsize, "%.34Qg", val);
+#elif NDARRAY_HAVE_FLOAT128
+    /* libquadmath not present: long double has ~18-19 significant digits. */
     long double ld = (long double)val;
     snprintf(buf, bufsize, "%.18Lg", ld);
 #else
@@ -196,9 +206,14 @@ void ndarray_fp128_to_string(ndarray_fp128_t val, char *buf, size_t bufsize) {
 }
 
 ndarray_fp128_t ndarray_string_to_fp128(const char *str) {
+#if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
+    char *endptr;
+    return strtoflt128(str, &endptr);
+#else
     char *endptr;
     long double ld = strtold(str, &endptr);
     return (ndarray_fp128_t)ld;
+#endif
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

@@ -1190,6 +1190,20 @@ NDArray_ScalarToZval(NDArray *array, zval *return_value) {
             cudaMemcpy(host_buf, NDArray_DATA(array), (size_t)elsize,
                        cudaMemcpyDeviceToHost);
         }
+        /* float128 on GPU is stored as double-double (hi, lo). Reassemble
+           into a __float128 before letting the dtype-aware reader interpret
+           the bytes as a normal fp128 value. When lo == 0 (including the
+           inf/nan/±0 special cases) use hi alone — adding +0.0 to -0.0
+           would discard the negative sign of zero per IEEE-754. */
+        if (is_type(type, NDARRAY_TYPE_FLOAT128)) {
+            double hi, lo;
+            memcpy(&hi, host_buf,        sizeof(double));
+            memcpy(&lo, host_buf + 8,    sizeof(double));
+            ndarray_fp128_t v = (lo == 0.0)
+                ? (ndarray_fp128_t)hi
+                : (ndarray_fp128_t)hi + (ndarray_fp128_t)lo;
+            memcpy(host_buf, &v, NDARRAY_FP128_SIZE);
+        }
         data = host_buf;
 #else
         data = (const char *)NDArray_DATA(array);
@@ -1257,7 +1271,7 @@ NDArray_ToIntVector(NDArray *nda) {
 NDArray *
 NDArray_ToGPU(NDArray *target) {
 #ifdef HAVE_CUBLAS
-    float *tmp_gpu;
+    char *tmp_gpu;
     int *new_shape;
     int n_ndim = NDArray_NDIM(target);
 
@@ -1271,8 +1285,33 @@ NDArray_ToGPU(NDArray *target) {
     NDArray *rtn = NDArray_Zeros(new_shape, n_ndim, NDArray_TYPE(target), NDArray_DEVICE(target));
     rtn->device = NDARRAY_DEVICE_GPU;
 
-    vmalloc((void **) &tmp_gpu, NDArray_NUMELEMENTS(target) * NDArray_ELSIZE(target));
-    cudaMemcpy(tmp_gpu, NDArray_DATA(target), NDArray_NUMELEMENTS(target) * NDArray_ELSIZE(target), cudaMemcpyHostToDevice);
+    long n = NDArray_NUMELEMENTS(target);
+    size_t bytes = (size_t)n * (size_t)NDArray_ELSIZE(target);
+
+    if (!strcmp(NDArray_TYPE(target), "float128")) {
+        /* fp128 on GPU is stored as double-double: each element is two doubles
+           (hi, lo). Convert here at the boundary. Staging buffer on CPU. */
+        double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
+        ndarray_fp128_t *src = (ndarray_fp128_t *)NDArray_DATA(target);
+        for (long i = 0; i < n; i++) {
+            double hi = (double)src[i];
+            double lo;
+            if (isinf(hi) || isnan(hi)) {
+                lo = 0.0;
+            } else {
+                lo = (double)(src[i] - (ndarray_fp128_t)hi);
+            }
+            staging[2*i]   = hi;
+            staging[2*i+1] = lo;
+        }
+        vmalloc((void **) &tmp_gpu, bytes); /* 2*n*8 = n*16 = bytes */
+        cudaMemcpy(tmp_gpu, staging, bytes, cudaMemcpyHostToDevice);
+        efree(staging);
+    } else {
+        vmalloc((void **) &tmp_gpu, bytes);
+        cudaMemcpy(tmp_gpu, NDArray_DATA(target), bytes, cudaMemcpyHostToDevice);
+    }
+
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         zend_throw_error(NULL, "Error synchronizing: %s\n", cudaGetErrorString(err));
@@ -1307,30 +1346,236 @@ NDArray_ToCPU(NDArray *target) {
     NDArray *rtn = NDArray_Empty(new_shape, n_ndim, NDArray_TYPE(target), NDARRAY_DEVICE_CPU);
     rtn->device = NDARRAY_DEVICE_CPU;
 #ifdef HAVE_CUBLAS
-    cudaMemcpy(rtn->data, NDArray_DATA(target),
-               (size_t)NDArray_NUMELEMENTS(target) * (size_t)NDArray_ELSIZE(target),
-               cudaMemcpyDeviceToHost);
+    long n = NDArray_NUMELEMENTS(target);
+    size_t bytes = (size_t)n * (size_t)NDArray_ELSIZE(target);
+
+    if (!strcmp(NDArray_TYPE(target), "float128")) {
+        /* Convert dd → __float128 at the boundary. */
+        double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
+        cudaMemcpy(staging, NDArray_DATA(target), bytes, cudaMemcpyDeviceToHost);
+        ndarray_fp128_t *dst = (ndarray_fp128_t *)rtn->data;
+        for (long i = 0; i < n; i++) {
+            double hi_d = staging[2*i];
+            double lo_d = staging[2*i+1];
+            ndarray_fp128_t hi = (ndarray_fp128_t)hi_d;
+            ndarray_fp128_t lo = (ndarray_fp128_t)lo_d;
+            /* Preserve sign of zero / INF / NaN. */
+            dst[i] = (lo_d == 0.0) ? hi : hi + lo;
+        }
+        efree(staging);
+    } else {
+        cudaMemcpy(rtn->data, NDArray_DATA(target), bytes, cudaMemcpyDeviceToHost);
+    }
 #endif
     return rtn;
 }
 
-/**
- * Cast NDArray to a different dtype, returning a new CPU NDArray.
- *
- * @param src         Source array
- * @param target_type Target dtype string
- * @return New NDArray with elements converted to target_type, or NULL on error
- */
+/* GPU cast dispatcher: pick the right cuda_cast_<src>_to_<dst> kernel based
+   on src and dst dtype strings. The dd128 storage on GPU is handled by the
+   ToGPU/ToCPU boundary, so this function does not need to handle "float128"
+   directly. float4/float8 stay 1 byte per element on GPU (we cast through
+   their CPU helpers when crossing dtype lines because there's no native CUDA
+   intrinsic; for now we fall back to CPU AsType for float4/float8 sources
+   and targets only). */
+#ifdef HAVE_CUBLAS
+#include "ndmath/cuda/cuda_math.h"
+static int ndarray_cast_on_gpu(NDArray *src, NDArray *dst) {
+    const char *s = NDArray_TYPE(src);
+    const char *d = NDArray_TYPE(dst);
+    int n = (int)NDArray_NUMELEMENTS(src);
+
+#define CAST_ROUTE_FOR_SRC(SRC_STR, SRC_TYPE, SRC_TAG)                              \
+    if (!strcmp(s, SRC_STR)) {                                                      \
+        SRC_TYPE *src_p = (SRC_TYPE *)NDArray_DATA(src);                            \
+        if (!strcmp(d, "int8"))   { cuda_cast_##SRC_TAG##_to_i8 (src_p, (int8_t  *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "uint8"))  { cuda_cast_##SRC_TAG##_to_u8 (src_p, (uint8_t *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "int16"))  { cuda_cast_##SRC_TAG##_to_i16(src_p, (int16_t *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "uint16")) { cuda_cast_##SRC_TAG##_to_u16(src_p, (uint16_t*)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "int32"))  { cuda_cast_##SRC_TAG##_to_i32(src_p, (int32_t *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "uint32")) { cuda_cast_##SRC_TAG##_to_u32(src_p, (uint32_t*)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "int64"))  { cuda_cast_##SRC_TAG##_to_i64(src_p, (int64_t *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "uint64")) { cuda_cast_##SRC_TAG##_to_u64(src_p, (uint64_t*)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "float32")){ cuda_cast_##SRC_TAG##_to_f32(src_p, (float   *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "float64")){ cuda_cast_##SRC_TAG##_to_f64(src_p, (double  *)NDArray_DATA(dst), n); return 0; } \
+        if (!strcmp(d, "float16")){ cuda_cast_##SRC_TAG##_to_f16(src_p, (uint16_t*)NDArray_DATA(dst), n); return 0; } \
+    }
+
+    CAST_ROUTE_FOR_SRC("int8",    int8_t,   i8)
+    CAST_ROUTE_FOR_SRC("uint8",   uint8_t,  u8)
+    CAST_ROUTE_FOR_SRC("int16",   int16_t,  i16)
+    CAST_ROUTE_FOR_SRC("uint16",  uint16_t, u16)
+    CAST_ROUTE_FOR_SRC("int32",   int32_t,  i32)
+    CAST_ROUTE_FOR_SRC("uint32",  uint32_t, u32)
+    CAST_ROUTE_FOR_SRC("int64",   int64_t,  i64)
+    CAST_ROUTE_FOR_SRC("uint64",  uint64_t, u64)
+    CAST_ROUTE_FOR_SRC("float32", float,    f32)
+    CAST_ROUTE_FOR_SRC("float64", double,   f64)
+
+    /* float16 source */
+    if (!strcmp(s, "float16")) {
+        uint16_t *src_p = (uint16_t *)NDArray_DATA(src);
+        if (!strcmp(d, "int8"))   { cuda_cast_f16_to_i8 (src_p, (int8_t  *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "uint8"))  { cuda_cast_f16_to_u8 (src_p, (uint8_t *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "int16"))  { cuda_cast_f16_to_i16(src_p, (int16_t *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "uint16")) { cuda_cast_f16_to_u16(src_p, (uint16_t*)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "int32"))  { cuda_cast_f16_to_i32(src_p, (int32_t *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "uint32")) { cuda_cast_f16_to_u32(src_p, (uint32_t*)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "int64"))  { cuda_cast_f16_to_i64(src_p, (int64_t *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "uint64")) { cuda_cast_f16_to_u64(src_p, (uint64_t*)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "float32")){ cuda_cast_f16_to_f32(src_p, (float   *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "float64")){ cuda_cast_f16_to_f64(src_p, (double  *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "float16")){ cuda_cast_f16_to_f16(src_p, (uint16_t*)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "float4")) { cuda_cast_f16_to_fp4(src_p, (uint8_t *)NDArray_DATA(dst), n); return 0; }
+        if (!strcmp(d, "float8")) { cuda_cast_f16_to_fp8(src_p, (uint8_t *)NDArray_DATA(dst), n); return 0; }
+    }
+
+    /* float4 and float8 sources: stage through float32 on GPU when the
+       destination isn't directly supported. (fp4/fp8 ↔ float16 has direct
+       kernels.) */
+    int is_fp4_src = !strcmp(s, "float4");
+    int is_fp8_src = !strcmp(s, "float8");
+    if (is_fp4_src || is_fp8_src) {
+        uint8_t *src_p = (uint8_t *)NDArray_DATA(src);
+        /* Direct fast paths to float16. */
+        if (!strcmp(d, "float16")) {
+            if (is_fp4_src) cuda_cast_fp4_to_f16(src_p, (uint16_t *)NDArray_DATA(dst), n);
+            else            cuda_cast_fp8_to_f16(src_p, (uint16_t *)NDArray_DATA(dst), n);
+            return 0;
+        }
+        /* float4 → float4 / float8 → float8: byte copy (caller would already
+           have returned via the same-dtype shortcut, but defend anyway). */
+        if (!strcmp(d, s)) {
+            cudaMemcpy(NDArray_DATA(dst), src_p, (size_t)n, cudaMemcpyDeviceToDevice);
+            return 0;
+        }
+        /* Stage through float32 GPU buffer for everything else. */
+        float *stage = NULL;
+        vmalloc((void **)&stage, sizeof(float) * (size_t)n);
+        if (is_fp4_src) cuda_cast_fp4_to_f32(src_p, stage, n);
+        else            cuda_cast_fp8_to_f32(src_p, stage, n);
+        if (!strcmp(d, "float32")) {
+            cudaMemcpy(NDArray_DATA(dst), stage, sizeof(float) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+        } else if (!strcmp(d, "float4")) {
+            cuda_cast_f32_to_fp4(stage, (uint8_t *)NDArray_DATA(dst), n);
+        } else if (!strcmp(d, "float8")) {
+            cuda_cast_f32_to_fp8(stage, (uint8_t *)NDArray_DATA(dst), n);
+        } else if (!strcmp(d, "float64")) {
+            cuda_cast_f32_to_f64(stage, (double *)NDArray_DATA(dst), n);
+        } else if (!strcmp(d, "int8"))   { cuda_cast_f32_to_i8 (stage, (int8_t  *)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "uint8"))    { cuda_cast_f32_to_u8 (stage, (uint8_t *)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "int16"))    { cuda_cast_f32_to_i16(stage, (int16_t *)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "uint16"))   { cuda_cast_f32_to_u16(stage, (uint16_t*)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "int32"))    { cuda_cast_f32_to_i32(stage, (int32_t *)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "uint32"))   { cuda_cast_f32_to_u32(stage, (uint32_t*)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "int64"))    { cuda_cast_f32_to_i64(stage, (int64_t *)NDArray_DATA(dst), n); }
+        else if (!strcmp(d, "uint64"))   { cuda_cast_f32_to_u64(stage, (uint64_t*)NDArray_DATA(dst), n); }
+        else { vfree(stage); return -1; }
+        vfree(stage);
+        return 0;
+    }
+
+    /* float4 / float8 destination (source is not fp4 / fp8): stage through
+       float32 on GPU, then quantise. */
+    int is_fp4_dst = !strcmp(d, "float4");
+    int is_fp8_dst = !strcmp(d, "float8");
+    if (is_fp4_dst || is_fp8_dst) {
+        float *stage = NULL;
+        vmalloc((void **)&stage, sizeof(float) * (size_t)n);
+        /* Source → float32. We've already handled fp4/fp8 sources and f16
+           source above, so the remaining sources are int*/uint*/float32/64. */
+        if (!strcmp(s, "float32")) {
+            cudaMemcpy(stage, NDArray_DATA(src), sizeof(float) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+        }
+        else if (!strcmp(s, "float64")) cuda_cast_f64_to_f32((double  *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "int8"))    cuda_cast_i8_to_f32 ((int8_t  *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "uint8"))   cuda_cast_u8_to_f32 ((uint8_t *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "int16"))   cuda_cast_i16_to_f32((int16_t *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "uint16"))  cuda_cast_u16_to_f32((uint16_t*)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "int32"))   cuda_cast_i32_to_f32((int32_t *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "uint32"))  cuda_cast_u32_to_f32((uint32_t*)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "int64"))   cuda_cast_i64_to_f32((int64_t *)NDArray_DATA(src), stage, n);
+        else if (!strcmp(s, "uint64"))  cuda_cast_u64_to_f32((uint64_t*)NDArray_DATA(src), stage, n);
+        else { vfree(stage); return -1; }
+
+        if (is_fp4_dst) cuda_cast_f32_to_fp4(stage, (uint8_t *)NDArray_DATA(dst), n);
+        else            cuda_cast_f32_to_fp8(stage, (uint8_t *)NDArray_DATA(dst), n);
+        vfree(stage);
+        return 0;
+    }
+
+#undef CAST_ROUTE_FOR_SRC
+    return -1;
+}
+#endif
+
+/* Typed H2D / D2H — fp128 needs CPU-side conversion to/from double-double.
+   Other dtypes are byte-for-byte memcpy. */
+void NDArray_TypedH2D(char *gpu_dst, const char *cpu_src, long n, const char *dtype) {
+#ifdef HAVE_CUBLAS
+    if (n <= 0) return;
+    if (!strcmp(dtype, "float128")) {
+        double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
+        const ndarray_fp128_t *src = (const ndarray_fp128_t *)cpu_src;
+        for (long i = 0; i < n; i++) {
+            double hi = (double)src[i];
+            /* IEEE-754 special handling: ±INF and NaN are exactly representable
+               in fp64 so hi captures the special value; lo must be a finite
+               companion (0.0) — otherwise (x - x) on a non-finite produces NaN
+               which would corrupt the value on round-trip. */
+            double lo;
+            if (isinf(hi) || isnan(hi)) {
+                lo = 0.0;
+            } else {
+                lo = (double)(src[i] - (ndarray_fp128_t)hi);
+            }
+            staging[2*i]     = hi;
+            staging[2*i + 1] = lo;
+        }
+        cudaMemcpy(gpu_dst, staging, (size_t)n * 16, cudaMemcpyHostToDevice);
+        efree(staging);
+    } else {
+        int elsize = get_type_size(dtype);
+        cudaMemcpy(gpu_dst, cpu_src, (size_t)n * (size_t)elsize, cudaMemcpyHostToDevice);
+    }
+#else
+    (void)gpu_dst; (void)cpu_src; (void)n; (void)dtype;
+#endif
+}
+
+void NDArray_TypedD2H(char *cpu_dst, const char *gpu_src, long n, const char *dtype) {
+#ifdef HAVE_CUBLAS
+    if (n <= 0) return;
+    if (!strcmp(dtype, "float128")) {
+        double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
+        cudaMemcpy(staging, gpu_src, (size_t)n * 16, cudaMemcpyDeviceToHost);
+        ndarray_fp128_t *dst = (ndarray_fp128_t *)cpu_dst;
+        for (long i = 0; i < n; i++) {
+            double hi_d = staging[2*i];
+            double lo_d = staging[2*i + 1];
+            ndarray_fp128_t hi = (ndarray_fp128_t)hi_d;
+            ndarray_fp128_t lo = (ndarray_fp128_t)lo_d;
+            /* Preserve sign of zero / INF / NaN: when lo == 0 use hi alone. */
+            dst[i] = (lo_d == 0.0) ? hi : hi + lo;
+        }
+        efree(staging);
+    } else {
+        int elsize = get_type_size(dtype);
+        cudaMemcpy(cpu_dst, gpu_src, (size_t)n * (size_t)elsize, cudaMemcpyDeviceToHost);
+    }
+#else
+    (void)cpu_dst; (void)gpu_src; (void)n; (void)dtype;
+#endif
+}
+
 NDArray *
 NDArray_AsType(NDArray *src, const char *target_type)
 {
-    if (NDArray_DEVICE(src) == NDARRAY_DEVICE_GPU) {
-        zend_throw_error(NULL, "Type casting of GPU arrays is not supported. Move to CPU first.");
-        return NULL;
-    }
     if (is_type(NDArray_TYPE(src), target_type)) {
-        return NDArray_Copy(src, NDARRAY_DEVICE_CPU);
+        return NDArray_Copy(src, NDArray_DEVICE(src));
     }
+
     int ndim = NDArray_NDIM(src);
     int *shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
     if (ndim > 0) {
@@ -1338,6 +1583,56 @@ NDArray_AsType(NDArray *src, const char *target_type)
     } else {
         shape[0] = 1;
     }
+
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(src) == NDARRAY_DEVICE_GPU) {
+        /* float128 ⇄ * still goes through CPU because the dd⇄fp128 conversion
+           lives at the ToGPU/ToCPU boundary. All other dtypes (incl. float4
+           and float8 via on-GPU staging through float32) cast on GPU. */
+        const char *st = NDArray_TYPE(src);
+        int src_castable_on_gpu = (strcmp(st, "float128") != 0);
+        int dst_castable_on_gpu = (strcmp(target_type, "float128") != 0);
+
+        if (src_castable_on_gpu && dst_castable_on_gpu) {
+            NDArray *rtn = NDArray_Empty(shape, ndim, target_type, NDARRAY_DEVICE_GPU);
+            if (rtn == NULL) {
+                efree(shape);
+                return NULL;
+            }
+            if (ndarray_cast_on_gpu(src, rtn) == 0) {
+                return rtn;
+            }
+            /* Should never happen given the dtype check above; defensively
+               free and fall through to CPU path. */
+            NDArray_FREE(rtn);
+            /* shape was consumed by NDArray_Empty -> Create_NDArray (stored
+               in rtn->dimensions and freed by NDArray_FREE). Allocate fresh. */
+            shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
+            if (ndim > 0) memcpy(shape, NDArray_SHAPE(src), sizeof(int) * ndim);
+            else shape[0] = 1;
+        }
+        /* CPU fallback for float4/float8/float128 source or destination. */
+        NDArray *cpu_src = NDArray_ToCPU(src);
+        if (cpu_src == NULL) { efree(shape); return NULL; }
+        NDArray *cpu_dst = NDArray_Empty(shape, ndim, target_type, NDARRAY_DEVICE_CPU);
+        if (cpu_dst == NULL) { NDArray_FREE(cpu_src); return NULL; }
+        long n = NDArray_NUMELEMENTS(cpu_src);
+        for (long i = 0; i < n; i++) {
+            double val = ndarray_element_to_double(NDArray_TYPE(cpu_src), NDArray_DATA(cpu_src), (size_t)i);
+            ndarray_set_from_double(target_type, NDArray_DATA(cpu_dst), (size_t)i, val);
+        }
+        NDArray_FREE(cpu_src);
+        /* Move result back to GPU unless target is float128 (no GPU repr). */
+        if (strcmp(target_type, "float128") == 0) {
+            return cpu_dst;
+        }
+        NDArray *gpu_dst = NDArray_ToGPU(cpu_dst);
+        NDArray_FREE(cpu_dst);
+        return gpu_dst;
+    }
+#endif
+
+    /* CPU path */
     NDArray *rtn = NDArray_Empty(shape, ndim, target_type, NDARRAY_DEVICE_CPU);
     if (rtn == NULL) {
         efree(shape);
@@ -1678,7 +1973,8 @@ NDArray_Overwrite(NDArray *target, NDArray *values) {
             for (long i = 0; i < n; i++) {
                 ndarray_set_from_double(dst_type, tmp, (size_t)i, scalar);
             }
-            cudaMemcpy(target->data, tmp, bytes, cudaMemcpyHostToDevice);
+            /* fp128 on GPU is dd-encoded — go through the typed H2D wrapper. */
+            NDArray_TypedH2D(target->data, tmp, n, dst_type);
             efree(tmp);
             return 1;
         }

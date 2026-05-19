@@ -24,7 +24,9 @@ $cases = [
     'float16'  => [['1.5', '-1.5', '0.5', '-0.5'],              'float'],
     'float32'  => [[0.0, -1.5, 1e3, -1e3],                      'float'],
     'float64'  => [[0.0, -1.5, 1e3, -1e3],                      'float'],
-    'float128' => [['1e3', '-1.5', '1e-9', '1e9'],              'string'],
+    /* fp128 GPU uses double-double; restrict to fp64-exact values so the
+       string round-trip is bit-identical to CPU. */
+    'float128' => [['1e3', '-1.5', '1.25', '1e9'],              'string'],
 
     'int8'     => [[-128, -1, 0, 127],                          'int'],
     'uint8'    => [[0, 1, 128, 255],                            'int'],

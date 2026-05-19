@@ -14,7 +14,8 @@ try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMe
 $cases = [
     'float32'  => [[0.0, 1.5, -1.5], [1e3, 1e-3, -1e3]],
     'float64'  => [[0.0, 1.5, -1.5], [1e3, 1e-3, -1e3]],
-    'float128' => [['0', '1.5', '-1.5'], ['1e3', '1e-9', '-1e3']],
+    /* fp128 GPU stored as dd; use fp64-exact values for bit parity. */
+    'float128' => [['0', '1.5', '-1.5'], ['1e3', '1.25', '-1e3']],
     'int8'     => [[-128, -1, 0], [1, 64, 127]],
     'int32'    => [[-2147483648, 0, 1], [2147483647, -1, 7]],
     'int64'    => [[PHP_INT_MIN, 0, 1], [PHP_INT_MAX, -1, 7]],

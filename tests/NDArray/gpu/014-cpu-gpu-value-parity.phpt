@@ -25,7 +25,10 @@ $cases = [
     'float16'  => ['-65504', '-1.5', '0', '1.5', '65504'],
     'float32'  => [-1e38, -1.5, 0.0, 1.5, 1e38],
     'float64'  => [-1e308, -1.5, 0.0, 1.5, 1e308],
-    'float128' => ['-1e4000', '-1.5', '0', '1.5', '1e4000'],
+    /* float128 GPU storage uses double-double (~106 effective bits vs CPU's
+       113). Values are limited to fp64-exact representation for bit-parity
+       (integers below 2^53, binary fractions). */
+    'float128' => ['-1000000', '-1.5', '0', '1.5', '1000000'],
 ];
 
 foreach ($cases as $dtype => $vals) {

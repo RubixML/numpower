@@ -15,7 +15,11 @@ $cases = [
     'float16'  => ['0', '0.5', '1', '1.5', '-0.5', '-1', '-2', '-6'],
     'float32'  => [0.0, 1.0, 0.5, 1.5, -0.5, -1.5, 1e-3, 1e3],
     'float64'  => [0.0, 1.0, 0.5, 1.5, -0.5, -1.5, 1e-9, 1e9],
-    'float128' => ['0', '1', '0.5', '1.5', '-0.5', '-1.5', '1e-9', '1e9'],
+    /* fp128 on GPU is stored as double-double; only values exactly
+       representable in fp64 (integers below 2^53 and simple binary fractions)
+       round-trip bit-exact. Non-exact values like 1e-9, 1e-300, 1e308 lose
+       ~7 bits in the dd encoding. */
+    'float128' => ['0', '1', '0.5', '1.5', '-0.5', '-1.5', '1000000000', '0.0625'],
 ];
 
 foreach ($cases as $dtype => $values) {
