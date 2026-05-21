@@ -42,7 +42,12 @@ NDArray_Diagonal(NDArray *target, int offset) {
         new_shape[0] = NDArray_SHAPE(target)[NDArray_NDIM(target) - 1];
         rtn = NDArray_Empty(new_shape, 1, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
         for (i = 0; i < NDArray_SHAPE(target)[NDArray_NDIM(target) - 1]; i++) {
-            vmemcpyd2d((NDArray_DATA(target) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 2]) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 1])), NDArray_DATA(rtn) + (i * sizeof(float)), sizeof(float));
+            /* Cast to char* before pointer arithmetic — MSVC rejects `void* + N`
+               (only a GCC extension); see C2036. The byte offset semantics are
+               identical on both compilers once the cast is in place. */
+            vmemcpyd2d(((char *)NDArray_DATA(target) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 2]) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 1])),
+                       ((char *)NDArray_DATA(rtn) + (i * sizeof(float))),
+                       sizeof(float));
         }
     }
 #endif
