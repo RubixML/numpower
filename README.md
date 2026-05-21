@@ -213,7 +213,7 @@ nmake
 nmake install
 ```
 
-After install, copy `libopenblas.dll` from the OpenBLAS `bin\` folder next to your `php.exe` (or anywhere on `%PATH%`). Then add `extension=php_ndarray.dll` to `php.ini`.
+After install, copy `libopenblas.dll` from the OpenBLAS `bin\` folder **next to your `php.exe`**. PHP hardens the Windows DLL search at startup and will **not** find extension dependencies on `%PATH%` — they have to sit in the same folder as `php.exe` (or in `C:\Windows\System32`). Then add `extension=php_ndarray.dll` to `php.ini`.
 
 **3. Build with GPU (CUDA) support — optional**
 
@@ -234,7 +234,7 @@ nmake install
 
 If cuDNN lives outside the CUDA Toolkit folder, add `--with-cudnn-dir=C:\path\to\cudnn` to the `configure` line. Without cuDNN you still get cuBLAS-backed GPU math, just no GPU convolutions.
 
-After `nmake install`, copy the CUDA runtime DLLs next to `php.exe` so the extension can find them at runtime. Alternatively, add `%CUDA_PATH%\bin` to your `PATH` — the loader searches there too:
+After `nmake install`, copy the CUDA runtime DLLs **next to `php.exe`** so the extension can find them at runtime. PHP does not consult `%PATH%` for extension dependencies (it hardens the Windows DLL search at startup), so simply having `%CUDA_PATH%\bin` on `PATH` is **not** enough — the files have to be in `php.exe`'s folder:
 
 ```bat
 copy "%CUDA_PATH%\bin\cublas64_*.dll"    C:\path\to\php\
@@ -247,7 +247,7 @@ copy "%CUDA_PATH%\bin\nvJitLink_*.dll"   C:\path\to\php\
 copy "%CUDA_PATH%\bin\cudnn64_*.dll"     C:\path\to\php\
 ```
 
-> If PHP fails to load `php_ndarray.dll` with `The specified module could not be found`, the DLL itself is fine — Windows is reporting that one of its dependencies isn't on `PATH` or next to the DLL. Stage the full list above (or just add `%CUDA_PATH%\bin` to `PATH`) and try again.
+> If PHP still fails to load `php_ndarray.dll` with `The specified module could not be found`, the named DLL is fine — Windows is reporting that one of its dependencies couldn't be resolved. Walk the dep tree with `dumpbin /dependents C:\path\to\php\php_ndarray.dll` and confirm every listed DLL is present in `C:\path\to\php\` (or in `C:\Windows\System32`).
 
 > You only re-run `build-cuda-windows.bat` if you edit one of the `.cu` files. For regular development on the C parts, plain `nmake` is enough.
 
