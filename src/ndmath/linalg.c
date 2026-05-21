@@ -14,6 +14,20 @@
 #include "../indexing.h"
 
 #ifdef HAVE_LAPACKE
+/* OpenBLAS's lapack.h defaults lapack_complex_float / lapack_complex_double
+   to "float _Complex" / "double _Complex" via <complex.h>. MSVC's <complex.h>
+   only ships the _Fcomplex / _Dcomplex struct types — the C99 _Complex
+   keyword isn't available — so those declarations cascade into syntax errors
+   at the first complex-using LAPACK prototype. We never call any complex
+   LAPACK routines, so opaque struct typedefs with the same layout suffice
+   for the declarations to parse. The same struct layout is what
+   MSVC's own _Fcomplex / _Dcomplex use, so even if a complex routine were
+   added later the ABI would line up. */
+#  ifdef _MSC_VER
+#    define LAPACK_COMPLEX_CUSTOM
+typedef struct { float  real, imag; } lapack_complex_float;
+typedef struct { double real, imag; } lapack_complex_double;
+#  endif
 #include <lapacke.h>
 #endif
 
