@@ -114,12 +114,18 @@ sudo make install          # use `sudo make install-cuda` for GPU builds
 
 **4. Turn the extension on**
 
+The build produces a shared library called `ndarray.so` (the file name comes from the build system) — but inside PHP the extension registers itself under the name **`RubixNumPower`**, which is what you'll see in `php -m`.
+
+Drop an ini fragment into your PHP's scan directory:
+
 ```bash
-echo "extension=ndarray.so" | sudo tee /etc/php/$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')/mods-available/ndarray.ini
-sudo phpenmod ndarray
+PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+echo "extension=ndarray.so" | sudo tee /etc/php/$PHP_VER/cli/conf.d/40-numpower.ini
+# Repeat for fpm/apache2 if you use those SAPIs:
+# sudo tee /etc/php/$PHP_VER/fpm/conf.d/40-numpower.ini < /etc/php/$PHP_VER/cli/conf.d/40-numpower.ini
 ```
 
-Done. Test it with `php -m | grep ndarray`.
+Done. Verify with `php -m | grep -i RubixNumPower`.
 
 ### Fedora / RHEL / Rocky / Alma
 
@@ -282,7 +288,7 @@ You can build NumPower with `--with-cuda` even on a machine without a physical G
 ## Verifying the installation
 
 ```bash
-php -m | grep ndarray
+php -m | grep -i RubixNumPower
 php -r '$a = NumPower::ones([3, 3]); echo $a;'
 ```
 
