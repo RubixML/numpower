@@ -225,7 +225,7 @@ jobs:
         with:
           cuda: '12.5.0'
           method: 'network'
-          sub-packages: '["nvcc", "cublas", "cublas_dev", "cudart", "thrust", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cublas", "cublas_dev", "cudart", "thrust", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "nvjitlink", "visual_studio_integration"]'
 
       - name: phpize
         shell: cmd
@@ -331,6 +331,23 @@ jobs:
           $dll = Join-Path $buildDir 'php_ndarray.dll'
           Write-Host "=== dumpbin /dependents $dll ==="
           dumpbin /dependents $dll
+          if ($env:RUNNER_CUDA -eq 'true') {
+            # Also dump deps of the CUDA libs themselves — these are transitive
+            # deps of php_ndarray.dll that the loader needs to resolve too.
+            # If something here is missing from php-bin\ or System32, that's
+            # the source of "module could not be found".
+            $phpBin = "${{ steps.php-sdk.outputs.prefix }}"
+            foreach ($name in @('cublas64_12.dll', 'cusolver64_11.dll', 'cudart64_12.dll', 'curand64_10.dll')) {
+              $p = Join-Path $phpBin $name
+              if (Test-Path $p) {
+                Write-Host ""
+                Write-Host "=== dumpbin /dependents $p ==="
+                dumpbin /dependents $p
+              }
+            }
+          }
+        env:
+          RUNNER_CUDA: ${{ matrix.cuda }}
 
       - name: Run tests
         shell: cmd
