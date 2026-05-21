@@ -234,14 +234,20 @@ nmake install
 
 If cuDNN lives outside the CUDA Toolkit folder, add `--with-cudnn-dir=C:\path\to\cudnn` to the `configure` line. Without cuDNN you still get cuBLAS-backed GPU math, just no GPU convolutions.
 
-After `nmake install`, copy the CUDA runtime DLLs next to `php.exe` so the extension can find them at runtime:
+After `nmake install`, copy the CUDA runtime DLLs next to `php.exe` so the extension can find them at runtime. Alternatively, add `%CUDA_PATH%\bin` to your `PATH` — the loader searches there too:
 
 ```bat
-copy "%CUDA_PATH%\bin\cublas64_*.dll"   C:\path\to\php\
-copy "%CUDA_PATH%\bin\cudart64_*.dll"   C:\path\to\php\
-copy "%CUDA_PATH%\bin\cublasLt64_*.dll" C:\path\to\php\
-copy "%CUDA_PATH%\bin\cudnn64_*.dll"    C:\path\to\php\
+copy "%CUDA_PATH%\bin\cublas64_*.dll"    C:\path\to\php\
+copy "%CUDA_PATH%\bin\cudart64_*.dll"    C:\path\to\php\
+copy "%CUDA_PATH%\bin\cublasLt64_*.dll"  C:\path\to\php\
+copy "%CUDA_PATH%\bin\cusolver64_*.dll"  C:\path\to\php\
+copy "%CUDA_PATH%\bin\curand64_*.dll"    C:\path\to\php\
+copy "%CUDA_PATH%\bin\cusparse64_*.dll"  C:\path\to\php\
+copy "%CUDA_PATH%\bin\nvJitLink_*.dll"   C:\path\to\php\
+copy "%CUDA_PATH%\bin\cudnn64_*.dll"     C:\path\to\php\
 ```
+
+> If PHP fails to load `php_ndarray.dll` with `The specified module could not be found`, the DLL itself is fine — Windows is reporting that one of its dependencies isn't on `PATH` or next to the DLL. Stage the full list above (or just add `%CUDA_PATH%\bin` to `PATH`) and try again.
 
 > You only re-run `build-cuda-windows.bat` if you edit one of the `.cu` files. For regular development on the C parts, plain `nmake` is enough.
 

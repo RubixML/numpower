@@ -225,7 +225,7 @@ jobs:
         with:
           cuda: '12.5.0'
           method: 'network'
-          sub-packages: '["nvcc", "cublas", "cublas_dev", "cudart", "thrust", "curand", "curand_dev", "cusolver", "cusolver_dev", "visual_studio_integration"]'
+          sub-packages: '["nvcc", "cublas", "cublas_dev", "cudart", "thrust", "curand", "curand_dev", "cusolver", "cusolver_dev", "cusparse", "visual_studio_integration"]'
 
       - name: phpize
         shell: cmd
@@ -276,11 +276,23 @@ jobs:
           Copy-Item openblas\bin\libopenblas.dll "$buildDir\" -Force
           Copy-Item openblas\bin\libopenblas.dll "${{ steps.php-sdk.outputs.prefix }}\" -Force -ErrorAction SilentlyContinue
           if ($env:RUNNER_CUDA -eq 'true') {
+            # All of the CUDA libs we link against (cublas, cudart, cusolver,
+            # curand) plus their transitive deps (cublasLt, cusparse, nvJitLink)
+            # need to be loadable when PHP loads php_ndarray.dll. Stage the
+            # direct deps in the build dir AND prepend %CUDA_PATH%\bin to PATH
+            # in the test step so the transitive ones (which we don't enumerate)
+            # are also reachable. Without both, the PHP loader fails with the
+            # generic "The specified module could not be found" — Windows can't
+            # tell us which transitive DLL is missing.
             $cudaBin = Join-Path $env:CUDA_PATH 'bin'
-            Get-ChildItem -Path $cudaBin -Filter 'cublas64_*.dll'   | Copy-Item -Destination "$buildDir\" -Force
-            Get-ChildItem -Path $cudaBin -Filter 'cudart64_*.dll'   | Copy-Item -Destination "$buildDir\" -Force
-            Get-ChildItem -Path $cudaBin -Filter 'cublasLt64_*.dll' | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
-            Get-ChildItem -Path $cudaBin -Filter 'cudnn64_*.dll'    | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $cudaBin -Filter 'cublas64_*.dll'    | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'cudart64_*.dll'    | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'cublasLt64_*.dll'  | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $cudaBin -Filter 'cusolver64_*.dll'  | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'curand64_*.dll'    | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'cusparse64_*.dll'  | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $cudaBin -Filter 'nvJitLink_*.dll'   | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $cudaBin -Filter 'cudnn64_*.dll'     | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
           }
         env:
           RUNNER_CUDA: ${{ matrix.cuda }}
@@ -290,6 +302,7 @@ jobs:
         env:
           REPORT_EXIT_STATUS: 1
         run: |
+          if not "%CUDA_PATH%"=="" set "PATH=%CUDA_PATH%\bin;%PATH%"
           nmake test TESTS="-q --show-diff"
 
       - name: Upload failure diffs
