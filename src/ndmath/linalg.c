@@ -2,7 +2,9 @@
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include "linalg.h"
+#ifndef _MSC_VER
 #include "../../config.h"
+#endif
 #include "../initializers.h"
 #include "../types.h"
 #include "../manipulation.h"

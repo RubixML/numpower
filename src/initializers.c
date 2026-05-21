@@ -4,7 +4,9 @@
 #include "initializers.h"
 #include "ndarray.h"
 #include "types.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "Zend/zend_hash.h"
 #include "iterators.h"
 #include "indexing.h"

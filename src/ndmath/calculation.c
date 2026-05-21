@@ -3,7 +3,9 @@
 #include "../initializers.h"
 #include "calculation.h"
 #include <Zend/zend.h>
+#ifndef _MSC_VER
 #include "../../config.h"
+#endif
 #include "../ndarray.h"
 
 static int

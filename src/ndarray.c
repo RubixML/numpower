@@ -6,7 +6,9 @@
 #include "initializers.h"
 #include "types.h"
 #include <php.h>
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include <Zend/zend_types.h>

@@ -1,5 +1,7 @@
 #include "ndarray_types.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>

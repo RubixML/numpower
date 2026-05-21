@@ -4,7 +4,9 @@
 #include <string.h>
 #include <math.h>
 #include "arithmetics.h"
+#ifndef _MSC_VER
 #include "../../config.h"
+#endif
 #include "../initializers.h"
 #include "../iterators.h"
 #include "../types.h"

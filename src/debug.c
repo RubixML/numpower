@@ -2,7 +2,9 @@
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include "debug.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "ndarray.h"
 #include "ndarray_types.h"
 #include "types.h"

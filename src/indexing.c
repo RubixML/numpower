@@ -3,7 +3,9 @@
 #include "ndarray.h"
 #include "initializers.h"
 #include "types.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 
 
 #ifdef HAVE_CUBLAS

@@ -2,7 +2,9 @@
 #define NUMPOWER_DNN_H
 
 #include "ndarray.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 
 NDArray* NDArrayDNN_Conv2D_Forward(NDArray *x, NDArray *filters, int *kernel_size, char activation, int use_bias);
 NDArray** NDArrayDNN_Conv2D_Backward(NDArray *input, NDArray *y, NDArray *filters, int kernel_size, char activation, int use_bias);

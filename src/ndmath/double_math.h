@@ -1,7 +1,9 @@
 #ifndef PHPSCI_NDARRAY_DOUBLE_MATH_H
 #define PHPSCI_NDARRAY_DOUBLE_MATH_H
 
+#ifndef _MSC_VER
 #include "../../config.h"
+#endif
 #include "../ndarray.h"
 
 float float_abs(float val);

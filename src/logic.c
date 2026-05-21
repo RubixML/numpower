@@ -1,6 +1,8 @@
 #include "logic.h"
 #include "ndarray.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "initializers.h"
 #include "manipulation.h"
 #include <Zend/zend.h>

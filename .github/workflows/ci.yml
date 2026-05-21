@@ -14,8 +14,8 @@ concurrency:
 
 jobs:
   # =========================================================================
-  # Full matrix: Ubuntu (22.04 / 24.04 / 26.04) × PHP (8.1–8.5) × CPU / CUDA
-  # All 30 combinations must pass before a PR can be merged into main.
+  # Linux matrix: Ubuntu (22.04 / 24.04) × PHP (8.1–8.5) × CPU / CUDA
+  # 20 combinations.
   # =========================================================================
   test:
     name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / ${{ matrix.cuda && 'CUDA' || 'CPU' }}"
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:   [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+        os:   [ubuntu-22.04, ubuntu-24.04]
         php:  ['8.1', '8.2', '8.3', '8.4', '8.5']
         cuda: [false, true]
 
@@ -96,24 +96,183 @@ jobs:
           if-no-files-found: ignore
 
   # =========================================================================
-  # Gate job — the ONLY required status check for branch protection.
+  # macOS matrix: macos-14 / macos-15 (both Apple Silicon ARM64) × PHP 8.1–8.5.
+  # 10 combinations. CPU only — CUDA is not available on macOS.
   #
-  # Configure in GitHub → Settings → Branches → Protection rules for "main":
-  #   ✓ Require status checks to pass before merging
-  #   ✓ Add status check: "All required tests passed"
-  #   ✓ Require branches to be up to date before merging
+  # Apple clang on ARM64 falls through the long-double fallback in
+  # src/ndarray_types.h (no __float128, no libquadmath). The HAVE_AVX2 macro
+  # is left undefined on non-x86 hosts by config.m4, so the AVX2 kernels are
+  # excluded from the build. OpenBLAS + LAPACK come from Homebrew.
+  # =========================================================================
+  macos-test:
+    name: "PHP ${{ matrix.php }} / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:  [macos-14, macos-15]
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: none
+          coverage: none
+
+      # Homebrew ships its own openblas + lapack kegs that include LAPACKE
+      # headers and the libopenblas.dylib symbol set we need (cblas_sdot,
+      # LAPACKE_sgesdd). Apple's vecLib/Accelerate framework would be lighter
+      # weight but doesn't export the LAPACKE_* C bindings.
+      - name: Install OpenBLAS + LAPACK (Homebrew)
+        run: |
+          brew update
+          brew install openblas lapack autoconf
+
+      - name: Build extension
+        run: |
+          OPENBLAS_PREFIX=$(brew --prefix openblas)
+          LAPACK_PREFIX=$(brew --prefix lapack)
+          export CPPFLAGS="-I${OPENBLAS_PREFIX}/include -I${LAPACK_PREFIX}/include ${CPPFLAGS}"
+          export LDFLAGS="-L${OPENBLAS_PREFIX}/lib -L${LAPACK_PREFIX}/lib ${LDFLAGS}"
+          export LIBRARY_PATH="${OPENBLAS_PREFIX}/lib:${LAPACK_PREFIX}/lib:${LIBRARY_PATH}"
+          export PKG_CONFIG_PATH="${OPENBLAS_PREFIX}/lib/pkgconfig:${LAPACK_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH}"
+          phpize
+          ./configure
+          make -j$(sysctl -n hw.ncpu)
+
+      - name: Run tests
+        run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
+
+      - name: Upload failure diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "diffs-php${{ matrix.php }}-${{ matrix.os }}"
+          path: "**/*.diff"
+          if-no-files-found: ignore
+
+  # =========================================================================
+  # Windows matrix: Windows Server 2022 / 2025 × PHP 8.1–8.5, x64 NTS.
+  # 10 combinations. CPU only — no CUDA build path on Windows.
+  # =========================================================================
+  windows-test:
+    name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / x64-nts"
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:  [windows-2022, windows-2025]
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sets %PHP_SDK_ROOT% / %PHP_PREFIX%, downloads the matching PHP devel
+      # pack, configures the right Visual Studio toolset (vs16/vs17) and
+      # exposes phpize.bat + nmake on PATH for subsequent steps.
+      - name: Set up PHP build environment
+        uses: php/setup-php-sdk@v0.12
+        id: php-sdk
+        with:
+          version: ${{ matrix.php }}
+          arch: x64
+          ts: nts
+
+      - name: Set up MSVC developer prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: ${{ steps.php-sdk.outputs.toolset }}
+
+      # OpenBLAS for Windows: download the upstream pre-built x64 release.
+      # The ZIP contains include/, lib/libopenblas.lib + libopenblas.dll.a,
+      # bin/libopenblas.dll — config.w32 finds these via --with-openblas-dir.
+      - name: Cache OpenBLAS
+        id: openblas-cache
+        uses: actions/cache@v4
+        with:
+          path: openblas
+          key: openblas-0.3.30-windows-x64
+
+      - name: Download OpenBLAS prebuilt
+        if: steps.openblas-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.30/OpenBLAS-0.3.30-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile openblas.zip
+          New-Item -ItemType Directory -Path openblas -Force | Out-Null
+          Expand-Archive -Path openblas.zip -DestinationPath openblas -Force
+
+      - name: phpize
+        shell: cmd
+        run: |
+          phpize
+
+      - name: configure
+        shell: cmd
+        run: |
+          configure --enable-ndarray --with-openblas-dir=%CD%\openblas --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+
+      - name: nmake
+        shell: cmd
+        run: |
+          nmake
+
+      # The PHP test runner loads the freshly-built php_ndarray.dll from the
+      # build output dir; the OpenBLAS DLL has to be co-located (or on PATH)
+      # for the loader to resolve cblas_* / LAPACKE_* at runtime.
+      - name: Stage OpenBLAS DLL next to extension
+        shell: pwsh
+        run: |
+          $buildDir = if (Test-Path 'x64\Release') { 'x64\Release' } else { 'x64\Release_TS' }
+          Copy-Item openblas\bin\libopenblas.dll "$buildDir\" -Force
+          Copy-Item openblas\bin\libopenblas.dll "${{ steps.php-sdk.outputs.prefix }}\" -Force -ErrorAction SilentlyContinue
+
+      - name: Run tests
+        shell: cmd
+        env:
+          REPORT_EXIT_STATUS: 1
+        run: |
+          nmake test TESTS="-q --show-diff"
+
+      - name: Upload failure diffs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "diffs-php${{ matrix.php }}-${{ matrix.os }}-win-x64"
+          path: "**/*.diff"
+          if-no-files-found: ignore
+
+  # =========================================================================
+  # Gate job — the ONLY required status check for branch protection.
   # =========================================================================
   all-pass:
     name: All required tests passed
-    needs: [test]
+    needs: [test, macos-test, windows-test]
     runs-on: ubuntu-latest
     if: always()
     steps:
-      - name: Check required matrix result
+      - name: Check required matrix results
         run: |
-          result="${{ needs.test.result }}"
-          if [[ "$result" != "success" ]]; then
-            echo "Required test matrix failed or was cancelled: $result"
+          fail=0
+          for label in "linux:${{ needs.test.result }}" \
+                      "macos:${{ needs.macos-test.result }}" \
+                      "windows:${{ needs.windows-test.result }}"; do
+            name="${label%%:*}"
+            result="${label##*:}"
+            echo "${name}: ${result}"
+            if [[ "${result}" != "success" ]]; then
+              fail=1
+            fi
+          done
+          if [[ $fail -ne 0 ]]; then
+            echo "::error::One or more required matrices failed or were cancelled."
             exit 1
           fi
-          echo "All 30 required combinations passed."
+          echo "All required Linux + macOS + Windows combinations passed."

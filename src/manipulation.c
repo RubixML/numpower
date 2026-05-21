@@ -2,7 +2,9 @@
 #include "manipulation.h"
 #include "ndarray.h"
 #include "initializers.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "types.h"
 #include <cblas.h>
 #include "iterators.h"

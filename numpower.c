@@ -61,7 +61,9 @@
 #include "src/ndmath/linalg.h"
 
 // COMPILE_DL_NDARRAY, HAVE_CUBLAS, HAVE_GD
+#ifndef _MSC_VER
 #include "config.h"
+#endif
 
 // NDARRAY_TYPE_FLOAT64, NDARRAY_TYPE_FLOAT32
 #include "src/types.h"

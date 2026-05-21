@@ -16,8 +16,15 @@ uint8_t ndarray_double_to_fp8(double val);
 double   ndarray_fp16_to_double(uint16_t fp16);
 uint16_t ndarray_double_to_fp16(double val);
 
-/* ── float128 : __float128 on GCC/x86-64, long double elsewhere ─────────── */
-#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+/* ── float128 : __float128 on GCC/x86-64 (Linux), long double elsewhere ──
+   Restricted to non-Apple GCC so clang on macOS (where __float128 is not
+   reliably supported and libquadmath isn't shipped) and MSVC (no __float128
+   at all) fall through to the long-double path. On those platforms fp128
+   storage is whatever long double is — 80-bit x87 on Intel non-Apple, 64-bit
+   on Apple Silicon / MSVC — which loses precision vs. true 113-bit fp128 but
+   keeps the dtype usable everywhere. */
+#if defined(__GNUC__) && !defined(__clang__) && !defined(__APPLE__) && \
+    (defined(__x86_64__) || defined(__i386__))
 #  define NDARRAY_HAVE_FLOAT128 1
    typedef __float128 ndarray_fp128_t;
 #  define NDARRAY_FP128_SIZE 16

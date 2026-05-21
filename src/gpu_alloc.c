@@ -1,4 +1,6 @@
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include <Zend/zend.h>
 
 #ifdef HAVE_CUBLAS
