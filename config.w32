@@ -109,7 +109,8 @@ if (PHP_NDARRAY != "no") {
                 "indexing.c " +
                 "sanitizers.c " +
                 "types.c " +
-                "ndarray_types.c",
+                "ndarray_types.c " +
+                "dd_math.c",
                 "ndarray");
 
             ADD_SOURCES(configure_module_dirname + "/src/ndmath",

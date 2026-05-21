@@ -24,10 +24,14 @@ $cases = [
     'float16'  => [['1.5', '-1.5', '0.5', '-0.5'],              ['1.5', '-1.5', '0.5', '-0.5']],
     'float32'  => [[0.0, -1.5, 1e3, -1e3],                      ['0', '-1.5', '1000', '-1000']],
     'float64'  => [[0.0, -1.5, 1e3, -1e3],                      ['0', '-1.5', '1000', '-1000']],
-    /* float128 stringification uses libquadmath's %Qg with 34 significant
-       digits, so values not exactly representable in 113 bits (like 1e-9)
-       expand to the closest representable approximation. */
-    'float128' => [['1e3', '-1.5', '1e-9', '1e9'],              ['1000', '-1.5', '9.999999999999999999999999999999999e-10', '1000000000']],
+    /* float128 stringification preserves more than fp64's ~17 digits. We use
+       values that round-trip identically on both the libquadmath path
+       (~34 digits) and the DD-emulated path (~32 digits) — i.e. each value
+       is either exact in fp64, or a decimal string ≤ 32 significant digits.
+       The full quadmath-only precision behaviour is covered by
+       tests/types/012-dtype-float128-quadmath.phpt. */
+    'float128' => [['1e3', '-1.5', '1.23456789012345678901234', '1e9'],
+                    ['1000', '-1.5', '1.23456789012345678901234', '1000000000']],
 
     'int8'     => [[-128, -1, 0, 127],                          ['-128', '-1', '0', '127']],
     'uint8'    => [[0, 1, 128, 255],                            ['0', '1', '128', '255']],

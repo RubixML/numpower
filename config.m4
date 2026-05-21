@@ -131,6 +131,7 @@ if test "$PHP_NDARRAY" != "no"; then
       src/sanitizers.c \
       src/types.c \
       src/ndarray_types.c \
+      src/dd_math.c \
       src/ndarray/frontend/ndarray_factory.c \
       src/ndarray/frontend/manipulations.c,
       $ext_shared)

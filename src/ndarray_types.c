@@ -177,19 +177,21 @@ uint16_t ndarray_double_to_fp16(double val) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   float128 – __float128 (GCC) or long double fallback
+   float128 — __float128+libquadmath on Linux GCC x86, otherwise double-double
+   (see src/dd_math.h). String I/O always preserves the full precision the
+   chosen storage can represent.
    ══════════════════════════════════════════════════════════════════════════ */
 
 ndarray_fp128_t ndarray_double_to_fp128(double val) {
-    return (ndarray_fp128_t)val;
+    return NDARRAY_FP128_FROM_D(val);
 }
 
 ndarray_fp128_t ndarray_ldouble_to_fp128(long double val) {
-    return (ndarray_fp128_t)val;
+    return NDARRAY_FP128_FROM_LD(val);
 }
 
 double ndarray_fp128_to_double(ndarray_fp128_t val) {
-    return (double)val;
+    return NDARRAY_FP128_TO_D(val);
 }
 
 void ndarray_fp128_to_string(ndarray_fp128_t val, char *buf, size_t bufsize) {
@@ -203,7 +205,9 @@ void ndarray_fp128_to_string(ndarray_fp128_t val, char *buf, size_t bufsize) {
     long double ld = (long double)val;
     snprintf(buf, bufsize, "%.18Lg", ld);
 #else
-    snprintf(buf, bufsize, "%.18Lg", (long double)val);
+    /* DD path: dedicated formatter that walks the (hi, lo) pair to recover
+       the full ~32 decimal digits worth of mantissa. */
+    ndarray_dd_to_string(val, buf, bufsize);
 #endif
 }
 
@@ -211,10 +215,15 @@ ndarray_fp128_t ndarray_string_to_fp128(const char *str) {
 #if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
     char *endptr;
     return strtoflt128(str, &endptr);
-#else
+#elif NDARRAY_HAVE_FLOAT128
     char *endptr;
     long double ld = strtold(str, &endptr);
     return (ndarray_fp128_t)ld;
+#else
+    /* DD path: digit-accumulating parser so the lo word captures the bits
+       beyond fp64 precision. strtold here would silently truncate to ~17
+       digits on Apple Silicon / MSVC where long double == double. */
+    return ndarray_dd_from_string(str);
 #endif
 }
 

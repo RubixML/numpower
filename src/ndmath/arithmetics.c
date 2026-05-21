@@ -1676,10 +1676,14 @@ NDArray* NDArray_##NAME##_Float128(NDArray* a, NDArray* b) {                    
     return result;                                                                  \
 }
 
-DEFINE_FP128_BINOP(Add,       x + y)
-DEFINE_FP128_BINOP(Subtract,  x - y)
-DEFINE_FP128_BINOP(Multiply,  x * y)
-DEFINE_FP128_BINOP(Divide,    x / y)
+/* EXPRs go through the NDARRAY_FP128_* macros from ndarray_types.h so they
+   resolve to native __float128 operators on the libquadmath build and to
+   ndarray_dd_* calls on the DD-emulated build. Same source code, same
+   precision tier per platform. */
+DEFINE_FP128_BINOP(Add,       NDARRAY_FP128_ADD(x, y))
+DEFINE_FP128_BINOP(Subtract,  NDARRAY_FP128_SUB(x, y))
+DEFINE_FP128_BINOP(Multiply,  NDARRAY_FP128_MUL(x, y))
+DEFINE_FP128_BINOP(Divide,    NDARRAY_FP128_DIV(x, y))
 
 NDArray* NDArray_Pow_Float128(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a) != NDARRAY_DEVICE_CPU || NDArray_DEVICE(b) != NDARRAY_DEVICE_CPU) {
@@ -1706,8 +1710,13 @@ NDArray* NDArray_Pow_Float128(NDArray* a, NDArray* b) {
     for (long i = 0; i < n; i++) {
 #if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
         rd[i] = powq(ad[i], bd[i]);
-#else
+#elif NDARRAY_HAVE_FLOAT128
         rd[i] = (ndarray_fp128_t)powl((long double)ad[i], (long double)bd[i]);
+#else
+        /* DD path: integer exponents stay at full DD precision; fractional
+           exponents degrade to fp64 (DD log+exp would add ~400 lines and
+           is unused by current tests). */
+        rd[i] = ndarray_dd_pow(ad[i], bd[i]);
 #endif
     }
     if (a_temp) NDArray_FREE(a);
@@ -1741,7 +1750,7 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
     for (long i = 0; i < n; i++) {
 #if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
         rd[i] = fmodq(ad[i], bd[i]);
-#else
+#elif NDARRAY_HAVE_FLOAT128
         /* Lossless fp128 fmod using only native __float128 operators:
            fmod(a, b) = a - trunc(a/b)*b. trunc on __float128 implemented via
            casts to integer parts when in range, else exponent manipulation. */
@@ -1763,6 +1772,10 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
             q_trunc = q;
         }
         rd[i] = x - q_trunc * y;
+#else
+        /* DD path: same fmod identity, implemented via dd_math.h primitives
+           (trunc handles the int64-fits-in-mantissa edge case too). */
+        rd[i] = ndarray_dd_fmod(ad[i], bd[i]);
 #endif
     }
     if (a_temp) NDArray_FREE(a);
@@ -1808,12 +1821,19 @@ static NDArray *gpu_broadcast_scalar(NDArray *scalar, NDArray *other) {
         ? scalar : NDArray_ToCPU(scalar);
     if (scalar_cpu == NULL) { NDArray_FREE(expanded); return NULL; }
 
-    /* For dd128, scalar_cpu is stored as __float128. Need to split. */
+    /* For dd128, scalar_cpu's CPU storage may be __float128 (Linux GCC) or
+       a (hi, lo) double-double pair (every other platform). Split into the
+       (hi, lo) doubles the GPU kernel expects either way. */
     if (!strcmp(dt, "float128")) {
         ndarray_fp128_t v;
         memcpy(&v, scalar_cpu->data, NDARRAY_FP128_SIZE);
+#if NDARRAY_HAVE_FLOAT128
         double hi = (double)v;
         double lo = (double)(v - (ndarray_fp128_t)hi);
+#else
+        double hi = v.hi;
+        double lo = v.lo;
+#endif
         cuda_fill_dd((double *)NDArray_DATA(expanded), hi, lo, n);
         if (scalar_cpu != scalar) NDArray_FREE(scalar_cpu);
         return expanded;

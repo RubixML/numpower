@@ -1201,9 +1201,17 @@ NDArray_ScalarToZval(NDArray *array, zval *return_value) {
             double hi, lo;
             memcpy(&hi, host_buf,        sizeof(double));
             memcpy(&lo, host_buf + 8,    sizeof(double));
+            /* On the __float128 path we reassemble hi+lo back into a 113-bit
+               fp128 value (the lo word holds the rounding error from GPU's
+               DD storage). On the DD path the storage and the GPU layout
+               are identical (hi, lo) so we just pack the pair. */
+#if NDARRAY_HAVE_FLOAT128
             ndarray_fp128_t v = (lo == 0.0)
                 ? (ndarray_fp128_t)hi
                 : (ndarray_fp128_t)hi + (ndarray_fp128_t)lo;
+#else
+            ndarray_fp128_t v = ndarray_dd_from_pair(hi, lo);
+#endif
             memcpy(host_buf, &v, NDARRAY_FP128_SIZE);
         }
         data = host_buf;
@@ -1296,6 +1304,8 @@ NDArray_ToGPU(NDArray *target) {
         double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
         ndarray_fp128_t *src = (ndarray_fp128_t *)NDArray_DATA(target);
         for (long i = 0; i < n; i++) {
+#if NDARRAY_HAVE_FLOAT128
+            /* Split a true 113-bit __float128 into (hi, lo) doubles. */
             double hi = (double)src[i];
             double lo;
             if (isinf(hi) || isnan(hi)) {
@@ -1303,6 +1313,11 @@ NDArray_ToGPU(NDArray *target) {
             } else {
                 lo = (double)(src[i] - (ndarray_fp128_t)hi);
             }
+#else
+            /* DD storage already is (hi, lo) — copy directly, no rounding. */
+            double hi = src[i].hi;
+            double lo = (isinf(hi) || isnan(hi)) ? 0.0 : src[i].lo;
+#endif
             staging[2*i]   = hi;
             staging[2*i+1] = lo;
         }
@@ -1352,17 +1367,22 @@ NDArray_ToCPU(NDArray *target) {
     size_t bytes = (size_t)n * (size_t)NDArray_ELSIZE(target);
 
     if (!strcmp(NDArray_TYPE(target), "float128")) {
-        /* Convert dd → __float128 at the boundary. */
+        /* Convert GPU's dd layout back to host fp128 representation. */
         double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
         cudaMemcpy(staging, NDArray_DATA(target), bytes, cudaMemcpyDeviceToHost);
         ndarray_fp128_t *dst = (ndarray_fp128_t *)rtn->data;
         for (long i = 0; i < n; i++) {
             double hi_d = staging[2*i];
             double lo_d = staging[2*i+1];
+#if NDARRAY_HAVE_FLOAT128
             ndarray_fp128_t hi = (ndarray_fp128_t)hi_d;
             ndarray_fp128_t lo = (ndarray_fp128_t)lo_d;
             /* Preserve sign of zero / INF / NaN. */
             dst[i] = (lo_d == 0.0) ? hi : hi + lo;
+#else
+            /* DD: pack the (hi, lo) pair as-is — no reassembly needed. */
+            dst[i] = ndarray_dd_from_pair(hi_d, lo_d);
+#endif
         }
         efree(staging);
     } else {
@@ -1521,17 +1541,24 @@ void NDArray_TypedH2D(char *gpu_dst, const char *cpu_src, long n, const char *dt
         double *staging = (double *)emalloc(sizeof(double) * 2 * (size_t)n);
         const ndarray_fp128_t *src = (const ndarray_fp128_t *)cpu_src;
         for (long i = 0; i < n; i++) {
-            double hi = (double)src[i];
-            /* IEEE-754 special handling: ±INF and NaN are exactly representable
+#if NDARRAY_HAVE_FLOAT128
+            /* Split a true 113-bit __float128 value into (hi, lo) doubles.
+               IEEE-754 special handling: ±INF and NaN are exactly representable
                in fp64 so hi captures the special value; lo must be a finite
                companion (0.0) — otherwise (x - x) on a non-finite produces NaN
                which would corrupt the value on round-trip. */
+            double hi = (double)src[i];
             double lo;
             if (isinf(hi) || isnan(hi)) {
                 lo = 0.0;
             } else {
                 lo = (double)(src[i] - (ndarray_fp128_t)hi);
             }
+#else
+            /* DD storage is already (hi, lo) — same layout the GPU wants. */
+            double hi = src[i].hi;
+            double lo = (isinf(hi) || isnan(hi)) ? 0.0 : src[i].lo;
+#endif
             staging[2*i]     = hi;
             staging[2*i + 1] = lo;
         }
@@ -1556,10 +1583,14 @@ void NDArray_TypedD2H(char *cpu_dst, const char *gpu_src, long n, const char *dt
         for (long i = 0; i < n; i++) {
             double hi_d = staging[2*i];
             double lo_d = staging[2*i + 1];
+#if NDARRAY_HAVE_FLOAT128
             ndarray_fp128_t hi = (ndarray_fp128_t)hi_d;
             ndarray_fp128_t lo = (ndarray_fp128_t)lo_d;
             /* Preserve sign of zero / INF / NaN: when lo == 0 use hi alone. */
             dst[i] = (lo_d == 0.0) ? hi : hi + lo;
+#else
+            dst[i] = ndarray_dd_from_pair(hi_d, lo_d);
+#endif
         }
         efree(staging);
     } else {
