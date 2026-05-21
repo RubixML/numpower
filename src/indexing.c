@@ -9,7 +9,7 @@
 
 
 #ifdef HAVE_CUBLAS
-#include "src/gpu_alloc.h"
+#include "gpu_alloc.h"
 #endif
 
 /**

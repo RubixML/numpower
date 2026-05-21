@@ -14,9 +14,14 @@ if test "$PHP_CUDA" != "no"; then
     [
       AC_DEFINE(HAVE_CUBLAS,1,[ ])
       PHP_ADD_LIBRARY(cublas,,NDARRAY_SHARED_LIBADD)
+      PHP_ADD_LIBRARY(cusolver,,NDARRAY_SHARED_LIBADD)
       AC_MSG_RESULT([CUBLAS detected ])
       PHP_ADD_MAKEFILE_FRAGMENT($abs_srcdir/Makefile.frag, $abs_builddir)
-      CFLAGS+=" -lcublas -lcudart"
+      dnl cuda_math.cu uses cusolverDn* (SVD, getrf, syevd, …) in addition
+      dnl to cublas. Without -lcusolver the .so loads via dlopen(RTLD_LAZY)
+      dnl but throws "undefined symbol: cusolverDnCreate" the moment any
+      dnl GPU SVD/eigen routine is actually called.
+      CFLAGS+=" -lcublas -lcudart -lcusolver"
     ],[
         AC_MSG_RESULT([wrong cublas version or library not found.])
     ])
