@@ -157,18 +157,22 @@ jobs:
           if-no-files-found: ignore
 
   # =========================================================================
-  # Windows matrix: Windows Server 2022 / 2025 × PHP 8.1–8.5, x64 NTS.
-  # 10 combinations. CPU only — no CUDA build path on Windows.
+  # Windows matrix: Windows Server 2022 / 2025 × PHP 8.1–8.5 × CPU / CUDA.
+  # 20 combinations. CUDA jobs install the NVIDIA Toolkit via Jimver's action,
+  # run build-cuda-windows.bat to pre-compile the .cu sources, then nmake
+  # links them in. GitHub-hosted Windows runners have no GPU, so the GPU
+  # PHPT tests SKIP at runtime — same behaviour as the Linux CUDA matrix.
   # =========================================================================
   windows-test:
-    name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / x64-nts"
+    name: "PHP ${{ matrix.php }} / ${{ matrix.os }} / ${{ matrix.cuda && 'CUDA' || 'CPU' }}"
     runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        os:  [windows-2022, windows-2025]
-        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        os:   [windows-2022, windows-2025]
+        php:  ['8.1', '8.2', '8.3', '8.4', '8.5']
+        cuda: [false, true]
 
     steps:
       - uses: actions/checkout@v4
@@ -209,15 +213,49 @@ jobs:
           New-Item -ItemType Directory -Path openblas -Force | Out-Null
           Expand-Archive -Path openblas.zip -DestinationPath openblas -Force
 
+      # CUDA Toolkit (network installer with a minimal sub-package list so the
+      # runner only downloads ~1.5 GB instead of the full 3+ GB). The action
+      # exposes %CUDA_PATH% for the rest of the steps. cuDNN is not installed
+      # by default — the GPU DNN tests will skip, matching the cudnn-less
+      # build path on the Linux CUDA matrix runners.
+      - name: Install CUDA Toolkit
+        if: matrix.cuda
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit
+        with:
+          cuda: '12.5.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cublas", "cublas_dev", "cudart", "thrust", "curand", "curand_dev", "cusolver", "cusolver_dev", "visual_studio_integration"]'
+
       - name: phpize
         shell: cmd
         run: |
           phpize
 
-      - name: configure
+      - name: configure (CPU)
+        if: '!matrix.cuda'
         shell: cmd
         run: |
           configure --enable-ndarray --with-openblas-dir=%CD%\openblas --with-prefix=${{ steps.php-sdk.outputs.prefix }}
+
+      - name: configure (CUDA)
+        if: matrix.cuda
+        shell: cmd
+        env:
+          PHP_PREFIX: ${{ steps.php-sdk.outputs.prefix }}
+        run: |
+          configure --enable-ndarray --with-openblas-dir=%CD%\openblas --with-cuda --with-cuda-dir="%CUDA_PATH%" --with-prefix=%PHP_PREFIX%
+
+      # Pre-compile the .cu sources into ndarray_cuda.lib. Must run BEFORE
+      # nmake, since config.w32 added ndarray_cuda.lib to LIBS_NDARRAY and
+      # nmake will fail at link time if the file is missing.
+      - name: Build CUDA objects
+        if: matrix.cuda
+        shell: cmd
+        env:
+          PHP_PREFIX: ${{ steps.php-sdk.outputs.prefix }}
+        run: |
+          call build-cuda-windows.bat --cuda-path="%CUDA_PATH%" --php-prefix="%PHP_PREFIX%"
 
       - name: nmake
         shell: cmd
@@ -225,14 +263,24 @@ jobs:
           nmake
 
       # The PHP test runner loads the freshly-built php_ndarray.dll from the
-      # build output dir; the OpenBLAS DLL has to be co-located (or on PATH)
-      # for the loader to resolve cblas_* / LAPACKE_* at runtime.
-      - name: Stage OpenBLAS DLL next to extension
+      # build output dir; the OpenBLAS DLL (and on CUDA builds the cublas /
+      # cudart / cudnn DLLs) have to be co-located or on PATH for the loader
+      # to resolve cblas_* / LAPACKE_* / cublas* / cudnn* at runtime.
+      - name: Stage runtime DLLs next to extension
         shell: pwsh
         run: |
           $buildDir = if (Test-Path 'x64\Release') { 'x64\Release' } else { 'x64\Release_TS' }
           Copy-Item openblas\bin\libopenblas.dll "$buildDir\" -Force
           Copy-Item openblas\bin\libopenblas.dll "${{ steps.php-sdk.outputs.prefix }}\" -Force -ErrorAction SilentlyContinue
+          if ($env:RUNNER_CUDA -eq 'true') {
+            $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+            Get-ChildItem -Path $cudaBin -Filter 'cublas64_*.dll'   | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'cudart64_*.dll'   | Copy-Item -Destination "$buildDir\" -Force
+            Get-ChildItem -Path $cudaBin -Filter 'cublasLt64_*.dll' | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $cudaBin -Filter 'cudnn64_*.dll'    | Copy-Item -Destination "$buildDir\" -Force -ErrorAction SilentlyContinue
+          }
+        env:
+          RUNNER_CUDA: ${{ matrix.cuda }}
 
       - name: Run tests
         shell: cmd
@@ -245,7 +293,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: "diffs-php${{ matrix.php }}-${{ matrix.os }}-win-x64"
+          name: "diffs-php${{ matrix.php }}-${{ matrix.os }}-win-x64-${{ matrix.cuda && 'cuda' || 'cpu' }}"
           path: "**/*.diff"
           if-no-files-found: ignore
 
