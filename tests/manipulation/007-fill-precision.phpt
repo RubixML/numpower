@@ -10,9 +10,13 @@ NDArray::fill() preserves precision for fp128, int64, uint64 boundary values
    - uint64 with values > PHP_INT_MAX (don't fit a signed long)
 */
 
-/* float128: 34-decimal-digit precision via string */
+/* float128: 26-digit precision via string. Stays within the DD path's ~32-digit
+   capacity so the literal round-trips identically on both backends:
+     - Linux GCC + libquadmath: native __float128
+     - Apple clang / MSVC:      double-double emulation
+   The full quadmath-only precision is covered by 012-fill-precision-quadmath.phpt. */
 $a = new NDArray(['0','0','0'], 'float128');
-$a->fill('3.14159265358979323846264338327950288');
+$a->fill('3.1415926535897932384626433');
 foreach ($a->toArray() as $i => $v) {
     echo "fp128[$i]=$v\n";
 }
@@ -72,9 +76,9 @@ $a->fill(-2147483648);
 echo "int32 -2147483648: ", ($a->toArray() === [-2147483648,-2147483648,-2147483648] ? "OK" : "BAD"), "\n";
 ?>
 --EXPECTF--
-fp128[0]=3.14159265358979323846264338327950%s
-fp128[1]=3.14159265358979323846264338327950%s
-fp128[2]=3.14159265358979323846264338327950%s
+fp128[0]=3.1415926535897932384626433
+fp128[1]=3.1415926535897932384626433
+fp128[2]=3.1415926535897932384626433
 int64 PHP_INT_MAX: OK
 int64 PHP_INT_MIN: OK
 uint64 max: OK
