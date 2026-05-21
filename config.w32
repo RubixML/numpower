@@ -4,18 +4,29 @@
 // Mirrors config.m4 / configure.ac:
 //   - links against OpenBLAS (cblas_sdot) and LAPACKE (LAPACKE_sgesdd),
 //   - opts in to AVX2 on x64 via /arch:AVX2 (matches -mavx2 on POSIX),
-//   - leaves CUDA, cuDNN, MKL, libquadmath, and GD disabled (no MSVC-side
-//     support yet); float128 falls back to long double via the gate in
-//     src/ndarray_types.h.
+//   - opts in to CUDA / cuDNN via --with-cuda when the CUDA Toolkit is
+//     available (the .cu sources must be pre-compiled into ndarray_cuda.lib
+//     via build-cuda-windows.bat; nmake then links that .lib alongside
+//     cublas.lib / cudart.lib / cudnn.lib),
+//   - leaves MKL, libquadmath, and GD disabled (no MSVC-side support yet);
+//     float128 falls back to long double via the gate in src/ndarray_types.h.
 //
 // Lookup order for OpenBLAS / LAPACKE: --with-openblas-dir=<path> takes
 // precedence; otherwise we fall back to the OPENBLAS_DIR environment
 // variable, the PHP SDK deps tree (deps/include / deps/lib) and finally the
 // standard CHECK_HEADER / CHECK_LIB search paths populated by phpsdk_deps.
+//
+// Lookup order for CUDA: --with-cuda-dir=<path> takes precedence over the
+// CUDA_PATH environment variable (set by the standard NVIDIA installer).
+// cuDNN is auto-detected inside the CUDA tree, or via --with-cudnn-dir=<path>
+// when installed separately.
 
 ARG_ENABLE("ndarray", "whether to enable ndarray (NumPower) support", "no");
 
 ARG_WITH("openblas-dir", "OpenBLAS install prefix (contains include\\ and lib\\)", "no");
+ARG_WITH("cuda", "whether to enable CUDA (GPU) support", "no");
+ARG_WITH("cuda-dir", "CUDA Toolkit install prefix (contains bin\\, include\\, lib\\x64\\)", "no");
+ARG_WITH("cudnn-dir", "cuDNN install prefix when not bundled inside the CUDA tree", "no");
 
 if (PHP_NDARRAY != "no") {
 
@@ -90,6 +101,103 @@ if (PHP_NDARRAY != "no") {
             // headers) from clobbering std::min/std::max — not C++ here but
             // also keeps min()/max() macros from biting AVX2 kernels.
             ADD_FLAG("CFLAGS_NDARRAY", "/D_USE_MATH_DEFINES /DNOMINMAX");
+
+            // ─────────────────────────────────────────────────────────────
+            // CUDA / cuDNN
+            //
+            // Opt-in via --with-cuda. The .cu sources (cuda_math.cu,
+            // cuda_dnn.cu) cannot be compiled by cl.exe — they must be
+            // pre-built into ndarray_cuda.lib by build-cuda-windows.bat
+            // before `nmake` runs. config.w32 here only handles:
+            //   1. locating the CUDA Toolkit + cuDNN libs,
+            //   2. defining HAVE_CUBLAS / HAVE_CUDNN so the .c sources
+            //      compile the GPU dispatch branches,
+            //   3. wiring cublas.lib / cudart.lib / cudnn.lib /
+            //      ndarray_cuda.lib into the link.
+            //
+            // The same /MD CRT mode (MSVC's multi-threaded DLL CRT) MUST be
+            // used by build-cuda-windows.bat when invoking nvcc, or the
+            // linker fails with LNK2038 "mismatch detected for _MSC_VER" /
+            // RuntimeLibrary mismatches.
+            // ─────────────────────────────────────────────────────────────
+            if (PHP_CUDA != "no") {
+                var cuda_root = (PHP_CUDA_DIR && PHP_CUDA_DIR != "no")
+                    ? PHP_CUDA_DIR
+                    : (WshShell.Environment("PROCESS").Item("CUDA_PATH") || "");
+
+                if (!cuda_root || cuda_root.length == 0) {
+                    WARNING("--with-cuda passed but no CUDA Toolkit found; pass --with-cuda-dir=<path> or set %CUDA_PATH%.");
+                } else {
+                    var cuda_inc = cuda_root + "\\include";
+                    var cuda_lib = cuda_root + "\\lib\\x64";
+
+                    var have_cublas_h = CHECK_HEADER_ADD_INCLUDE(
+                        "cublas_v2.h", "CFLAGS_NDARRAY",
+                        cuda_inc + ";" + configure_module_dirname);
+
+                    // cuda_math.cu calls into cusolverDn* (SVD, getrf, syevd,
+                    // …) and src/initializers.c calls curand host functions
+                    // (curandCreateGenerator, curandGenerateNormal, …), so
+                    // cusolver.lib AND curand.lib must be in the link line.
+                    // Windows' linker is strict on unresolved symbols (Linux
+                    // gets away with deferred binding via dlopen(RTLD_LAZY),
+                    // but that's a latent bug there too — runtime crash the
+                    // first time anyone calls NumPower::svd / ::normal / etc.
+                    // on a GPU array).
+                    var have_cublas_lib = false;
+                    if (have_cublas_h) {
+                        ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + cuda_lib + "\"");
+                        have_cublas_lib =
+                            CHECK_LIB("cublas.lib",   "ndarray", cuda_lib) &&
+                            CHECK_LIB("cudart.lib",   "ndarray", cuda_lib) &&
+                            CHECK_LIB("cusolver.lib", "ndarray", cuda_lib) &&
+                            CHECK_LIB("curand.lib",   "ndarray", cuda_lib);
+                    }
+
+                    if (!have_cublas_h || !have_cublas_lib) {
+                        WARNING("CUDA enabled but cublas_v2.h / cublas.lib / cudart.lib / cusolver.lib / curand.lib not found under \"" + cuda_root + "\"; GPU support disabled.");
+                    } else {
+                        AC_DEFINE("HAVE_CUBLAS", 1, "Have cuBLAS / cudart / cusolver / curand support");
+                        ADD_FLAG("LIBS_NDARRAY", "cublas.lib cudart.lib cusolver.lib curand.lib");
+
+                        // cuDNN: optional. Prefer --with-cudnn-dir, then look
+                        // inside the CUDA tree (newer Toolkits ship cuDNN
+                        // headers alongside the rest under include\).
+                        var cudnn_root = (PHP_CUDNN_DIR && PHP_CUDNN_DIR != "no")
+                            ? PHP_CUDNN_DIR
+                            : cuda_root;
+                        var cudnn_inc = cudnn_root + "\\include";
+                        var cudnn_lib = cudnn_root + "\\lib\\x64";
+                        var have_cudnn_h = CHECK_HEADER_ADD_INCLUDE(
+                            "cudnn.h", "CFLAGS_NDARRAY",
+                            cudnn_inc + ";" + configure_module_dirname);
+                        if (have_cudnn_h) {
+                            if (cudnn_root != cuda_root) {
+                                ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + cudnn_lib + "\"");
+                            }
+                            if (CHECK_LIB("cudnn.lib", "ndarray", cudnn_lib)) {
+                                AC_DEFINE("HAVE_CUDNN", 1, "Have cuDNN support");
+                                ADD_FLAG("LIBS_NDARRAY", "cudnn.lib");
+                            } else {
+                                STDOUT.WriteLine("    cudnn.h found but cudnn.lib not located; cuDNN disabled.");
+                            }
+                        } else {
+                            STDOUT.WriteLine("    cudnn.h not found; cuDNN GPU paths disabled (cublas/cudart still active).");
+                        }
+
+                        // ndarray_cuda.lib bundles the pre-compiled
+                        // cuda_math.obj + cuda_dnn.obj (produced by
+                        // build-cuda-windows.bat at the repo root). The
+                        // linker searches the build CWD by default, but we
+                        // add a /LIBPATH for safety in case nmake is run
+                        // from a subdir.
+                        ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + configure_module_dirname + "\"");
+                        ADD_FLAG("LIBS_NDARRAY", "ndarray_cuda.lib");
+
+                        STDOUT.WriteLine("    CUDA enabled — remember to run build-cuda-windows.bat BEFORE nmake.");
+                    }
+                }
+            }
 
             AC_DEFINE("HAVE_NDARRAY", 1, "Have ndarray support");
 

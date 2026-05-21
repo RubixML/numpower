@@ -13,7 +13,9 @@
 #ifdef HAVE_CUBLAS
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
-#include <nvml.h>
+/* nvml.h was historically pulled in here but no NVML symbols are referenced
+   anywhere in the codebase. Dropping it avoids needing the NVIDIA Management
+   Library dev pack (nvml_dev) on Windows CI just to satisfy a dead include. */
 #endif
 
 /**
