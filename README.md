@@ -3,19 +3,12 @@
 </p>
 
 <h1 align="center">Rubix NumPower</h1>
-<p align="center">
-<img width="500" height="102" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=102&separator=%3C&lines=%3C%24arr+%3D+NumPower%3A%3Aarray(%5B%5B1%2C+2%5D%2C+%5B3%2C+4%5D%5D);%3C%24result+%3D+%24arr+*+2;%3Cecho+%24result;" alt="Typing code" />
-</p>
 
 **Rubix NumPower** is a PHP extension for fast math on large arrays — think NumPy, but for PHP. It gives you N-dimensional arrays (`NDArray`) and operations on them that run **tens to thousands of times faster** than the same code written with plain PHP arrays.
 
 Under the hood NumPower uses the same battle-tested numerical libraries (OpenBLAS, LAPACK) that NumPy, SciPy, and most machine-learning frameworks rely on, plus AVX2 instructions on your CPU and — if you have an NVIDIA GPU — CUDA kernels for matrix operations that don't fit on the CPU comfortably.
 
 **Typical use cases:** machine learning, neural networks, signal processing, image processing, statistics, scientific computing — anything where you need to multiply, add, slice, or transform big matrices and vectors.
-
-<p align="center">
-<img width="500" height="127" src="https://readme-typing-svg.demolab.com?font=Fira+Code&duration=2500&pause=250&color=F7381D&multiline=true&width=500&height=127&separator=%3C&lines=%3C%24a+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24b+%3D+NumPower%3A%3Anormal(%5B2%2C+2%5D)-%3Egpu();%3C%24result+%3D+NumPower%3A%3Amatmul(%24aGpu%2C+%24bGpu);%3Cecho+%24result;" alt="Typing code" />
-</p>
 
 ---
 
