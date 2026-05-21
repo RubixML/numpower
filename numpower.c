@@ -275,11 +275,15 @@ PHP_METHOD(NDArray, gpu) {
 
 /**
  * @brief Fills the NDArray with a specified value.
- * 
+ *
  * ```
- * fill(float|int|bool $value): void
+ * fill(float|int|bool|string $value): void
  * ```
- * 
+ *
+ * String inputs preserve full precision for float128 / int64 / uint64 dtypes
+ * — for those types passing a numeric string is the only way to express
+ * values outside PHP's native int / float range.
+ *
  * @param value The value to fill the NDArray with.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_fill, 1)
@@ -293,11 +297,13 @@ PHP_METHOD(NDArray, fill) {
         Z_PARAM_ZVAL(value)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (Z_TYPE(*value) != IS_LONG && Z_TYPE(*value) != IS_DOUBLE && Z_TYPE(*value) != IS_TRUE && Z_TYPE(*value) != IS_FALSE) {
-        zend_throw_error(NULL, "Invalid value type. Supported types are: float, int, bool");
+    if (Z_TYPE(*value) != IS_LONG && Z_TYPE(*value) != IS_DOUBLE &&
+        Z_TYPE(*value) != IS_TRUE && Z_TYPE(*value) != IS_FALSE &&
+        Z_TYPE(*value) != IS_STRING) {
+        zend_throw_error(NULL, "Invalid value type. Supported types are: float, int, bool, string");
         return;
     }
-    
+
     NDArray* ndarray = NDArrayFactory_restoreFromZval(objZval);
 
     if (ndarray == NULL) {
