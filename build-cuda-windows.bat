@@ -17,11 +17,19 @@ REM                --with-prefix=<php-prefix>
 REM   3. build-cuda-windows.bat            <-- THIS SCRIPT
 REM   4. nmake
 REM
-REM Required env vars (or arguments):
+REM Configuration is read from environment variables only — cmd.exe treats
+REM `=` as a token delimiter inside batch arguments, which makes a
+REM `--cuda-path=<value>` style flag fragile (the `=` splits the arg in two
+REM and the value gets mis-parsed). The standard NVIDIA installer already
+REM exports CUDA_PATH; setup-php-sdk exposes PHP_PREFIX. For local manual
+REM use, `set CUDA_PATH=...` and `set PHP_PREFIX=...` before calling this
+REM script.
+REM
+REM Required env vars:
 REM   %CUDA_PATH%   CUDA Toolkit install root (the dir that contains bin\,
-REM                 include\, lib\x64\). May also be passed as first arg.
+REM                 include\, lib\x64\).
 REM   %PHP_PREFIX%  PHP install root with include\php\... headers. Normally
-REM                 set by setup-php-sdk; otherwise pass --php-prefix=<path>.
+REM                 set automatically by setup-php-sdk in CI.
 REM
 REM Optional:
 REM   %CUDNN_DIR%   cuDNN install root if cuDNN headers/libs are not already
@@ -30,37 +38,11 @@ REM ===========================================================================
 
 setlocal enabledelayedexpansion
 
-set "ARG_CUDA_PATH="
-set "ARG_PHP_PREFIX="
-set "ARG_CUDNN_DIR="
-
-:parse_args
-if "%~1"=="" goto args_done
-set "_arg=%~1"
-if /I "!_arg:~0,13!"=="--cuda-path=" (
-    set "ARG_CUDA_PATH=!_arg:~13!"
-) else if /I "!_arg:~0,14!"=="--php-prefix=" (
-    set "ARG_PHP_PREFIX=!_arg:~14!"
-) else if /I "!_arg:~0,13!"=="--cudnn-dir=" (
-    set "ARG_CUDNN_DIR=!_arg:~13!"
-) else if "!_arg:~0,2!"=="--" (
-    echo ERROR: unknown option "!_arg!"
-    goto usage
-) else if "!ARG_CUDA_PATH!"=="" (
-    set "ARG_CUDA_PATH=!_arg!"
-)
-shift
-goto parse_args
-:args_done
-
-if not "%ARG_CUDA_PATH%"=="" set "CUDA_PATH=%ARG_CUDA_PATH%"
-if not "%ARG_PHP_PREFIX%"=="" set "PHP_PREFIX=%ARG_PHP_PREFIX%"
-if not "%ARG_CUDNN_DIR%"=="" set "CUDNN_DIR=%ARG_CUDNN_DIR%"
-
 if "%CUDA_PATH%"=="" (
-    echo ERROR: CUDA_PATH not set. Either set the env var or pass the CUDA
-    echo        Toolkit path as the first argument / --cuda-path=...
-    goto usage
+    echo ERROR: CUDA_PATH environment variable is not set.
+    echo        The NVIDIA CUDA Toolkit installer normally sets it; otherwise
+    echo        run `set CUDA_PATH=^<path^>` before calling this script.
+    exit /b 1
 )
 if not exist "%CUDA_PATH%\bin\nvcc.exe" (
     echo ERROR: nvcc.exe not found at "%CUDA_PATH%\bin\nvcc.exe"
@@ -69,10 +51,11 @@ if not exist "%CUDA_PATH%\bin\nvcc.exe" (
 )
 
 if "%PHP_PREFIX%"=="" (
-    echo ERROR: PHP_PREFIX not set. The setup-php-sdk action exposes this as
-    echo        its `prefix` output; locally, point it at the PHP install
-    echo        whose include\php\... headers match your build target.
-    goto usage
+    echo ERROR: PHP_PREFIX environment variable is not set.
+    echo        The setup-php-sdk action exposes this as its `prefix` output;
+    echo        locally, point it at the PHP install whose include\php\...
+    echo        headers match your build target.
+    exit /b 1
 )
 
 REM ---- Locate PHP include tree --------------------------------------------
@@ -148,11 +131,3 @@ echo.
 echo OK: produced ndarray_cuda.lib (%BUILD_DIR%\ holds the intermediate .obj files).
 echo     Now run `nmake` to link the extension.
 exit /b 0
-
-:usage
-echo.
-echo Usage:
-echo   build-cuda-windows.bat [--cuda-path=^<path^>] [--php-prefix=^<path^>] [--cudnn-dir=^<path^>]
-echo.
-echo Or rely on the matching env vars %%CUDA_PATH%%, %%PHP_PREFIX%%, %%CUDNN_DIR%%.
-exit /b 1

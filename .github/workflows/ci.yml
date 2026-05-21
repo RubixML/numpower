@@ -248,14 +248,17 @@ jobs:
 
       # Pre-compile the .cu sources into ndarray_cuda.lib. Must run BEFORE
       # nmake, since config.w32 added ndarray_cuda.lib to LIBS_NDARRAY and
-      # nmake will fail at link time if the file is missing.
+      # nmake will fail at link time if the file is missing. The .bat reads
+      # %CUDA_PATH% (set by the cuda-toolkit action) and %PHP_PREFIX% (set
+      # below) directly from the environment — passing them as CLI flags
+      # would hit cmd.exe's quirk of treating `=` as an argument delimiter.
       - name: Build CUDA objects
         if: matrix.cuda
         shell: cmd
         env:
           PHP_PREFIX: ${{ steps.php-sdk.outputs.prefix }}
         run: |
-          call build-cuda-windows.bat --cuda-path="%CUDA_PATH%" --php-prefix="%PHP_PREFIX%"
+          call build-cuda-windows.bat
 
       - name: nmake
         shell: cmd

@@ -226,8 +226,10 @@ configure --enable-ndarray ^
           --with-cuda --with-cuda-dir="%CUDA_PATH%" ^
           --with-prefix=C:\path\to\php
 
-REM Compiles the .cu files into ndarray_cuda.lib. Uses %CUDA_PATH% and
-REM %PHP_PREFIX%; pass --cuda-path=... / --php-prefix=... if needed.
+REM Compiles the .cu files into ndarray_cuda.lib. Reads %CUDA_PATH%
+REM (set by the CUDA Toolkit installer) and %PHP_PREFIX% (set by the
+REM PHP SDK setup). Use `set CUDA_PATH=...` / `set PHP_PREFIX=...`
+REM beforehand if they're not already in the environment.
 build-cuda-windows.bat
 
 nmake
