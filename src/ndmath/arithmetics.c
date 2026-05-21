@@ -385,11 +385,13 @@ NDArray* NDArray_Add_Double(NDArray* a, NDArray* b) {
     return result;
 }
 
+#if HAVE_AVX2
 __m256 fix_negative_zero(__m256 vec) {
     __m256 zero = _mm256_set1_ps(-0.0f);
     __m256 mask = _mm256_cmp_ps(vec, zero, _CMP_EQ_OQ);
     return _mm256_blendv_ps(vec, zero, mask);
 }
+#endif
 
 /**
  * Multiply elements of a and b element-wise

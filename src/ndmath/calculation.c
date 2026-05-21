@@ -1,3 +1,4 @@
+#include <math.h>
 #include <string.h>
 #include "../manipulation.h"
 #include "../initializers.h"
@@ -14,7 +15,7 @@ float_argmax(float *ip, int n, float *max_ind)
     int i;
     float mp = *ip;
     *max_ind = 0;
-    if (isnanf(mp)) {
+    if (isnan(mp)) {
         /* nan encountered; it's maximal */
         return 0;
     }
@@ -26,7 +27,7 @@ float_argmax(float *ip, int n, float *max_ind)
         if (*ip > mp) {  /* negated, for correct nan handling */
             mp = *ip;
             *max_ind = (float)i;
-            if (isnanf(mp)) {
+            if (isnan(mp)) {
                 /* nan encountered, it's maximal */
                 break;
             }
@@ -41,7 +42,7 @@ float_argmin(float *ip, int n, float *min_ind)
     int i;
     float mp = *ip;
     *min_ind = 0;
-    if (isnanf(mp)) {
+    if (isnan(mp)) {
         /* nan encountered; it's minimal */
         return 0;
     }
@@ -52,7 +53,7 @@ float_argmin(float *ip, int n, float *min_ind)
         if (!_LESS_THAN_OR_EQUAL(mp, *ip)) {
             mp = *ip;
             *min_ind = (float)i;
-            if (isnanf(mp)) {
+            if (isnan(mp)) {
                 break;
             }
         }
