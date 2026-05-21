@@ -272,25 +272,28 @@ jobs:
       - name: Stage runtime DLLs next to extension
         shell: pwsh
         run: |
-          # IMPORTANT: PHP on Windows calls SetDefaultDllDirectories(
-          # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS) at startup, which DISABLES
-          # PATH-based DLL search for extensions. So when PHP's LoadLibrary
-          # resolves php_ndarray.dll's transitive deps (libopenblas.dll,
-          # cublas64_*.dll, …), it ONLY looks in:
+          # PHP on Windows calls SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+          # early in startup, which kills PATH-based search for extension transitive
+          # deps. After that, dependency resolution only looks in:
           #   1. The directory of php.exe (= %PHP_PREFIX% = php-bin\)
           #   2. C:\Windows\System32
-          #   3. Dirs explicitly registered via AddDllDirectory() — none here.
-          # Notably the directory of the loaded DLL (x64\Release\) and PATH
-          # are NOT in that list. Therefore every runtime DLL must be copied
-          # next to php.exe in php-bin\. The copies into x64\Release\ are
-          # kept as a belt-and-suspenders for tools that don't go through
-          # PHP's hardened loader.
+          #   3. Dirs added via AddDllDirectory() — PHP adds none.
+          # So every runtime DLL must end up in php-bin\. The copies into x64\Release\
+          # are belt & suspenders for tools that bypass the hardened loader.
           $buildDir = if (Test-Path 'x64\Release') { 'x64\Release' } else { 'x64\Release_TS' }
           $phpBin   = "${{ steps.php-sdk.outputs.prefix }}"
-          Copy-Item openblas\bin\libopenblas.dll "$buildDir\" -Force
-          Copy-Item openblas\bin\libopenblas.dll "$phpBin\"   -Force -ErrorAction SilentlyContinue
+          Write-Host "=== Staging targets ==="
+          Write-Host "  buildDir = $buildDir"
+          Write-Host "  phpBin   = $phpBin"
+
+          Write-Host "=== Copying libopenblas.dll ==="
+          Copy-Item openblas\bin\libopenblas.dll "$buildDir\" -Force -Verbose
+          Copy-Item openblas\bin\libopenblas.dll "$phpBin\"   -Force -Verbose
+
           if ($env:RUNNER_CUDA -eq 'true') {
             $cudaBin = Join-Path $env:CUDA_PATH 'bin'
+            Write-Host "=== Source CUDA bin: $cudaBin ==="
+            Get-ChildItem -Path $cudaBin -Filter '*.dll' | Select-Object -ExpandProperty Name | Sort-Object | Out-Host
             $filters = @(
               'cublas64_*.dll',    # direct link dep
               'cudart64_*.dll',    # direct link dep
@@ -302,14 +305,32 @@ jobs:
               'cudnn64_*.dll'      # optional, when cuDNN sub-package was installed
             )
             foreach ($filter in $filters) {
-              Get-ChildItem -Path $cudaBin -Filter $filter -ErrorAction SilentlyContinue | ForEach-Object {
-                Copy-Item -Path $_.FullName -Destination "$buildDir\" -Force
-                Copy-Item -Path $_.FullName -Destination "$phpBin\"   -Force -ErrorAction SilentlyContinue
+              $matched = Get-ChildItem -Path $cudaBin -Filter $filter -ErrorAction SilentlyContinue
+              if (-not $matched) {
+                Write-Host "  $filter -> no match"
+                continue
+              }
+              foreach ($f in $matched) {
+                Write-Host "  Copying $($f.Name) -> $buildDir\ and $phpBin\"
+                Copy-Item -Path $f.FullName -Destination "$buildDir\" -Force
+                Copy-Item -Path $f.FullName -Destination "$phpBin\"   -Force
               }
             }
           }
+
+          Write-Host ""
+          Write-Host "=== Files in $phpBin (final) ==="
+          Get-ChildItem -Path $phpBin -Filter '*.dll' | Select-Object -ExpandProperty Name | Sort-Object | Out-Host
         env:
           RUNNER_CUDA: ${{ matrix.cuda }}
+
+      - name: Show extension's transitive DLL deps
+        shell: pwsh
+        run: |
+          $buildDir = if (Test-Path 'x64\Release') { 'x64\Release' } else { 'x64\Release_TS' }
+          $dll = Join-Path $buildDir 'php_ndarray.dll'
+          Write-Host "=== dumpbin /dependents $dll ==="
+          dumpbin /dependents $dll
 
       - name: Run tests
         shell: cmd
