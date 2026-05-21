@@ -2,7 +2,9 @@
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include "debug.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "ndarray.h"
 #include "ndarray_types.h"
 #include "types.h"
@@ -20,32 +22,32 @@
 void
 NDArray_Dump(NDArray* array) {
     int i;
-    printf("\n=================================================");
-    printf("\nNDArray.uuid\t\t\t%d", array->uuid);
-    printf("\nNDArray.ndim\t\t\t%d", array->ndim);
-    printf("\nNDArray.dims\t\t\t[");
+    php_printf("\n=================================================");
+    php_printf("\nNDArray.uuid\t\t\t%d", array->uuid);
+    php_printf("\nNDArray.ndim\t\t\t%d", array->ndim);
+    php_printf("\nNDArray.dims\t\t\t[");
     for(i = 0; i < array->ndim; i ++) {
-        printf(" %d", array->dimensions[i]);
+        php_printf(" %d", array->dimensions[i]);
     }
-    printf(" ]\n");
-    printf("NDArray.strides\t\t\t[");
+    php_printf(" ]\n");
+    php_printf("NDArray.strides\t\t\t[");
     for(i = 0; i < array->ndim; i ++) {
-        printf(" %d", array->strides[i]);
+        php_printf(" %d", array->strides[i]);
     }
-    printf(" ]\n");
+    php_printf(" ]\n");
     if (NDArray_DEVICE(array) == NDARRAY_DEVICE_GPU) {
-        printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "GPU");
+        php_printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "GPU");
     } else if(NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
-        printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "CPU");
+        php_printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "CPU");
     } else {
-        printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "ERROR");
+        php_printf("NDArray.device\t\t\t(%d) %s\n", NDArray_DEVICE(array), "ERROR");
     }
-    printf("NDArray.refcount\t\t%d\n", array->refcount);
-    printf("NDArray.descriptor.elsize\t%d\n", array->descriptor->elsize);
-    printf("NDArray.descriptor.numElements\t%ld\n", array->descriptor->numElements);
-    printf("NDArray.descriptor.type\t\t%s\n", array->descriptor->type);
-    printf("NDArray.iterator.current_index\t%d", array->iterator->currentIndex);
-    printf("\n=================================================\n");
+    php_printf("NDArray.refcount\t\t%d\n", array->refcount);
+    php_printf("NDArray.descriptor.elsize\t%d\n", array->descriptor->elsize);
+    php_printf("NDArray.descriptor.numElements\t%ld\n", array->descriptor->numElements);
+    php_printf("NDArray.descriptor.type\t\t%s\n", array->descriptor->type);
+    php_printf("NDArray.iterator.current_index\t%d", array->iterator->currentIndex);
+    php_printf("\n=================================================\n");
 }
 
 /**
@@ -468,7 +470,11 @@ char *print_matrix_generic(
     if (device == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
         gpu_buf = (char *)emalloc((size_t)num_elements * (size_t)elsize);
-        cudaMemcpy(gpu_buf, data, (size_t)num_elements * (size_t)elsize, cudaMemcpyDeviceToHost);
+        /* fp128 lives on GPU as double-double (hi, lo) — go through the typed
+           D2H helper so it's reassembled into native __float128 bytes for the
+           generic stringifier. Other dtypes use the same byte layout on both
+           devices, so the helper degenerates to a plain cudaMemcpy. */
+        NDArray_TypedD2H(gpu_buf, data, num_elements, type);
         tmp = gpu_buf;
 #endif
     }

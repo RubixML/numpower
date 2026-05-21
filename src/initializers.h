@@ -32,6 +32,7 @@ NDArray* NDArray_EmptyLike(NDArray *a);
 NDArray* NDArray_FromNDArrayBase(NDArray *target, char *data_ptr, int* shape, int* strides, const int ndim);
 
 NDArray* NDArray_FillDouble(NDArray *a, double fill_value);
+NDArray* NDArray_FillFloat128(NDArray *a, ndarray_fp128_t fill_value);
 
 #ifdef __cplusplus
 extern "C" {

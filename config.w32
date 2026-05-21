@@ -1,0 +1,131 @@
+// vim:ft=javascript
+//
+// Windows PHP SDK build configuration for the ndarray (NumPower) extension.
+// Mirrors config.m4 / configure.ac:
+//   - links against OpenBLAS (cblas_sdot) and LAPACKE (LAPACKE_sgesdd),
+//   - opts in to AVX2 on x64 via /arch:AVX2 (matches -mavx2 on POSIX),
+//   - leaves CUDA, cuDNN, MKL, libquadmath, and GD disabled (no MSVC-side
+//     support yet); float128 falls back to long double via the gate in
+//     src/ndarray_types.h.
+//
+// Lookup order for OpenBLAS / LAPACKE: --with-openblas-dir=<path> takes
+// precedence; otherwise we fall back to the OPENBLAS_DIR environment
+// variable, the PHP SDK deps tree (deps/include / deps/lib) and finally the
+// standard CHECK_HEADER / CHECK_LIB search paths populated by phpsdk_deps.
+
+ARG_ENABLE("ndarray", "whether to enable ndarray (NumPower) support", "no");
+
+ARG_WITH("openblas-dir", "OpenBLAS install prefix (contains include\\ and lib\\)", "no");
+
+if (PHP_NDARRAY != "no") {
+
+    var openblas_root = (PHP_OPENBLAS_DIR && PHP_OPENBLAS_DIR != "no")
+        ? PHP_OPENBLAS_DIR
+        : (WshShell.Environment("PROCESS").Item("OPENBLAS_DIR") || "");
+
+    var extra_inc = "";
+    var extra_lib = "";
+    if (openblas_root && openblas_root.length > 0) {
+        extra_inc = openblas_root + "\\include;" +
+                    openblas_root + "\\include\\openblas;";
+        extra_lib = openblas_root + "\\lib;";
+        ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + openblas_root + "\\lib\"");
+        ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + openblas_root + "\\bin\"");
+    }
+
+    // Header probes — OpenBLAS ships cblas.h either at the include root or
+    // under include\openblas\ depending on the distribution.
+    var have_cblas_h =
+        CHECK_HEADER_ADD_INCLUDE("cblas.h", "CFLAGS_NDARRAY", extra_inc + configure_module_dirname) ||
+        CHECK_HEADER_ADD_INCLUDE("openblas\\cblas.h", "CFLAGS_NDARRAY", extra_inc + configure_module_dirname);
+
+    var have_lapacke_h =
+        CHECK_HEADER_ADD_INCLUDE("lapacke.h", "CFLAGS_NDARRAY", extra_inc + configure_module_dirname) ||
+        CHECK_HEADER_ADD_INCLUDE("openblas\\lapacke.h", "CFLAGS_NDARRAY", extra_inc + configure_module_dirname);
+
+    if (!have_cblas_h) {
+        WARNING("ndarray not enabled; cblas.h not found. Pass --with-openblas-dir=<path> or set %OPENBLAS_DIR%.");
+    } else if (!have_lapacke_h) {
+        WARNING("ndarray not enabled; lapacke.h not found. Pass --with-openblas-dir=<path> or set %OPENBLAS_DIR%.");
+    } else {
+        // OpenBLAS prebuilt distributions name their import library either
+        // "libopenblas.lib" (OpenMathLib release archives) or "openblas.lib"
+        // (vcpkg). Try both.
+        var blas_lib = null;
+        if (CHECK_LIB("libopenblas.lib", "ndarray", extra_lib)) {
+            blas_lib = "libopenblas.lib";
+        } else if (CHECK_LIB("openblas.lib", "ndarray", extra_lib)) {
+            blas_lib = "openblas.lib";
+        }
+
+        if (blas_lib === null) {
+            WARNING("ndarray not enabled; OpenBLAS import library (libopenblas.lib / openblas.lib) not found.");
+        } else {
+            AC_DEFINE("HAVE_CBLAS",   1, "Have CBLAS support");
+            AC_DEFINE("HAVE_LAPACKE", 1, "Have LAPACKE support");
+            // OpenBLAS exports both cblas_* and LAPACKE_* symbols from the
+            // same DLL, so a single import library satisfies both.
+
+            // HAVE_QUADMATH is consumed via `#if HAVE_QUADMATH` so a 0
+            // value correctly disables the libquadmath code path. The
+            // CUDA / cuDNN / MKL / GD feature flags are consumed via
+            // `#ifdef HAVE_xxx` in many sites, so we must leave them
+            // *undefined* to keep those paths out of the build.
+
+            // AVX2: on x64 it is always available on any CPU released since
+            // 2013 and matches the POSIX configure (which sets -mavx2 -march=
+            // native unconditionally on x86 hosts). On ARM64 it is mandatory
+            // to leave HAVE_AVX2=0 — the kernels are gated by this macro.
+            if (X64) {
+                AC_DEFINE("HAVE_AVX2", 1, "Have AVX2/SSE support");
+                ADD_FLAG("CFLAGS_NDARRAY", "/arch:AVX2");
+            } else {
+                AC_DEFINE("HAVE_AVX2", 0, "Have AVX2/SSE support");
+            }
+
+            // _USE_MATH_DEFINES: M_PI etc. used by trig/log helpers on POSIX
+            // are not in the C standard; MSVC only exposes them when this
+            // macro is defined before <math.h> is included.
+            // NOMINMAX: keep <windows.h> (pulled in transitively by some PHP
+            // headers) from clobbering std::min/std::max — not C++ here but
+            // also keeps min()/max() macros from biting AVX2 kernels.
+            ADD_FLAG("CFLAGS_NDARRAY", "/D_USE_MATH_DEFINES /DNOMINMAX");
+
+            AC_DEFINE("HAVE_NDARRAY", 1, "Have ndarray support");
+
+            // Source list — identical to PHP_NEW_EXTENSION in config.m4.
+            EXTENSION("ndarray", "numpower.c", PHP_NDARRAY_SHARED, "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+
+            ADD_SOURCES(configure_module_dirname + "/src",
+                "initializers.c " +
+                "ndarray.c " +
+                "debug.c " +
+                "buffer.c " +
+                "logic.c " +
+                "gpu_alloc.c " +
+                "manipulation.c " +
+                "dnn.c " +
+                "iterators.c " +
+                "indexing.c " +
+                "sanitizers.c " +
+                "types.c " +
+                "ndarray_types.c " +
+                "dd_math.c",
+                "ndarray");
+
+            ADD_SOURCES(configure_module_dirname + "/src/ndmath",
+                "double_math.c " +
+                "linalg.c " +
+                "arithmetics.c " +
+                "calculation.c " +
+                "statistics.c " +
+                "signal.c",
+                "ndarray");
+
+            ADD_SOURCES(configure_module_dirname + "/src/ndarray/frontend",
+                "ndarray_factory.c " +
+                "manipulations.c",
+                "ndarray");
+        }
+    }
+}

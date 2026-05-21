@@ -31,6 +31,12 @@ int type_needs_string_io(const char *type);
 /* Returns 1 if the type is one of the validated dtype strings */
 int type_is_valid(const char *type);
 
+/* Returns the canonical pointer (static program-lifetime constant) for the
+   given dtype name, or NULL if unrecognised. Use this whenever the source
+   buffer of the type string may be freed (e.g. PHP strings during
+   __unserialize) — NDArrayDescriptor stores the pointer by reference. */
+const char *type_canonicalize(const char *type);
+
 /* PyTorch-compatible type promotion: returns the higher-ranked dtype of a and b */
 const char *promote_dtype(const char *a, const char *b);
 

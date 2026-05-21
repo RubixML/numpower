@@ -1,5 +1,7 @@
 // HAVE_CUBLAS
+#ifndef _MSC_VER
 #include "../../../config.h"
+#endif
 
 #include <Zend/zend_interfaces.h>
 

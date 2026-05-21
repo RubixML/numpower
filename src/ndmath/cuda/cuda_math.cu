@@ -9,6 +9,8 @@
 #include <cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
+#include <cuda_fp16.h>
+#include <stdint.h>
 
 #define CHECK_CUDA(func) do { \
   cudaError_t status = (func); \
@@ -901,6 +903,390 @@ void fill_float_kernel_double(double* array, int n, double value) {
     }
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   Typed CUDA kernels — keep GPU arrays on GPU for every supported dtype.
+
+   For every binary op (add/sub/mul/div/mod/pow) we define a C++ template
+   __global__ kernel and an extern "C" wrapper per dtype. The wrappers are
+   the only API surface; the templates exist only inside the .cu file.
+
+   Integer pow uses repeated-squaring fast exponentiation (exact); float pow
+   uses pow() / powf() which already give native precision.
+
+   Integer mod uses % (with C semantics: sign of result follows dividend).
+   Float mod uses fmod() / fmodf().
+
+   Division by zero on integer dtypes is undefined in C (just like CPU);
+   on float dtypes it follows IEEE-754 (INF / NaN). We match this on GPU.
+   ────────────────────────────────────────────────────────────────────────── */
+
+template <typename T>
+__device__ inline T tcuda_add(T a, T b) { return a + b; }
+template <typename T>
+__device__ inline T tcuda_sub(T a, T b) { return a - b; }
+template <typename T>
+__device__ inline T tcuda_mul(T a, T b) { return a * b; }
+template <typename T>
+__device__ inline T tcuda_div(T a, T b) { return a / b; }
+
+/* Integer mod uses % with C semantics; protect against division by zero by
+   returning 0 (matches PyTorch's defined behavior for integer x % 0). */
+template <typename T>
+__device__ inline T tcuda_mod_int(T a, T b) { return b == (T)0 ? (T)0 : a % b; }
+__device__ inline double tcuda_mod_f(double a, double b) { return fmod(a, b); }
+__device__ inline float  tcuda_mod_f(float a, float b)   { return fmodf(a, b); }
+
+/* Integer pow: repeated squaring. Exact for all (a, b) where b >= 0; for
+   b < 0 on signed types we return 0 (analogous to int division). */
+template <typename T>
+__device__ inline T tcuda_pow_int(T base, T exp) {
+    if (exp < (T)0) return (T)0;
+    T result = (T)1;
+    T b = base;
+    typename std::make_unsigned<T>::type e =
+        (typename std::make_unsigned<T>::type)exp;
+    while (e) {
+        if (e & 1) result *= b;
+        e >>= 1;
+        if (e) b *= b;
+    }
+    return result;
+}
+template <typename T>
+__device__ inline T tcuda_pow_uint(T base, T exp) {
+    T result = (T)1;
+    T b = base;
+    while (exp) {
+        if (exp & 1) result *= b;
+        exp >>= 1;
+        if (exp) b *= b;
+    }
+    return result;
+}
+__device__ inline double tcuda_pow_f(double a, double b) { return pow(a, b); }
+__device__ inline float  tcuda_pow_f(float a, float b)   { return powf(a, b); }
+
+#define TYPED_BINOP_KERNEL(KERNEL_NAME, EXPR)                                       \
+template <typename T>                                                                \
+__global__ void KERNEL_NAME(const T *a, const T *b, T *out, int n) {                 \
+    int i = threadIdx.x + blockIdx.x * blockDim.x;                                   \
+    if (i < n) { T x = a[i]; T y = b[i]; out[i] = (EXPR); }                          \
+}
+
+TYPED_BINOP_KERNEL(tcuda_add_kernel, x + y)
+TYPED_BINOP_KERNEL(tcuda_sub_kernel, x - y)
+TYPED_BINOP_KERNEL(tcuda_mul_kernel, x * y)
+TYPED_BINOP_KERNEL(tcuda_div_kernel, x / y)
+
+/* Specialised mod/pow kernels (need different impl for int vs float) */
+template <typename T>
+__global__ void tcuda_mod_int_kernel(const T *a, const T *b, T *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = tcuda_mod_int(a[i], b[i]);
+}
+__global__ void tcuda_mod_f64_kernel(const double *a, const double *b, double *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = fmod(a[i], b[i]);
+}
+
+template <typename T>
+__global__ void tcuda_pow_signed_kernel(const T *a, const T *b, T *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = tcuda_pow_int(a[i], b[i]);
+}
+template <typename T>
+__global__ void tcuda_pow_unsigned_kernel(const T *a, const T *b, T *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = tcuda_pow_uint(a[i], b[i]);
+}
+__global__ void tcuda_pow_f64_kernel(const double *a, const double *b, double *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = pow(a[i], b[i]);
+}
+
+/* __half (float16) kernels — promote to float for compute to retain accuracy
+   matching CPU's float32 compute path. */
+__global__ void tcuda_add_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+}
+__global__ void tcuda_sub_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(__half2float(a[i]) - __half2float(b[i]));
+}
+__global__ void tcuda_mul_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(__half2float(a[i]) * __half2float(b[i]));
+}
+__global__ void tcuda_div_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(__half2float(a[i]) / __half2float(b[i]));
+}
+__global__ void tcuda_mod_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(fmodf(__half2float(a[i]), __half2float(b[i])));
+}
+__global__ void tcuda_pow_half_kernel(const __half *a, const __half *b, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(powf(__half2float(a[i]), __half2float(b[i])));
+}
+
+/* Generic typed fill. */
+template <typename T>
+__global__ void tcuda_fill_kernel(T *out, T value, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = value;
+}
+__global__ void tcuda_fill_half_kernel(__half *out, float value, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half(value);
+}
+
+/* GPU AsType cast kernels. Each pair (Src → Dst) is template-instantiated.
+   Casts are value-preserving where the destination range fits the source;
+   when not, C-style cast semantics apply (truncate / wrap), matching CPU. */
+template <typename Src, typename Dst>
+__global__ void tcuda_cast_kernel(const Src *in, Dst *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = (Dst)in[i];
+}
+template <typename Src>
+__global__ void tcuda_cast_to_half_kernel(const Src *in, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = __float2half((float)in[i]);
+}
+template <typename Dst>
+__global__ void tcuda_cast_from_half_kernel(const __half *in, Dst *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = (Dst)__half2float(in[i]);
+}
+__global__ void tcuda_cast_half_to_half_kernel(const __half *in, __half *out, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) out[i] = in[i];
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   GPU float128 emulation via double-double (TwoSum / Veltkamp split).
+
+   Storage: each fp128 element on GPU occupies 16 bytes laid out as (hi, lo)
+   where hi is the leading double and lo is the residual. Effective precision:
+   ~106 bits (vs fp128's 113 bits). Conversion to/from native __float128
+   happens host-side in NDArray_ToGPU / NDArray_ToCPU.
+
+   References: Dekker (1971), Bailey & Hida (2001) "Algorithms for
+   Quad-Double Precision Floating Point Arithmetic".
+   ────────────────────────────────────────────────────────────────────────── */
+struct dd_real { double hi; double lo; };
+
+__device__ inline dd_real dd_make(double h, double l) { dd_real r; r.hi = h; r.lo = l; return r; }
+
+/* TwoSum: a + b = s + e exactly, |e| << |s|. */
+__device__ inline dd_real dd_two_sum(double a, double b) {
+    double s  = a + b;
+    double bb = s - a;
+    double e  = (a - (s - bb)) + (b - bb);
+    return dd_make(s, e);
+}
+/* TwoProd via FMA (single rounding). */
+__device__ inline dd_real dd_two_prod(double a, double b) {
+    double p = a * b;
+    double e = fma(a, b, -p);
+    return dd_make(p, e);
+}
+
+__device__ inline dd_real dd_add(dd_real a, dd_real b) {
+    dd_real s = dd_two_sum(a.hi, b.hi);
+    dd_real t = dd_two_sum(a.lo, b.lo);
+    s.lo += t.hi;
+    dd_real s2 = dd_two_sum(s.hi, s.lo);
+    s2.lo += t.lo;
+    return dd_two_sum(s2.hi, s2.lo);
+}
+__device__ inline dd_real dd_neg(dd_real a) { return dd_make(-a.hi, -a.lo); }
+__device__ inline dd_real dd_sub(dd_real a, dd_real b) { return dd_add(a, dd_neg(b)); }
+__device__ inline dd_real dd_mul(dd_real a, dd_real b) {
+    dd_real p = dd_two_prod(a.hi, b.hi);
+    p.lo += a.hi * b.lo + a.lo * b.hi;
+    return dd_two_sum(p.hi, p.lo);
+}
+__device__ inline dd_real dd_div(dd_real a, dd_real b) {
+    /* Long-form division: q1 = a.hi / b.hi, refine */
+    double q1 = a.hi / b.hi;
+    dd_real r1 = dd_mul(b, dd_make(q1, 0.0));
+    dd_real diff = dd_sub(a, r1);
+    double q2 = diff.hi / b.hi;
+    dd_real r2 = dd_mul(b, dd_make(q2, 0.0));
+    dd_real diff2 = dd_sub(diff, r2);
+    double q3 = diff2.hi / b.hi;
+    return dd_add(dd_add(dd_make(q1, 0.0), dd_make(q2, 0.0)), dd_make(q3, 0.0));
+}
+
+/* dd_pow uses x^y = exp(y * log(x)) via dd_exp and dd_log; for simplicity we
+   use double-precision exp/log here and accept the precision degradation for
+   pow specifically. Add/sub/mul/div retain full double-double precision. */
+__device__ inline double dd_to_double(dd_real a) { return a.hi; }
+__device__ inline dd_real dd_pow(dd_real a, dd_real b) {
+    double r = pow(dd_to_double(a), dd_to_double(b));
+    return dd_make(r, 0.0);
+}
+__device__ inline dd_real dd_mod(dd_real a, dd_real b) {
+    /* fmod(a, b) = a - trunc(a / b) * b  (double-double precision) */
+    dd_real q = dd_div(a, b);
+    double q_trunc = trunc(q.hi);
+    dd_real qt = dd_mul(b, dd_make(q_trunc, 0.0));
+    return dd_sub(a, qt);
+}
+
+#define DD_BINOP_KERNEL(NAME, OP)                                                   \
+__global__ void NAME(const double *a, const double *b, double *out, int n) {        \
+    int i = threadIdx.x + blockIdx.x * blockDim.x;                                  \
+    if (i < n) {                                                                    \
+        dd_real x = dd_make(a[2*i], a[2*i+1]);                                      \
+        dd_real y = dd_make(b[2*i], b[2*i+1]);                                      \
+        dd_real r = OP(x, y);                                                       \
+        out[2*i]   = r.hi;                                                          \
+        out[2*i+1] = r.lo;                                                          \
+    }                                                                               \
+}
+
+DD_BINOP_KERNEL(tcuda_add_dd_kernel, dd_add)
+DD_BINOP_KERNEL(tcuda_sub_dd_kernel, dd_sub)
+DD_BINOP_KERNEL(tcuda_mul_dd_kernel, dd_mul)
+DD_BINOP_KERNEL(tcuda_div_dd_kernel, dd_div)
+DD_BINOP_KERNEL(tcuda_pow_dd_kernel, dd_pow)
+DD_BINOP_KERNEL(tcuda_mod_dd_kernel, dd_mod)
+
+__global__ void tcuda_fill_dd_kernel(double *out, double hi, double lo, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        out[2*i]   = hi;
+        out[2*i+1] = lo;
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   float4 (E2M1) and float8 (E4M3) GPU casts.
+
+   float4 has only 16 distinct values; we cast through float (lossless: all
+   representable values are exact in fp32). The encoder picks the nearest
+   representable nibble.
+
+   float8 (E4M3) has range [-240, 240] with ~3 mantissa bits; all values fit
+   exactly in float16 (mantissa 10, exponent 5) so casting fp8 ⇄ float16 is
+   lossless. We round-trip through float for the math, which gives the same
+   result as float16 with more headroom.
+   ────────────────────────────────────────────────────────────────────────── */
+
+__constant__ float c_fp4_lut[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+
+__device__ inline float dev_fp4_to_float(uint8_t nibble) {
+    return c_fp4_lut[nibble & 0x0F];
+}
+
+__device__ inline uint8_t dev_float_to_fp4(float val) {
+    /* Find nearest representable. Branchless tournament. */
+    uint8_t best = 0;
+    float best_err = fabsf(val - c_fp4_lut[0]);
+    #pragma unroll
+    for (int i = 1; i < 16; i++) {
+        float err = fabsf(val - c_fp4_lut[i]);
+        if (err < best_err) { best_err = err; best = (uint8_t)i; }
+    }
+    return best;
+}
+
+__device__ inline float dev_fp8_to_float(uint8_t fp8) {
+    int sign = (fp8 >> 7) & 1;
+    int exp  = (fp8 >> 3) & 0xF;
+    int man  = fp8 & 0x7;
+    if (exp == 0xF) return nanf("");
+    float val;
+    if (exp == 0) {
+        val = ((float)man / 8.0f) * ldexpf(1.0f, -6);
+    } else {
+        val = (1.0f + (float)man / 8.0f) * ldexpf(1.0f, exp - 7);
+    }
+    return sign ? -val : val;
+}
+
+__device__ inline uint8_t dev_float_to_fp8(float val) {
+    if (isnan(val)) return 0xFF;
+    int sign = (val < 0.0f || (val == 0.0f && (1.0f / val) < 0)) ? 1 : 0;
+    float ax = fabsf(val);
+    if (ax == 0.0f) return (uint8_t)(sign << 7);
+    if (ax > 240.0f) ax = 240.0f;
+
+    int e;
+    float frac = frexpf(ax, &e);   /* ax = frac * 2^e, frac in [0.5, 1.0) */
+    int biased_exp = e + 6;
+
+    if (biased_exp <= 0) {
+        int man = (int)(ax * 512.0f + 0.5f);
+        if (man > 7) man = 7;
+        return (uint8_t)((sign << 7) | man);
+    }
+    if (biased_exp >= 15) {
+        return (uint8_t)((sign << 7) | (14 << 3) | 7);
+    }
+    int man = (int)((2.0f * frac - 1.0f) * 8.0f + 0.5f);
+    if (man > 7) { man = 0; biased_exp++; }
+    if (biased_exp >= 15) {
+        return (uint8_t)((sign << 7) | (14 << 3) | 7);
+    }
+    return (uint8_t)((sign << 7) | ((biased_exp & 0xF) << 3) | (man & 0x7));
+}
+
+/* Cast kernels: each thread converts one element. */
+__global__ void tcuda_cast_fp4_to_f32_kernel(const uint8_t *src, float *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_fp4_to_float(src[i]);
+}
+__global__ void tcuda_cast_f32_to_fp4_kernel(const float *src, uint8_t *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_float_to_fp4(src[i]);
+}
+__global__ void tcuda_cast_fp4_to_f16_kernel(const uint8_t *src, __half *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(dev_fp4_to_float(src[i]));
+}
+__global__ void tcuda_cast_f16_to_fp4_kernel(const __half *src, uint8_t *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_float_to_fp4(__half2float(src[i]));
+}
+
+__global__ void tcuda_cast_fp8_to_f32_kernel(const uint8_t *src, float *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_fp8_to_float(src[i]);
+}
+__global__ void tcuda_cast_f32_to_fp8_kernel(const float *src, uint8_t *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_float_to_fp8(src[i]);
+}
+__global__ void tcuda_cast_fp8_to_f16_kernel(const uint8_t *src, __half *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2half(dev_fp8_to_float(src[i]));
+}
+__global__ void tcuda_cast_f16_to_fp8_kernel(const __half *src, uint8_t *dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = dev_float_to_fp8(__half2float(src[i]));
+}
+
+/* Byte-wise gather kernel: dst[i] = src[src_offsets[i]] (each element is
+   elsize bytes). The host computes src_offsets per broadcast rules and ships
+   them via a small int buffer. Keeps GPU code dtype-agnostic. */
+__global__ void tcuda_broadcast_by_offsets(const char *src, char *dst,
+                                           const int *src_offsets, int n_out,
+                                           int elsize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_out) return;
+    const char *s = src + (long long)src_offsets[idx] * elsize;
+    char *d       = dst + (long long)idx             * elsize;
+    for (int b = 0; b < elsize; b++) d[b] = s[b];
+}
+
 extern "C" {
 
     int
@@ -1765,5 +2151,315 @@ extern "C" {
         cudaMemcpy(rtn, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
     }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Typed wrapper functions exposed to the C side.
+
+   Naming: cuda_<op>_<dtype>(a, b, rtn, n)
+   For dtype ∈ {i8, u8, i16, u16, i32, u32, i64, u64, f16, f64, dd128}.
+   The dd128 wrappers operate on the GPU's double-double layout (2*n doubles
+   contiguous: hi[0], lo[0], hi[1], lo[1], ...).
+   ────────────────────────────────────────────────────────────────────────── */
+
+#define GRID_FOR(n)  int blockSize = 256; int numBlocks = ((n) + blockSize - 1) / blockSize
+
+#define DEF_BINOP_WRAPPER(NAME, KERNEL, T)                                          \
+void NAME(T *a, T *b, T *rtn, int n) {                                              \
+    GRID_FOR(n);                                                                    \
+    KERNEL<T><<<numBlocks, blockSize>>>(a, b, rtn, n);                              \
+    cudaDeviceSynchronize();                                                        \
+}
+
+DEF_BINOP_WRAPPER(cuda_add_i8,  tcuda_add_kernel, int8_t)
+DEF_BINOP_WRAPPER(cuda_sub_i8,  tcuda_sub_kernel, int8_t)
+DEF_BINOP_WRAPPER(cuda_mul_i8,  tcuda_mul_kernel, int8_t)
+DEF_BINOP_WRAPPER(cuda_div_i8,  tcuda_div_kernel, int8_t)
+DEF_BINOP_WRAPPER(cuda_add_u8,  tcuda_add_kernel, uint8_t)
+DEF_BINOP_WRAPPER(cuda_sub_u8,  tcuda_sub_kernel, uint8_t)
+DEF_BINOP_WRAPPER(cuda_mul_u8,  tcuda_mul_kernel, uint8_t)
+DEF_BINOP_WRAPPER(cuda_div_u8,  tcuda_div_kernel, uint8_t)
+DEF_BINOP_WRAPPER(cuda_add_i16, tcuda_add_kernel, int16_t)
+DEF_BINOP_WRAPPER(cuda_sub_i16, tcuda_sub_kernel, int16_t)
+DEF_BINOP_WRAPPER(cuda_mul_i16, tcuda_mul_kernel, int16_t)
+DEF_BINOP_WRAPPER(cuda_div_i16, tcuda_div_kernel, int16_t)
+DEF_BINOP_WRAPPER(cuda_add_u16, tcuda_add_kernel, uint16_t)
+DEF_BINOP_WRAPPER(cuda_sub_u16, tcuda_sub_kernel, uint16_t)
+DEF_BINOP_WRAPPER(cuda_mul_u16, tcuda_mul_kernel, uint16_t)
+DEF_BINOP_WRAPPER(cuda_div_u16, tcuda_div_kernel, uint16_t)
+DEF_BINOP_WRAPPER(cuda_add_i32, tcuda_add_kernel, int32_t)
+DEF_BINOP_WRAPPER(cuda_sub_i32, tcuda_sub_kernel, int32_t)
+DEF_BINOP_WRAPPER(cuda_mul_i32, tcuda_mul_kernel, int32_t)
+DEF_BINOP_WRAPPER(cuda_div_i32, tcuda_div_kernel, int32_t)
+DEF_BINOP_WRAPPER(cuda_add_u32, tcuda_add_kernel, uint32_t)
+DEF_BINOP_WRAPPER(cuda_sub_u32, tcuda_sub_kernel, uint32_t)
+DEF_BINOP_WRAPPER(cuda_mul_u32, tcuda_mul_kernel, uint32_t)
+DEF_BINOP_WRAPPER(cuda_div_u32, tcuda_div_kernel, uint32_t)
+DEF_BINOP_WRAPPER(cuda_add_i64, tcuda_add_kernel, int64_t)
+DEF_BINOP_WRAPPER(cuda_sub_i64, tcuda_sub_kernel, int64_t)
+DEF_BINOP_WRAPPER(cuda_mul_i64, tcuda_mul_kernel, int64_t)
+DEF_BINOP_WRAPPER(cuda_div_i64, tcuda_div_kernel, int64_t)
+DEF_BINOP_WRAPPER(cuda_add_u64, tcuda_add_kernel, uint64_t)
+DEF_BINOP_WRAPPER(cuda_sub_u64, tcuda_sub_kernel, uint64_t)
+DEF_BINOP_WRAPPER(cuda_mul_u64, tcuda_mul_kernel, uint64_t)
+DEF_BINOP_WRAPPER(cuda_div_u64, tcuda_div_kernel, uint64_t)
+DEF_BINOP_WRAPPER(cuda_add_f64, tcuda_add_kernel, double)
+DEF_BINOP_WRAPPER(cuda_sub_f64, tcuda_sub_kernel, double)
+DEF_BINOP_WRAPPER(cuda_mul_f64, tcuda_mul_kernel, double)
+DEF_BINOP_WRAPPER(cuda_div_f64, tcuda_div_kernel, double)
+
+#define DEF_MOD_INT_WRAPPER(NAME, T)                                                \
+void NAME(T *a, T *b, T *rtn, int n) {                                              \
+    GRID_FOR(n);                                                                    \
+    tcuda_mod_int_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);                \
+    cudaDeviceSynchronize();                                                        \
+}
+DEF_MOD_INT_WRAPPER(cuda_mod_i8,  int8_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_u8,  uint8_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_i16, int16_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_u16, uint16_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_i32, int32_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_u32, uint32_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_i64, int64_t)
+DEF_MOD_INT_WRAPPER(cuda_mod_u64, uint64_t)
+void cuda_mod_f64(double *a, double *b, double *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_mod_f64_kernel<<<numBlocks, blockSize>>>(a, b, rtn, n);
+    cudaDeviceSynchronize();
+}
+
+#define DEF_POW_SIGNED_WRAPPER(NAME, T)                                             \
+void NAME(T *a, T *b, T *rtn, int n) {                                              \
+    GRID_FOR(n);                                                                    \
+    tcuda_pow_signed_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);             \
+    cudaDeviceSynchronize();                                                        \
+}
+#define DEF_POW_UNSIGNED_WRAPPER(NAME, T)                                           \
+void NAME(T *a, T *b, T *rtn, int n) {                                              \
+    GRID_FOR(n);                                                                    \
+    tcuda_pow_unsigned_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);           \
+    cudaDeviceSynchronize();                                                        \
+}
+DEF_POW_SIGNED_WRAPPER(cuda_pow_i8,  int8_t)
+DEF_POW_SIGNED_WRAPPER(cuda_pow_i16, int16_t)
+DEF_POW_SIGNED_WRAPPER(cuda_pow_i32, int32_t)
+DEF_POW_SIGNED_WRAPPER(cuda_pow_i64, int64_t)
+DEF_POW_UNSIGNED_WRAPPER(cuda_pow_u8,  uint8_t)
+DEF_POW_UNSIGNED_WRAPPER(cuda_pow_u16, uint16_t)
+DEF_POW_UNSIGNED_WRAPPER(cuda_pow_u32, uint32_t)
+DEF_POW_UNSIGNED_WRAPPER(cuda_pow_u64, uint64_t)
+void cuda_pow_f64(double *a, double *b, double *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_pow_f64_kernel<<<numBlocks, blockSize>>>(a, b, rtn, n);
+    cudaDeviceSynchronize();
+}
+
+/* float16 (__half) wrappers */
+void cuda_add_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_add_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+void cuda_sub_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_sub_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+void cuda_mul_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_mul_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+void cuda_div_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_div_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+void cuda_mod_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_mod_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+void cuda_pow_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_pow_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
+    cudaDeviceSynchronize();
+}
+
+/* Typed fills */
+#define DEF_FILL_WRAPPER(NAME, T)                                                   \
+void NAME(T *a, T value, int n) {                                                   \
+    GRID_FOR(n);                                                                    \
+    tcuda_fill_kernel<T><<<numBlocks, blockSize>>>(a, value, n);                    \
+    cudaDeviceSynchronize();                                                        \
+}
+DEF_FILL_WRAPPER(cuda_fill_i8,  int8_t)
+DEF_FILL_WRAPPER(cuda_fill_u8,  uint8_t)
+DEF_FILL_WRAPPER(cuda_fill_i16, int16_t)
+DEF_FILL_WRAPPER(cuda_fill_u16, uint16_t)
+DEF_FILL_WRAPPER(cuda_fill_i32, int32_t)
+DEF_FILL_WRAPPER(cuda_fill_u32, uint32_t)
+DEF_FILL_WRAPPER(cuda_fill_i64, int64_t)
+DEF_FILL_WRAPPER(cuda_fill_u64, uint64_t)
+DEF_FILL_WRAPPER(cuda_fill_f64, double)
+void cuda_fill_f16(uint16_t *a, float value, int n) {
+    GRID_FOR(n);
+    tcuda_fill_half_kernel<<<numBlocks, blockSize>>>((__half *)a, value, n);
+    cudaDeviceSynchronize();
+}
+void cuda_fill_dd(double *out, double hi, double lo, int n) {
+    GRID_FOR(n);
+    tcuda_fill_dd_kernel<<<numBlocks, blockSize>>>(out, hi, lo, n);
+    cudaDeviceSynchronize();
+}
+
+/* GPU AsType — explicit Src→Dst cast kernels covering every pair we may need.
+   The wrapper takes both src and dst typed pointers; the source is read-only.
+   To keep the API surface manageable we provide one cast function that takes
+   src and dst dtype tags as strings and dispatches internally; the dispatcher
+   lives in cuda_math.cu via a per-pair switch. */
+
+#define CAST_PAIR(SRC, DST, ST, DT)                                                 \
+void cuda_cast_##SRC##_to_##DST(ST *src, DT *dst, int n) {                          \
+    GRID_FOR(n);                                                                    \
+    tcuda_cast_kernel<ST, DT><<<numBlocks, blockSize>>>(src, dst, n);               \
+    cudaDeviceSynchronize();                                                        \
+}
+
+#define DECL_CAST_TARGETS(SRC, ST)                                                  \
+CAST_PAIR(SRC, i8,  ST, int8_t)                                                     \
+CAST_PAIR(SRC, u8,  ST, uint8_t)                                                    \
+CAST_PAIR(SRC, i16, ST, int16_t)                                                    \
+CAST_PAIR(SRC, u16, ST, uint16_t)                                                   \
+CAST_PAIR(SRC, i32, ST, int32_t)                                                    \
+CAST_PAIR(SRC, u32, ST, uint32_t)                                                   \
+CAST_PAIR(SRC, i64, ST, int64_t)                                                    \
+CAST_PAIR(SRC, u64, ST, uint64_t)                                                   \
+CAST_PAIR(SRC, f32, ST, float)                                                      \
+CAST_PAIR(SRC, f64, ST, double)
+
+DECL_CAST_TARGETS(i8,  int8_t)
+DECL_CAST_TARGETS(u8,  uint8_t)
+DECL_CAST_TARGETS(i16, int16_t)
+DECL_CAST_TARGETS(u16, uint16_t)
+DECL_CAST_TARGETS(i32, int32_t)
+DECL_CAST_TARGETS(u32, uint32_t)
+DECL_CAST_TARGETS(i64, int64_t)
+DECL_CAST_TARGETS(u64, uint64_t)
+DECL_CAST_TARGETS(f32, float)
+DECL_CAST_TARGETS(f64, double)
+
+/* Casts involving __half — must go through __half2float / __float2half. */
+#define CAST_FROM_HALF(DST, DT)                                                     \
+void cuda_cast_f16_to_##DST(uint16_t *src, DT *dst, int n) {                        \
+    GRID_FOR(n);                                                                    \
+    tcuda_cast_from_half_kernel<DT><<<numBlocks, blockSize>>>((__half *)src, dst, n); \
+    cudaDeviceSynchronize();                                                        \
+}
+CAST_FROM_HALF(i8,  int8_t)
+CAST_FROM_HALF(u8,  uint8_t)
+CAST_FROM_HALF(i16, int16_t)
+CAST_FROM_HALF(u16, uint16_t)
+CAST_FROM_HALF(i32, int32_t)
+CAST_FROM_HALF(u32, uint32_t)
+CAST_FROM_HALF(i64, int64_t)
+CAST_FROM_HALF(u64, uint64_t)
+CAST_FROM_HALF(f32, float)
+CAST_FROM_HALF(f64, double)
+
+#define CAST_TO_HALF(SRC, ST)                                                       \
+void cuda_cast_##SRC##_to_f16(ST *src, uint16_t *dst, int n) {                      \
+    GRID_FOR(n);                                                                    \
+    tcuda_cast_to_half_kernel<ST><<<numBlocks, blockSize>>>(src, (__half *)dst, n); \
+    cudaDeviceSynchronize();                                                        \
+}
+CAST_TO_HALF(i8,  int8_t)
+CAST_TO_HALF(u8,  uint8_t)
+CAST_TO_HALF(i16, int16_t)
+CAST_TO_HALF(u16, uint16_t)
+CAST_TO_HALF(i32, int32_t)
+CAST_TO_HALF(u32, uint32_t)
+CAST_TO_HALF(i64, int64_t)
+CAST_TO_HALF(u64, uint64_t)
+CAST_TO_HALF(f32, float)
+CAST_TO_HALF(f64, double)
+void cuda_cast_f16_to_f16(uint16_t *src, uint16_t *dst, int n) {
+    GRID_FOR(n);
+    tcuda_cast_half_to_half_kernel<<<numBlocks, blockSize>>>((__half *)src, (__half *)dst, n);
+    cudaDeviceSynchronize();
+}
+
+/* dd128 wrappers — note the buffer holds 2n doubles (hi, lo interleaved). */
+#define DEF_DD_WRAPPER(NAME, KERNEL)                                                \
+void NAME(double *a, double *b, double *rtn, int n) {                               \
+    GRID_FOR(n);                                                                    \
+    KERNEL<<<numBlocks, blockSize>>>(a, b, rtn, n);                                 \
+    cudaDeviceSynchronize();                                                        \
+}
+DEF_DD_WRAPPER(cuda_add_dd, tcuda_add_dd_kernel)
+DEF_DD_WRAPPER(cuda_sub_dd, tcuda_sub_dd_kernel)
+DEF_DD_WRAPPER(cuda_mul_dd, tcuda_mul_dd_kernel)
+DEF_DD_WRAPPER(cuda_div_dd, tcuda_div_dd_kernel)
+DEF_DD_WRAPPER(cuda_pow_dd, tcuda_pow_dd_kernel)
+DEF_DD_WRAPPER(cuda_mod_dd, tcuda_mod_dd_kernel)
+
+/* float4 / float8 GPU casts. Names mirror the cuda_cast_<src>_to_<dst>
+   convention. fp4 / fp8 storage on GPU is one byte per element. */
+#define DEF_FPSMALL_CAST(NAME, KERNEL, ST, DT)                                      \
+void NAME(ST *src, DT *dst, int n) {                                                \
+    GRID_FOR(n);                                                                    \
+    KERNEL<<<numBlocks, blockSize>>>(src, dst, n);                                  \
+    cudaDeviceSynchronize();                                                        \
+}
+
+void cuda_cast_fp4_to_f32(uint8_t *src, float *dst, int n) {
+    GRID_FOR(n); tcuda_cast_fp4_to_f32_kernel<<<numBlocks, blockSize>>>(src, dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_f32_to_fp4(float *src, uint8_t *dst, int n) {
+    GRID_FOR(n); tcuda_cast_f32_to_fp4_kernel<<<numBlocks, blockSize>>>(src, dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_fp4_to_f16(uint8_t *src, uint16_t *dst, int n) {
+    GRID_FOR(n);
+    tcuda_cast_fp4_to_f16_kernel<<<numBlocks, blockSize>>>(src, (__half *)dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_f16_to_fp4(uint16_t *src, uint8_t *dst, int n) {
+    GRID_FOR(n);
+    tcuda_cast_f16_to_fp4_kernel<<<numBlocks, blockSize>>>((__half *)src, dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_fp8_to_f32(uint8_t *src, float *dst, int n) {
+    GRID_FOR(n); tcuda_cast_fp8_to_f32_kernel<<<numBlocks, blockSize>>>(src, dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_f32_to_fp8(float *src, uint8_t *dst, int n) {
+    GRID_FOR(n); tcuda_cast_f32_to_fp8_kernel<<<numBlocks, blockSize>>>(src, dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_fp8_to_f16(uint8_t *src, uint16_t *dst, int n) {
+    GRID_FOR(n);
+    tcuda_cast_fp8_to_f16_kernel<<<numBlocks, blockSize>>>(src, (__half *)dst, n);
+    cudaDeviceSynchronize();
+}
+void cuda_cast_f16_to_fp8(uint16_t *src, uint8_t *dst, int n) {
+    GRID_FOR(n);
+    tcuda_cast_f16_to_fp8_kernel<<<numBlocks, blockSize>>>((__half *)src, dst, n);
+    cudaDeviceSynchronize();
+}
+
+/* Broadcast wrapper. Caller must have:
+   - src GPU buffer of elsize * src_n bytes
+   - dst GPU buffer of elsize * n_out bytes (pre-allocated, untouched)
+   - src_offsets_gpu: GPU buffer of n_out ints, each entry < src_n. Computed
+     host-side from the broadcast rule and copied via cudaMemcpy beforehand. */
+void cuda_broadcast(const char *src_gpu, char *dst_gpu,
+                    const int *src_offsets_gpu, int n_out, int elsize) {
+    int blockSize = 256;
+    int numBlocks = (n_out + blockSize - 1) / blockSize;
+    tcuda_broadcast_by_offsets<<<numBlocks, blockSize>>>(
+        src_gpu, dst_gpu, src_offsets_gpu, n_out, elsize);
+    cudaDeviceSynchronize();
+}
 
 }

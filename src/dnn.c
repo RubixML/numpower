@@ -2,7 +2,9 @@
 #include "ndarray.h"
 #include "initializers.h"
 #include "dnn.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 #include "manipulation.h"
 
 #ifdef HAVE_CUDNN

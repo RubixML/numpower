@@ -8,6 +8,7 @@ extern "C" {
 #include "stddef.h"
 #include <Zend/zend_types.h>
 #include <stdbool.h>
+#include "ndarray_types.h"
 
 #define NDARRAY_MAX_DIMS 128
 #define NDARRAY_ARRAY_C_CONTIGUOUS    0x0001
@@ -18,6 +19,7 @@ extern "C" {
 #define NDArray_DESCRIPTOR(a) ((NDArrayDescriptor *)((a)->descriptor))
 #define NDArray_F64DATA(a) ((double *)((a)->data))
 #define NDArray_F32DATA(a) ((float *)((a)->data))
+#define NDArray_F128DATA(a) ((ndarray_fp128_t *)((a)->data))
 #define NDArray_NDIM(a) ((int)((a)->ndim))
 #define NDArray_FLAGS(a) ((int)((a)->flags))
 #define NDArray_SHAPE(a) ((int *)((a)->dimensions))
@@ -158,6 +160,10 @@ NDArray* NDArray_Maximum(NDArray *a, NDArray *b);
 NDArray * NDArray_Minimum(NDArray *a, NDArray *b);
 NDArray* NDArray_MaxAxis(NDArray* target, int axis);
 zval NDArray_ToPHPArray(NDArray *target);
+/* Convert an NDArray scalar (0-dim) into a PHP zval of the appropriate native
+   type for the dtype: IS_STRING for float128/uint64, IS_LONG for int/uint
+   (other than uint64), IS_DOUBLE for float4..float64. Handles GPU memory. */
+void NDArray_ScalarToZval(NDArray *array, zval *return_value);
 int *NDArray_ToIntVector(NDArray *nda);
 NDArray *NDArray_ToGPU(NDArray *target);
 NDArray *NDArray_ToCPU(NDArray *target);
@@ -178,6 +184,11 @@ int NDArray_CompareLists(int const *l1, int const *l2, int n);
 void NDArray_CreateMultiSortedStridePerm(int narrays, NDArray **arrays, int ndim, int *out_strideperm);
 void NDArray_CreateSortedStridePerm(int ndim, int const *strides, NDArrayStrideSortItem *out_strideperm);
 NDArray *NDArray_AsType(NDArray *src, const char *target_type);
+/* Copy n elements of typed data from CPU staging to GPU target. Handles the
+   fp128 ↔ dd conversion transparently so callers don't need to know about
+   the on-GPU representation. */
+void NDArray_TypedH2D(char *gpu_dst, const char *cpu_src, long n, const char *dtype);
+void NDArray_TypedD2H(char *cpu_dst, const char *gpu_src, long n, const char *dtype);
 
 #ifdef __cplusplus
 }

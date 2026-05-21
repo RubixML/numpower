@@ -61,7 +61,9 @@
 #include "src/ndmath/linalg.h"
 
 // COMPILE_DL_NDARRAY, HAVE_CUBLAS, HAVE_GD
+#ifndef _MSC_VER
 #include "config.h"
+#endif
 
 // NDARRAY_TYPE_FLOAT64, NDARRAY_TYPE_FLOAT32
 #include "src/types.h"
@@ -120,9 +122,9 @@
 	ZEND_PARSE_PARAMETERS_END()
 #endif
 
-PHPAPI zend_class_entry *phpsci_ce_NDArray;
-PHPAPI zend_class_entry *phpsci_ce_NumPower;
-PHPAPI zend_class_entry *phpsci_ce_ArithmeticOperand;
+zend_class_entry *phpsci_ce_NDArray;
+zend_class_entry *phpsci_ce_NumPower;
+zend_class_entry *phpsci_ce_ArithmeticOperand;
 
 static zend_object_handlers ndarray_object_handlers;
 static zend_object_handlers numpower_object_handlers;
@@ -226,11 +228,7 @@ void ndarray_init_new_object(NDArray* array, zval* return_value) {
         object_init_ex(return_value, phpsci_ce_NDArray);
         ZVAL_LONG(OBJ_PROP_NUM(Z_OBJ_P(return_value), 0), NDArray_UUID(array));
     } else {
-        if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT64) {
-            ZVAL_DOUBLE(return_value, NDArray_GetDoubleScalar(array));
-        } else {
-            ZVAL_DOUBLE(return_value, NDArray_GetFloatScalar(array));
-        }
+        NDArray_ScalarToZval(array, return_value);
         NDArray_FREE(array);
     }
 }
@@ -250,7 +248,22 @@ PHP_METHOD(NDArray, gpu) {
     if (ndarray == NULL) {
         return;
     }
-    
+
+    /* Already on the GPU: no allocation, no cudaMemcpy, no buffer copy.
+       For ndim > 0 the legacy API returns an NDArray, so we hand $this
+       back unchanged. For ndim == 0 the legacy API collapses the array
+       into a scalar zval; we read that scalar directly from the existing
+       array (which is a single DeviceToHost word and is unavoidable —
+       PHP needs the value — but no buffer is duplicated). */
+    if (NDArray_DEVICE(ndarray) == NDARRAY_DEVICE_GPU) {
+        if (NDArray_NDIM(ndarray) > 0) {
+            ZVAL_COPY(return_value, obj_zval);
+        } else {
+            NDArray_ScalarToZval(ndarray, return_value);
+        }
+        return;
+    }
+
     rtn = NDArray_ToGPU(ndarray);
 
     ndarray_init_new_object(rtn, return_value);
@@ -391,37 +404,160 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
     int dev_a = NDArray_DEVICE(nda);
     int dev_b = NDArray_DEVICE(ndb);
 
+    /* Device handling: when at least one operand is on GPU, keep computation
+       on GPU. Scalar + GPU(any dtype): migrate scalar to GPU (carrying the
+       array's dtype). Real-array CPU + real-array GPU still throws. */
+    NDArray *nda_dev_migrated = NULL, *ndb_dev_migrated = NULL;
     if (dev_a != dev_b) {
-        zend_throw_error(NULL,
-            "Device mismatch, both NDArray MUST be in the same device.");
-        return NULL;
+        int a_is_scalar = (NDArray_NDIM(nda) == 0);
+        int b_is_scalar = (NDArray_NDIM(ndb) == 0);
+        if (!a_is_scalar && !b_is_scalar) {
+            zend_throw_error(NULL,
+                "Device mismatch, both NDArray MUST be in the same device.");
+            return NULL;
+        }
+        /* Migrate scalar to the other operand's device so we stay on GPU
+           for the compute. The migration uses NDArray_ToGPU / ToCPU. */
+        if (a_is_scalar) {
+            NDArray *moved = (dev_b == NDARRAY_DEVICE_GPU)
+                ? NDArray_ToGPU(nda) : NDArray_ToCPU(nda);
+            if (moved == NULL) return NULL;
+            nda_dev_migrated = moved;
+            nda = moved;
+            dev_a = dev_b;
+        } else {
+            NDArray *moved = (dev_a == NDARRAY_DEVICE_GPU)
+                ? NDArray_ToGPU(ndb) : NDArray_ToCPU(ndb);
+            if (moved == NULL) return NULL;
+            ndb_dev_migrated = moved;
+            ndb = moved;
+            dev_b = dev_a;
+        }
     }
 
     int both_gpu = (dev_a == NDARRAY_DEVICE_GPU);
 
-    if (both_gpu &&
-        (!is_type(NDArray_TYPE(nda), NDARRAY_TYPE_FLOAT32) ||
-         !is_type(NDArray_TYPE(ndb), NDARRAY_TYPE_FLOAT32))) {
-        /* GPU native arithmetic only supports float32+float32.
-           For other dtype combinations (e.g. float16+float64) we follow PyTorch semantics:
-           copy both arrays to CPU, promote types, compute, then move result back to GPU. */
-        NDArray *cpu_a = NDArray_ToCPU(nda);
-        NDArray *cpu_b = NDArray_ToCPU(ndb);
-        if (cpu_a == NULL || cpu_b == NULL) {
-            if (cpu_a) NDArray_FREE(cpu_a);
-            if (cpu_b) NDArray_FREE(cpu_b);
-            return NULL;
+    if (both_gpu) {
+        /* GPU stays on GPU for every supported dtype. We promote types, cast
+           on GPU via NDArray_AsType (now GPU-aware), call the typed GPU binop,
+           then cast back. No CPU round-trip for float32, float64, float16,
+           int8..uint64, and (via dd kernels) float128.
+           float4/float8 fall back to CPU because there are no native CUDA
+           intrinsics and they're 1-byte values (we go through NDArray_AsType
+           which already routes them through CPU for those source/target types). */
+        const char *gpu_result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
+
+        if (opcode == ZEND_DIV) {
+            int is_int_result =
+                (!strcmp(gpu_result_type, "int8")   || !strcmp(gpu_result_type, "uint8")  ||
+                 !strcmp(gpu_result_type, "int16")  || !strcmp(gpu_result_type, "uint16") ||
+                 !strcmp(gpu_result_type, "int32")  || !strcmp(gpu_result_type, "uint32") ||
+                 !strcmp(gpu_result_type, "int64")  || !strcmp(gpu_result_type, "uint64"));
+            if (is_int_result) {
+                gpu_result_type = (!strcmp(gpu_result_type, "int32") || !strcmp(gpu_result_type, "uint32") ||
+                                   !strcmp(gpu_result_type, "int64") || !strcmp(gpu_result_type, "uint64"))
+                    ? "float64" : "float32";
+            }
         }
-        NDArray *cpu_rtn = ndarray_promote_and_op(opcode, cpu_a, cpu_b, result_type_out);
-        NDArray_FREE(cpu_a);
-        NDArray_FREE(cpu_b);
-        if (cpu_rtn == NULL) return NULL;
-        NDArray *gpu_rtn = NDArray_ToGPU(cpu_rtn);
-        NDArray_FREE(cpu_rtn);
-        return gpu_rtn;
+        const char *gpu_comp_type = compute_dtype_for_arithmetic(gpu_result_type);
+        if (result_type_out) *result_type_out = gpu_result_type;
+
+        NDArray *gpu_a_cast = NULL, *gpu_b_cast = NULL;
+        if (!is_type(NDArray_TYPE(nda), gpu_comp_type)) {
+            gpu_a_cast = NDArray_AsType(nda, gpu_comp_type);
+            if (gpu_a_cast == NULL) {
+                if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+                if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+                return NULL;
+            }
+        }
+        if (!is_type(NDArray_TYPE(ndb), gpu_comp_type)) {
+            gpu_b_cast = NDArray_AsType(ndb, gpu_comp_type);
+            if (gpu_b_cast == NULL) {
+                if (gpu_a_cast) NDArray_FREE(gpu_a_cast);
+                if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+                if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+                return NULL;
+            }
+        }
+        NDArray *ga = gpu_a_cast ? gpu_a_cast : nda;
+        NDArray *gb = gpu_b_cast ? gpu_b_cast : ndb;
+        /* If AsType pulled to CPU (float4/float8/float128 with no GPU cast
+           kernel), continue with CPU compute below by falling through. */
+        if (NDArray_DEVICE(ga) == NDARRAY_DEVICE_GPU && NDArray_DEVICE(gb) == NDARRAY_DEVICE_GPU) {
+            NDArray *gr = NDArray_TypedBinOp_GPU(opcode, ga, gb);
+            if (gpu_a_cast) NDArray_FREE(gpu_a_cast);
+            if (gpu_b_cast) NDArray_FREE(gpu_b_cast);
+            if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+            if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+            if (gr == NULL) return NULL;
+            /* Cast back to result_type if different from comp_type. */
+            if (!is_type(gpu_comp_type, gpu_result_type)) {
+                NDArray *gr_cast = NDArray_AsType(gr, gpu_result_type);
+                NDArray_FREE(gr);
+                gr = gr_cast;
+            }
+            return gr;
+        }
+        /* Fell through: at least one cast went CPU-side (float4/8/128 source
+           or destination). Continue with CPU compute by treating both as CPU
+           operands. Free any GPU temporaries created above. */
+        if (gpu_a_cast && NDArray_DEVICE(gpu_a_cast) == NDARRAY_DEVICE_CPU) {
+            nda = gpu_a_cast;
+        } else if (gpu_a_cast) {
+            /* gpu_a_cast is on GPU but other side went CPU — pull this down. */
+            NDArray *cpu_a = NDArray_ToCPU(gpu_a_cast);
+            NDArray_FREE(gpu_a_cast);
+            gpu_a_cast = cpu_a;
+            nda = gpu_a_cast;
+        } else if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_GPU) {
+            NDArray *cpu_a = NDArray_ToCPU(nda);
+            if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+            nda_dev_migrated = cpu_a;
+            nda = cpu_a;
+        }
+        if (gpu_b_cast && NDArray_DEVICE(gpu_b_cast) == NDARRAY_DEVICE_CPU) {
+            ndb = gpu_b_cast;
+        } else if (gpu_b_cast) {
+            NDArray *cpu_b = NDArray_ToCPU(gpu_b_cast);
+            NDArray_FREE(gpu_b_cast);
+            gpu_b_cast = cpu_b;
+            ndb = gpu_b_cast;
+        } else if (NDArray_DEVICE(ndb) == NDARRAY_DEVICE_GPU) {
+            NDArray *cpu_b = NDArray_ToCPU(ndb);
+            if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+            ndb_dev_migrated = cpu_b;
+            ndb = cpu_b;
+        }
+        /* Reassign migrations to be cleaned up at the end. */
+        if (gpu_a_cast && !nda_dev_migrated) nda_dev_migrated = gpu_a_cast;
+        else if (gpu_a_cast)                 NDArray_FREE(gpu_a_cast);
+        if (gpu_b_cast && !ndb_dev_migrated) ndb_dev_migrated = gpu_b_cast;
+        else if (gpu_b_cast)                 NDArray_FREE(gpu_b_cast);
+        both_gpu = 0;
     }
 
     const char *result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
+
+    /* PyTorch: true division ("/") always returns a float dtype, even for
+       integer inputs. int32 / 2 → float32 (not int32 truncated). */
+    if (opcode == ZEND_DIV) {
+        int is_int_result =
+            (!strcmp(result_type, "int8")   || !strcmp(result_type, "uint8")  ||
+             !strcmp(result_type, "int16")  || !strcmp(result_type, "uint16") ||
+             !strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
+             !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64"));
+        if (is_int_result) {
+            /* int8/uint8/int16/uint16 → float32 keeps fidelity; wider ints → float64. */
+            if (!strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
+                !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64")) {
+                result_type = "float64";
+            } else {
+                result_type = "float32";
+            }
+        }
+    }
+
     const char *comp_type   = compute_dtype_for_arithmetic(result_type);
     if (result_type_out) *result_type_out = result_type;
 
@@ -429,40 +565,61 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
 
     if (!is_type(NDArray_TYPE(nda), comp_type)) {
         nda_cast = NDArray_AsType(nda, comp_type);
-        if (nda_cast == NULL) return NULL;
+        if (nda_cast == NULL) {
+            if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+            if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+            return NULL;
+        }
     }
     if (!is_type(NDArray_TYPE(ndb), comp_type)) {
         ndb_cast = NDArray_AsType(ndb, comp_type);
         if (ndb_cast == NULL) {
             if (nda_cast) NDArray_FREE(nda_cast);
+            if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+            if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
             return NULL;
         }
     }
 
     NDArray *a = nda_cast ? nda_cast : nda;
     NDArray *b = ndb_cast ? ndb_cast : ndb;
-    int use_double = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
+    int use_double   = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
+    int use_float128 = is_type(comp_type, NDARRAY_TYPE_FLOAT128);
 
     NDArray *rtn = NULL;
     switch (opcode) {
     case ZEND_ADD:
-        rtn = use_double ? NDArray_Add_Double(a, b)      : NDArray_Add_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Add_Float128(a, b)
+            : use_double   ? NDArray_Add_Double(a, b)
+                           : NDArray_Add_Float(a, b);      break;
     case ZEND_SUB:
-        rtn = use_double ? NDArray_Subtract_Double(a, b) : NDArray_Subtract_Float(a, b); break;
+        rtn = use_float128 ? NDArray_Subtract_Float128(a, b)
+            : use_double   ? NDArray_Subtract_Double(a, b)
+                           : NDArray_Subtract_Float(a, b); break;
     case ZEND_MUL:
-        rtn = use_double ? NDArray_Multiply_Double(a, b) : NDArray_Multiply_Float(a, b); break;
+        rtn = use_float128 ? NDArray_Multiply_Float128(a, b)
+            : use_double   ? NDArray_Multiply_Double(a, b)
+                           : NDArray_Multiply_Float(a, b); break;
     case ZEND_DIV:
-        rtn = use_double ? NDArray_Divide_Double(a, b)   : NDArray_Divide_Float(a, b);   break;
+        rtn = use_float128 ? NDArray_Divide_Float128(a, b)
+            : use_double   ? NDArray_Divide_Double(a, b)
+                           : NDArray_Divide_Float(a, b);   break;
     case ZEND_POW:
-        rtn = use_double ? NDArray_Pow_Double(a, b)      : NDArray_Pow_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Pow_Float128(a, b)
+            : use_double   ? NDArray_Pow_Double(a, b)
+                           : NDArray_Pow_Float(a, b);      break;
     case ZEND_MOD:
-        rtn = use_double ? NDArray_Mod_Double(a, b)      : NDArray_Mod_Float(a, b);      break;
+        rtn = use_float128 ? NDArray_Mod_Float128(a, b)
+            : use_double   ? NDArray_Mod_Double(a, b)
+                           : NDArray_Mod_Float(a, b);      break;
     default:
         break;
     }
 
     if (nda_cast) NDArray_FREE(nda_cast);
     if (ndb_cast) NDArray_FREE(ndb_cast);
+    if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+    if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
 
     /* Cast back to result_type if computation used a wider type (e.g. float16→float32→float16) */
     if (rtn != NULL && !is_type(comp_type, result_type)) {
@@ -486,24 +643,100 @@ static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, z
             return FAILURE;
     }
 
-    NDArray *nda = ZVAL_TO_NDARRAY(op1);
-    NDArray *ndb = ZVAL_TO_NDARRAY(op2);
+    /* PyTorch "weak scalar" promotion: when one operand is an NDArray and the
+       other is a bare PHP IS_LONG/IS_DOUBLE, create the scalar in the array's
+       dtype so the result preserves that dtype. Exception: an IS_DOUBLE
+       scalar with an integer tensor still promotes to float (matches PyTorch's
+       category-promotion rule). */
+    NDArray *nda = NULL, *ndb = NULL;
+    int nda_is_scalar_owned = 0, ndb_is_scalar_owned = 0;
+    int op1_is_ndarray = (Z_TYPE_P(op1) == IS_OBJECT &&
+                          instanceof_function(Z_OBJCE_P(op1), phpsci_ce_NDArray));
+    int op2_is_ndarray = (Z_TYPE_P(op2) == IS_OBJECT &&
+                          instanceof_function(Z_OBJCE_P(op2), phpsci_ce_NDArray));
+    int op1_is_php_scalar = (Z_TYPE_P(op1) == IS_LONG || Z_TYPE_P(op1) == IS_DOUBLE);
+    int op2_is_php_scalar = (Z_TYPE_P(op2) == IS_LONG || Z_TYPE_P(op2) == IS_DOUBLE);
+
+    if (op1_is_ndarray && op2_is_php_scalar) {
+        nda = ZVAL_TO_NDARRAY(op1);
+        if (nda == NULL) return FAILURE;
+        const char *target_dtype = NDArray_TYPE(nda);
+        int is_int_tensor =
+            (!strcmp(target_dtype, "int8")   || !strcmp(target_dtype, "uint8")  ||
+             !strcmp(target_dtype, "int16")  || !strcmp(target_dtype, "uint16") ||
+             !strcmp(target_dtype, "int32")  || !strcmp(target_dtype, "uint32") ||
+             !strcmp(target_dtype, "int64")  || !strcmp(target_dtype, "uint64"));
+        if (Z_TYPE_P(op2) == IS_DOUBLE && is_int_tensor) {
+            /* Float scalar + int tensor → float result. Default to float64
+               for full IEEE-754 double precision. */
+            target_dtype = "float64";
+        }
+        int *shape0 = emalloc(sizeof(int));
+        shape0[0] = 1;
+        ndb = NDArray_Empty(shape0, 0, target_dtype, NDARRAY_DEVICE_CPU);
+        if (ndb == NULL) {
+            CHECK_INPUT_AND_FREE(op1, nda);
+            return FAILURE;
+        }
+        if (Z_TYPE_P(op2) == IS_LONG) {
+            ndarray_set_from_double(target_dtype, NDArray_DATA(ndb), 0,
+                                    (double)Z_LVAL_P(op2));
+        } else {
+            ndarray_set_from_double(target_dtype, NDArray_DATA(ndb), 0,
+                                    Z_DVAL_P(op2));
+        }
+        ndb_is_scalar_owned = 1;
+    } else if (op1_is_php_scalar && op2_is_ndarray) {
+        ndb = ZVAL_TO_NDARRAY(op2);
+        if (ndb == NULL) return FAILURE;
+        const char *target_dtype = NDArray_TYPE(ndb);
+        int is_int_tensor =
+            (!strcmp(target_dtype, "int8")   || !strcmp(target_dtype, "uint8")  ||
+             !strcmp(target_dtype, "int16")  || !strcmp(target_dtype, "uint16") ||
+             !strcmp(target_dtype, "int32")  || !strcmp(target_dtype, "uint32") ||
+             !strcmp(target_dtype, "int64")  || !strcmp(target_dtype, "uint64"));
+        if (Z_TYPE_P(op1) == IS_DOUBLE && is_int_tensor) {
+            target_dtype = "float64";
+        }
+        int *shape0 = emalloc(sizeof(int));
+        shape0[0] = 1;
+        nda = NDArray_Empty(shape0, 0, target_dtype, NDARRAY_DEVICE_CPU);
+        if (nda == NULL) {
+            CHECK_INPUT_AND_FREE(op2, ndb);
+            return FAILURE;
+        }
+        if (Z_TYPE_P(op1) == IS_LONG) {
+            ndarray_set_from_double(target_dtype, NDArray_DATA(nda), 0,
+                                    (double)Z_LVAL_P(op1));
+        } else {
+            ndarray_set_from_double(target_dtype, NDArray_DATA(nda), 0,
+                                    Z_DVAL_P(op1));
+        }
+        nda_is_scalar_owned = 1;
+    } else {
+        nda = ZVAL_TO_NDARRAY(op1);
+        ndb = ZVAL_TO_NDARRAY(op2);
+    }
 
     if (nda == NULL || ndb == NULL) {
+        if (nda_is_scalar_owned && nda) NDArray_FREE(nda);
+        else if (nda) CHECK_INPUT_AND_FREE(op1, nda);
+        if (ndb_is_scalar_owned && ndb) NDArray_FREE(ndb);
+        else if (ndb) CHECK_INPUT_AND_FREE(op2, ndb);
         return FAILURE;
     }
 
     if (!NDArray_IsBroadcastable(nda, ndb)) {
         zend_throw_error(NULL, "Can't broadcast arrays with incompatible shapes.");
-        CHECK_INPUT_AND_FREE(op1, nda);
-        CHECK_INPUT_AND_FREE(op2, ndb);
+        if (nda_is_scalar_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+        if (ndb_is_scalar_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
         return FAILURE;
     }
 
     NDArray *rtn = ndarray_promote_and_op(opcode, nda, ndb, NULL);
 
-    CHECK_INPUT_AND_FREE(op1, nda);
-    CHECK_INPUT_AND_FREE(op2, ndb);
+    if (nda_is_scalar_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+    if (ndb_is_scalar_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
 
     if (rtn == NULL) {
         return FAILURE;
@@ -740,12 +973,7 @@ PHP_METHOD(NDArray, toArray) {
         return;
     }
     if (NDArray_NDIM(array) == 0) {
-        if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT32) {
-            RETURN_DOUBLE(NDArray_F32DATA(array)[0]);
-        } else if (NDArray_TYPE(array) == NDARRAY_TYPE_FLOAT64) {
-            RETURN_DOUBLE(NDArray_F64DATA(array)[0]);
-        }
-        NDArray_FREE(array);
+        NDArray_ScalarToZval(array, return_value);
         return;
     }
 
@@ -778,10 +1006,15 @@ PHP_METHOD(NDArray, toImage) {
         zend_throw_error(NULL, "NDArray must be 3-dimensional before it can be converted to a RGB image.");
         return;
     }
+#ifdef HAVE_GD
     NDArray_ToGD(array, n_alpha, return_value);
     if (alpha != NULL) {
         CHECK_INPUT_AND_FREE(alpha, n_alpha);
     }
+#else
+    (void)n_alpha;
+    zend_throw_error(NULL, "NDArray::toImage() requires the extension to be built with GD support.");
+#endif
 }
 
 ZEND_BEGIN_ARG_INFO(arginfo_cpu, 0)
@@ -793,6 +1026,16 @@ PHP_METHOD(NDArray, cpu) {
     ZEND_PARSE_PARAMETERS_END();
     NDArray* array = ZVAL_TO_NDARRAY(obj_zval);
     if (array == NULL) {
+        return;
+    }
+    /* Already on the CPU: no allocation, no copy. See PHP_METHOD(NDArray, gpu)
+       for the rationale around the ndim == 0 branch. */
+    if (NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
+        if (NDArray_NDIM(array) > 0) {
+            ZVAL_COPY(return_value, obj_zval);
+        } else {
+            NDArray_ScalarToZval(array, return_value);
+        }
         return;
     }
     rtn = NDArray_ToCPU(array);
@@ -2452,8 +2695,13 @@ PHP_METHOD(NumPower, fromImage) {
         Z_PARAM_OPTIONAL
         Z_PARAM_BOOL(channelLast)
     ZEND_PARSE_PARAMETERS_END();
+#ifdef HAVE_GD
     rtn = NDArray_FromGD(image, channelLast);
     ndarray_init_new_object(rtn, return_value);
+#else
+    (void)image; (void)channelLast; (void)rtn;
+    zend_throw_error(NULL, "NumPower::fromImage() requires the extension to be built with GD support.");
+#endif
 }
 
 /**
@@ -5373,6 +5621,80 @@ PHP_METHOD(NDArray, offsetGet) {
     return;
 }
 
+/* Scalar fast path for offsetSet: writes a single PHP scalar value into
+ * every element of [slice] using the dtype-aware ndarray_set_from_* hooks.
+ *
+ * Why this exists: ZVAL_TO_NDARRAY(IS_LONG) routes through
+ * NDArray_CreateFromLongScalar which casts to float32 (≈ 7 decimal digits).
+ * For int64 / uint64 / float128 targets that's a precision-destroying
+ * round-trip — PHP_INT_MAX (9.22e18) overflows the float32 mantissa and
+ * comes back as PHP_INT_MIN. This path stays in the target dtype the whole
+ * way.
+ */
+static int ndarray_fill_from_php_scalar(NDArray *slice, zval *value) {
+    const char *dtype = NDArray_TYPE(slice);
+    long  n     = NDArray_NUMELEMENTS(slice);
+    int   elsize = NDArray_ELSIZE(slice);
+    if (n <= 0) return 1;
+
+    char *target_data;
+    char *gpu_tmp = NULL;
+    if (NDArray_DEVICE(slice) == NDARRAY_DEVICE_GPU) {
+        gpu_tmp = emalloc((size_t)n * (size_t)elsize);
+        target_data = gpu_tmp;
+    } else {
+        target_data = (char *)NDArray_DATA(slice);
+    }
+
+    int is_int64_like = (!strcmp(dtype, "int64") || !strcmp(dtype, "uint64"));
+
+    if (Z_TYPE_P(value) == IS_STRING) {
+        const char *str = Z_STRVAL_P(value);
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_string(dtype, target_data, (size_t)i, str);
+        }
+    } else if (Z_TYPE_P(value) == IS_LONG) {
+        zend_long lv = Z_LVAL_P(value);
+        if (is_int64_like) {
+            /* Avoid double-rounding of long values for int64/uint64 dtypes. */
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)lv);
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_string(dtype, target_data, (size_t)i, tmp);
+            }
+        } else {
+            for (long i = 0; i < n; i++) {
+                ndarray_set_from_double(dtype, target_data, (size_t)i, (double)lv);
+            }
+        }
+    } else if (Z_TYPE_P(value) == IS_DOUBLE) {
+        double dv = Z_DVAL_P(value);
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, dv);
+        }
+    } else if (Z_TYPE_P(value) == IS_TRUE) {
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, 1.0);
+        }
+    } else if (Z_TYPE_P(value) == IS_FALSE) {
+        for (long i = 0; i < n; i++) {
+            ndarray_set_from_double(dtype, target_data, (size_t)i, 0.0);
+        }
+    } else {
+        if (gpu_tmp) efree(gpu_tmp);
+        return 0; /* signal: caller should fall through */
+    }
+
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(slice) == NDARRAY_DEVICE_GPU) {
+        /* fp128 on GPU is stored as double-double — convert during transfer. */
+        NDArray_TypedH2D((char *)NDArray_DATA(slice), gpu_tmp, n, dtype);
+        efree(gpu_tmp);
+    }
+#endif
+    return 1;
+}
+
 PHP_METHOD(NDArray, offsetSet) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     zval *offset;
@@ -5392,10 +5714,27 @@ PHP_METHOD(NDArray, offsetSet) {
             zend_throw_error(NULL, "Index out of bounds");
             return;
         }
-        NDArray* nd_value = ZVAL_TO_NDARRAY(value);
         ndarray->iterator->currentIndex = (int)zval_get_long(offset);
         NDArray *rtn = NDArrayIterator_GET(ndarray);
         NDArrayIterator_REWIND(ndarray);
+
+        /* Scalar/string fast path stays in the target's dtype end-to-end. */
+        if (Z_TYPE_P(value) == IS_LONG   || Z_TYPE_P(value) == IS_DOUBLE ||
+            Z_TYPE_P(value) == IS_STRING || Z_TYPE_P(value) == IS_TRUE   ||
+            Z_TYPE_P(value) == IS_FALSE) {
+            if (ndarray_fill_from_php_scalar(rtn, value)) {
+                NDArray_FREE(rtn);
+                return;
+            }
+        }
+
+        /* Fallback: array / NDArray source — wrap and let NDArray_Overwrite
+           handle byte-copy or cast through double. */
+        NDArray* nd_value = ZVAL_TO_NDARRAY(value);
+        if (nd_value == NULL) {
+            NDArray_FREE(rtn);
+            return;
+        }
         NDArray_Overwrite(rtn, nd_value);
         NDArray_FREE(rtn);
         CHECK_INPUT_AND_FREE(value, nd_value);
@@ -5405,8 +5744,18 @@ PHP_METHOD(NDArray, offsetSet) {
     }
 }
 
+/* Wire format emitted by __serialize:
+ *   ['__ndarray__' => 1, 'dtype' => 'float128', 'shape' => [3], 'data' => [...]]
+ *
+ * The dtype field lets __unserialize reconstruct the original array with full
+ * precision — without it, the receiver defaults to float32 and silently
+ * round-trips float128/uint64/int64 through double, dropping bits.
+ *
+ * Backward compatibility: __unserialize first checks for the '__ndarray__'
+ * marker. If absent, it falls back to treating the payload as a plain PHP
+ * array and constructing a float32 NDArray (the historical lossy behaviour).
+ */
 PHP_METHOD(NDArray, __serialize) {
-    zval rtn;
     zval *obj_zval = getThis();
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
@@ -5418,23 +5767,73 @@ PHP_METHOD(NDArray, __serialize) {
         zend_throw_error(NULL, "NDArray must be on CPU RAM before it can be converted to a PHP array.");
         return;
     }
-    if (NDArray_NDIM(array) == 0) {
-        RETURN_DOUBLE(NDArray_F32DATA(array)[0]);
-        NDArray_FREE(array);
-        return;
+
+    array_init(return_value);
+
+    add_assoc_long(return_value, "__ndarray__", 1);
+    add_assoc_string(return_value, "dtype", (char *)NDArray_TYPE(array));
+
+    zval shape_arr;
+    array_init(&shape_arr);
+    for (int i = 0; i < NDArray_NDIM(array); i++) {
+        add_next_index_long(&shape_arr, (zend_long)NDArray_SHAPE(array)[i]);
     }
-    rtn = NDArray_ToPHPArray(array);
-    RETURN_ZVAL(&rtn, 0, 0);
+    add_assoc_zval(return_value, "shape", &shape_arr);
+
+    zval data_zv;
+    if (NDArray_NDIM(array) == 0) {
+        NDArray_ScalarToZval(array, &data_zv);
+    } else {
+        data_zv = NDArray_ToPHPArray(array);
+    }
+    add_assoc_zval(return_value, "data", &data_zv);
 }
 
 PHP_METHOD(NDArray, __unserialize) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
-    long offset;
     zval *data;
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ZVAL(data)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* New format: {'__ndarray__': 1, 'dtype': str, 'shape': [...], 'data': mixed} */
+    if (Z_TYPE_P(data) == IS_ARRAY) {
+        HashTable *ht = Z_ARRVAL_P(data);
+        zval *marker = zend_hash_str_find(ht, "__ndarray__", sizeof("__ndarray__") - 1);
+        zval *dtype  = zend_hash_str_find(ht, "dtype",       sizeof("dtype") - 1);
+        zval *payload = zend_hash_str_find(ht, "data",       sizeof("data") - 1);
+
+        if (marker != NULL && dtype != NULL && payload != NULL &&
+            Z_TYPE_P(dtype) == IS_STRING) {
+            /* Canonicalise: descriptor->type is stored by reference, so we
+               must use the static NDARRAY_TYPE_* pointer rather than the
+               soon-to-be-freed Z_STRVAL_P buffer. */
+            const char *canonical = type_canonicalize(Z_STRVAL_P(dtype));
+            if (canonical == NULL) {
+                zend_throw_error(NULL,
+                    "Unknown dtype '%s' in serialised NDArray payload",
+                    Z_STRVAL_P(dtype));
+                return;
+            }
+            NDArray *nda = NDArrayFactory_createFromZval(payload, canonical);
+            if (nda == NULL) {
+                if (!EG(exception)) {
+                    zend_throw_error(NULL,
+                        "Failed to reconstruct NDArray from unserialised payload");
+                }
+                return;
+            }
+            /* NDArrayFactory_createFromZval already called add_to_buffer. */
+            ZVAL_LONG(OBJ_PROP_NUM(obj, 0), NDArray_UUID(nda));
+            return;
+        }
+    }
+
+    /* Legacy format: plain PHP array, default to float32 (lossy for non-fp32 dtypes). */
     NDArray *nda = ZVAL_TO_NDARRAY(data);
+    if (nda == NULL) {
+        return;
+    }
     add_to_buffer(nda);
     ZVAL_LONG(OBJ_PROP_NUM(obj, 0), NDArray_UUID(nda));
 }

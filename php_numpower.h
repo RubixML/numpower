@@ -3,7 +3,9 @@
 #ifndef PHP_NDARRAY_H
 # define PHP_NDARRAY_H
 
+#ifndef _MSC_VER
 #include "config.h"
+#endif
 #include "php.h"
 
 #ifdef HAVE_CUBLAS
@@ -61,9 +63,13 @@ ZEND_END_ARG_INFO()
 
 ZEND_FUNCTION(print_r_);
 
-PHPAPI extern zend_class_entry *phpsci_ce_NDArray;
-PHPAPI extern zend_class_entry *phpsci_ce_NumPower;
-PHPAPI extern zend_class_entry *phpsci_ce_ArithmeticOperand;
+/* No PHPAPI: these class entries are private to the ndarray extension. On
+   Windows PHPAPI expands to __declspec(dllimport) when PHP_EXPORTS isn't set
+   (i.e. for every extension build), which would make the compiler emit
+   __imp_phpsci_ce_* thunks even though the same DLL defines the symbols. */
+extern zend_class_entry *phpsci_ce_NDArray;
+extern zend_class_entry *phpsci_ce_NumPower;
+extern zend_class_entry *phpsci_ce_ArithmeticOperand;
 
 # define PHP_NDARRAY_VERSION "0.7.0"
 

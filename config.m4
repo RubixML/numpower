@@ -88,6 +88,16 @@ PHP_CHECK_LIBRARY(mkl_rt,LAPACKE_sgesdd,
 ])
 
 
+PHP_CHECK_LIBRARY(quadmath, powq,
+    [
+      AC_DEFINE(HAVE_QUADMATH,1,[Have libquadmath for full 128-bit float math])
+      PHP_ADD_LIBRARY(quadmath,,NDARRAY_SHARED_LIBADD)
+      AC_MSG_RESULT([libquadmath detected, enabling true __float128 math.])
+      CFLAGS+=" -lquadmath "
+    ],[
+      AC_MSG_RESULT([libquadmath not found. float128 math will use long double precision.])
+])
+
 PHP_CHECK_LIBRARY(cudnn, cudnnCreate,
     [
       AC_DEFINE(HAVE_CUDNN,1,[ ])
@@ -121,6 +131,7 @@ if test "$PHP_NDARRAY" != "no"; then
       src/sanitizers.c \
       src/types.c \
       src/ndarray_types.c \
+      src/dd_math.c \
       src/ndarray/frontend/ndarray_factory.c \
       src/ndarray/frontend/manipulations.c,
       $ext_shared)

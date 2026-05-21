@@ -3,7 +3,9 @@
 #include "ndarray.h"
 #include "initializers.h"
 #include "types.h"
+#ifndef _MSC_VER
 #include "../config.h"
+#endif
 
 
 #ifdef HAVE_CUBLAS
@@ -31,7 +33,7 @@ NDArray_Diagonal(NDArray *target, int offset) {
         new_shape[0] = NDArray_SHAPE(target)[NDArray_NDIM(target) - 1];
         rtn = NDArray_Empty(new_shape, 1, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
         for (i = 0; i < NDArray_SHAPE(target)[NDArray_NDIM(target) - 1]; i++) {
-            NDArray_F32DATA(rtn)[i] = ((float*)(NDArray_DATA(target) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 2]) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 1])))[0];
+            NDArray_F32DATA(rtn)[i] = ((float*)((char *)NDArray_DATA(target) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 2]) + (i * NDArray_STRIDES(target)[NDArray_NDIM(target) - 1])))[0];
         }
     }
 #ifdef HAVE_CUBLAS

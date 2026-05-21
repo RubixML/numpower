@@ -2,7 +2,9 @@
 #include "Zend/zend_alloc.h"
 #include "Zend/zend_API.h"
 #include "linalg.h"
+#ifndef _MSC_VER
 #include "../../config.h"
+#endif
 #include "../initializers.h"
 #include "../types.h"
 #include "../manipulation.h"
@@ -12,6 +14,20 @@
 #include "../indexing.h"
 
 #ifdef HAVE_LAPACKE
+/* OpenBLAS's lapack.h defaults lapack_complex_float / lapack_complex_double
+   to "float _Complex" / "double _Complex" via <complex.h>. MSVC's <complex.h>
+   only ships the _Fcomplex / _Dcomplex struct types — the C99 _Complex
+   keyword isn't available — so those declarations cascade into syntax errors
+   at the first complex-using LAPACK prototype. We never call any complex
+   LAPACK routines, so opaque struct typedefs with the same layout suffice
+   for the declarations to parse. The same struct layout is what
+   MSVC's own _Fcomplex / _Dcomplex use, so even if a complex routine were
+   added later the ABI would line up. */
+#  ifdef _MSC_VER
+#    define LAPACK_COMPLEX_CUSTOM
+typedef struct { float  real, imag; } lapack_complex_float;
+typedef struct { double real, imag; } lapack_complex_double;
+#  endif
 #include <lapacke.h>
 #endif
 
@@ -210,6 +226,7 @@ NDArray_SVD(NDArray *target) {
     rtns[1] = rtn_s;
     rtns[2] = rtn_v;
 
+#ifdef HAVE_CUBLAS
     if (NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_GPU) {
         rtn_u->device = NDARRAY_DEVICE_GPU;
         rtn_s->device = NDARRAY_DEVICE_GPU;
@@ -217,6 +234,7 @@ NDArray_SVD(NDArray *target) {
         vfree(output_data);
         NDArray_FREE(target_ptr);
     }
+#endif
 
     return rtns;
 }
@@ -505,15 +523,18 @@ matrixFloatInverse(float* matrix, int n) {
         return 0;
     }
 
-    // Calculate the inverse
+    // Calculate the inverse. Workspace is heap-allocated: lwork = n*n can be
+    // megabytes for moderate matrices, and MSVC doesn't accept C99 VLAs anyway.
     int lwork = n * n;
-    float work_query[lwork];
+    float *work_query = (float *)emalloc((size_t)lwork * sizeof(float));
     sgetri_(&n, matrix, &n, ipiv, work_query, &lwork, &info);
     if (info != 0) {
         zend_throw_error(NULL, "Matrix inversion failed.\n");
+        efree(work_query);
         efree(ipiv);
         return 0;
     }
+    efree(work_query);
     efree(ipiv);
     return 1;
 }

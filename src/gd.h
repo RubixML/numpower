@@ -6,7 +6,9 @@ extern "C" {
 #endif
 
 #ifdef HAVE_CONFIG_H
+#ifndef _MSC_VER
 #include "config.h"
+#endif
 #endif
 
 #include "php_compat.h"
