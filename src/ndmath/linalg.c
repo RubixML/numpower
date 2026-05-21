@@ -507,15 +507,18 @@ matrixFloatInverse(float* matrix, int n) {
         return 0;
     }
 
-    // Calculate the inverse
+    // Calculate the inverse. Workspace is heap-allocated: lwork = n*n can be
+    // megabytes for moderate matrices, and MSVC doesn't accept C99 VLAs anyway.
     int lwork = n * n;
-    float work_query[lwork];
+    float *work_query = (float *)emalloc((size_t)lwork * sizeof(float));
     sgetri_(&n, matrix, &n, ipiv, work_query, &lwork, &info);
     if (info != 0) {
         zend_throw_error(NULL, "Matrix inversion failed.\n");
+        efree(work_query);
         efree(ipiv);
         return 0;
     }
+    efree(work_query);
     efree(ipiv);
     return 1;
 }

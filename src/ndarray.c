@@ -1732,9 +1732,11 @@ NDArray_IsBroadcastable(const NDArray *array1, const NDArray *array2) {
     // Determine the maximum number of dimensions
     int maxDims = (NDArray_NDIM(array1) > NDArray_NDIM(array2)) ? NDArray_NDIM(array1) : NDArray_NDIM(array2);
 
-    // Pad the shape arrays with 1s if necessary
-    int paddedShape1[maxDims];
-    int paddedShape2[maxDims];
+    // Pad the shape arrays with 1s if necessary. Fixed-size stack storage —
+    // MSVC doesn't support C99 VLAs, and NDARRAY_MAX_DIMS bounds every other
+    // shape-handling site in the codebase.
+    int paddedShape1[NDARRAY_MAX_DIMS];
+    int paddedShape2[NDARRAY_MAX_DIMS];
 
     for (int i = 0; i < maxDims; i++) {
         paddedShape1[i] = (i < NDArray_NDIM(array1)) ? NDArray_SHAPE(array1)[i] : 1;
@@ -2376,7 +2378,11 @@ NDArray_CreateSortedStridePerm(int ndim, int const *strides,
         out_strideperm[i].stride = strides[i];
     }
 
-    /* Sort them */
-    qsort(out_strideperm, ndim, sizeof(raw_array_assign_array),
+    /* Sort them. The element size must match the array we're sorting,
+       not the unrelated function name that was here originally — MSVC
+       rejects sizeof on a function designator; GCC silently accepted it
+       (producing 1) which would have silently mis-sorted any time
+       ndim > 1. */
+    qsort(out_strideperm, ndim, sizeof(NDArrayStrideSortItem),
           &_nd_stride_sort_item_comparator);
 }
