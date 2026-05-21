@@ -226,6 +226,7 @@ NDArray_SVD(NDArray *target) {
     rtns[1] = rtn_s;
     rtns[2] = rtn_v;
 
+#ifdef HAVE_CUBLAS
     if (NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_GPU) {
         rtn_u->device = NDARRAY_DEVICE_GPU;
         rtn_s->device = NDARRAY_DEVICE_GPU;
@@ -233,6 +234,7 @@ NDArray_SVD(NDArray *target) {
         vfree(output_data);
         NDArray_FREE(target_ptr);
     }
+#endif
 
     return rtns;
 }

@@ -122,9 +122,9 @@
 	ZEND_PARSE_PARAMETERS_END()
 #endif
 
-PHPAPI zend_class_entry *phpsci_ce_NDArray;
-PHPAPI zend_class_entry *phpsci_ce_NumPower;
-PHPAPI zend_class_entry *phpsci_ce_ArithmeticOperand;
+zend_class_entry *phpsci_ce_NDArray;
+zend_class_entry *phpsci_ce_NumPower;
+zend_class_entry *phpsci_ce_ArithmeticOperand;
 
 static zend_object_handlers ndarray_object_handlers;
 static zend_object_handlers numpower_object_handlers;
@@ -1006,10 +1006,15 @@ PHP_METHOD(NDArray, toImage) {
         zend_throw_error(NULL, "NDArray must be 3-dimensional before it can be converted to a RGB image.");
         return;
     }
+#ifdef HAVE_GD
     NDArray_ToGD(array, n_alpha, return_value);
     if (alpha != NULL) {
         CHECK_INPUT_AND_FREE(alpha, n_alpha);
     }
+#else
+    (void)n_alpha;
+    zend_throw_error(NULL, "NDArray::toImage() requires the extension to be built with GD support.");
+#endif
 }
 
 ZEND_BEGIN_ARG_INFO(arginfo_cpu, 0)
@@ -2690,8 +2695,13 @@ PHP_METHOD(NumPower, fromImage) {
         Z_PARAM_OPTIONAL
         Z_PARAM_BOOL(channelLast)
     ZEND_PARSE_PARAMETERS_END();
+#ifdef HAVE_GD
     rtn = NDArray_FromGD(image, channelLast);
     ndarray_init_new_object(rtn, return_value);
+#else
+    (void)image; (void)channelLast; (void)rtn;
+    zend_throw_error(NULL, "NumPower::fromImage() requires the extension to be built with GD support.");
+#endif
 }
 
 /**
