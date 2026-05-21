@@ -926,10 +926,14 @@ NDArray_Lstsq(NDArray *a, NDArray *b) {
         efree(a_data);
         efree(b_data);
     } else {
-#ifdef HAVE_CUBLAS
-        cuda_lstsq_float(NDArray_F32DATA(a), NDArray_SHAPE(a)[0], NDArray_SHAPE(a)[1], NDArray_F32DATA(b), NDArray_SHAPE(b)[0],
-                         NDArray_F32DATA(x));
-#endif
+        /* cuda_lstsq_float was declared in cuda_math.h but never implemented
+           in cuda_math.cu. On Linux it lurked as an undefined symbol resolved
+           lazily by dlopen — calling NDArray_Lstsq on GPU data would have
+           crashed at runtime. On Windows the strict linker refuses to build.
+           Surface the missing GPU path as a clear error, mirroring how
+           NDArray_Qr handles the same situation a few lines below. */
+        zend_throw_error(NULL, "ndarray::lstsq not implemented for GPU");
+        return NULL;
     }
     return x;
 }

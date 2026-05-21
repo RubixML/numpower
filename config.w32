@@ -136,24 +136,29 @@ if (PHP_NDARRAY != "no") {
                         cuda_inc + ";" + configure_module_dirname);
 
                     // cuda_math.cu calls into cusolverDn* (SVD, getrf, syevd,
-                    // …) in addition to cublas, so cusolver.lib must be in
-                    // the link line — Windows' linker is strict on unresolved
-                    // symbols (Linux gets away with deferred binding via
-                    // dlopen(RTLD_LAZY), but that's a latent bug there too).
+                    // …) and src/initializers.c calls curand host functions
+                    // (curandCreateGenerator, curandGenerateNormal, …), so
+                    // cusolver.lib AND curand.lib must be in the link line.
+                    // Windows' linker is strict on unresolved symbols (Linux
+                    // gets away with deferred binding via dlopen(RTLD_LAZY),
+                    // but that's a latent bug there too — runtime crash the
+                    // first time anyone calls NumPower::svd / ::normal / etc.
+                    // on a GPU array).
                     var have_cublas_lib = false;
                     if (have_cublas_h) {
                         ADD_FLAG("LDFLAGS_NDARRAY", "/libpath:\"" + cuda_lib + "\"");
                         have_cublas_lib =
                             CHECK_LIB("cublas.lib",   "ndarray", cuda_lib) &&
                             CHECK_LIB("cudart.lib",   "ndarray", cuda_lib) &&
-                            CHECK_LIB("cusolver.lib", "ndarray", cuda_lib);
+                            CHECK_LIB("cusolver.lib", "ndarray", cuda_lib) &&
+                            CHECK_LIB("curand.lib",   "ndarray", cuda_lib);
                     }
 
                     if (!have_cublas_h || !have_cublas_lib) {
-                        WARNING("CUDA enabled but cublas_v2.h / cublas.lib / cudart.lib / cusolver.lib not found under \"" + cuda_root + "\"; GPU support disabled.");
+                        WARNING("CUDA enabled but cublas_v2.h / cublas.lib / cudart.lib / cusolver.lib / curand.lib not found under \"" + cuda_root + "\"; GPU support disabled.");
                     } else {
-                        AC_DEFINE("HAVE_CUBLAS", 1, "Have cuBLAS / cudart / cusolver support");
-                        ADD_FLAG("LIBS_NDARRAY", "cublas.lib cudart.lib cusolver.lib");
+                        AC_DEFINE("HAVE_CUBLAS", 1, "Have cuBLAS / cudart / cusolver / curand support");
+                        ADD_FLAG("LIBS_NDARRAY", "cublas.lib cudart.lib cusolver.lib curand.lib");
 
                         // cuDNN: optional. Prefer --with-cudnn-dir, then look
                         // inside the CUDA tree (newer Toolkits ship cuDNN

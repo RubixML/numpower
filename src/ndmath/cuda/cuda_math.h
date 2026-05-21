@@ -74,7 +74,11 @@ void cuda_float_compare_greater_equal(int nblocks, float *a_array, float *b_arra
 void cuda_float_compare_less(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_float_compare_less_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_float_compare_not_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
-void cuda_lstsq_float(float* A, int m, int n, float* B, int k, float* X);
+/* cuda_lstsq_float was historically declared here but never implemented in
+   cuda_math.cu. The call site in src/ndmath/linalg.c (NDArray_Lstsq, GPU
+   branch) now throws "not implemented for GPU" instead of referencing a
+   non-existent symbol. Re-add the declaration here when the GPU kernel
+   actually lands. */
 NDArray* NDArrayMathGPU_ElementWise2F(NDArray* ndarray, ElementWiseFloatGPUOperation2F op, float val1, float val2);
 NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOperation1F op, float val1);
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
