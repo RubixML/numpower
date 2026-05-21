@@ -3,7 +3,9 @@
 #ifndef PHP_NDARRAY_H
 # define PHP_NDARRAY_H
 
+#ifndef _MSC_VER
 #include "config.h"
+#endif
 #include "php.h"
 
 #ifdef HAVE_CUBLAS
