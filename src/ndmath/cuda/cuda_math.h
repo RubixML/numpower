@@ -243,6 +243,31 @@ void cuda_cast_u64_to_f16(uint64_t *src, uint16_t *dst, int n);
 void cuda_cast_f32_to_f16(float    *src, uint16_t *dst, int n);
 void cuda_cast_f64_to_f16(double   *src, uint16_t *dst, int n);
 
+/**
+ * Strided device-to-device copy.
+ *
+ * Materialises a contiguous result NDArray from a view described by
+ * (ndim, shape, strides_b) in a single kernel launch — used by
+ * NDArray_Slice on GPU to avoid the per-row cudaMemcpy latency that
+ * dominates strided copies. Strides are in BYTES and may be negative
+ * (for reverse-step slices).
+ *
+ * @param dst_gpu          Pre-allocated device destination buffer of
+ *                         `n_elems * elsize` bytes; written contiguously.
+ * @param src_gpu          Device source buffer; read via `host_strides_b`.
+ * @param n_elems          Total output element count (= product of `host_shape`).
+ * @param ndim             Number of axes; must be in [1, STRIDED_COPY_MAX_NDIM].
+ * @param elsize           Dtype byte size; fast paths cover 1/2/4/8/16.
+ * @param host_shape       Per-axis shape (host memory, packed into kernel arg).
+ * @param host_strides_b   Per-axis source stride in bytes, signed.
+ * @return                 0 on success, -1 if (ndim, elsize) are outside the
+ *                         kernel envelope so the caller can pick a fallback.
+ */
+int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
+                      long long n_elems, int ndim, int elsize,
+                      const int       *host_shape,
+                      const long long *host_strides_b);
+
 #ifdef __cplusplus
 }
 #endif

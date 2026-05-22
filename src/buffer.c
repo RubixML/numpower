@@ -145,6 +145,40 @@ NDArray* buffer_get(int uuid) {
 }
 
 /**
+ * Atomically replace the NDArray at `uuid` and return the previous occupant.
+ *
+ * Used by NDArray::slice()'s in-place mutation path: a freshly-built result
+ * is swapped into the slot so the PHP object identity (via its uuid prop)
+ * is preserved, then the caller releases the old NDArray via NDArray_FREE.
+ *
+ * @param uuid  Buffer slot to replace; must be in [0, numElements).
+ * @param next  Replacement NDArray; its `uuid` field is updated.
+ * @return      Previous NDArray pointer, or NULL if `uuid` is out of range.
+ */
+NDArray* buffer_replace(int uuid, NDArray *next) {
+#ifdef ZTS
+    tsrm_mutex_lock(MAIN_MEM_STACK.lock);
+#endif
+
+    NDArray *prev = NULL;
+    if (MAIN_MEM_STACK.buffer != NULL &&
+        uuid >= 0 &&
+        uuid < MAIN_MEM_STACK.numElements) {
+        prev = MAIN_MEM_STACK.buffer[uuid];
+        MAIN_MEM_STACK.buffer[uuid] = next;
+        if (next != NULL) {
+            next->uuid = uuid;
+        }
+    }
+
+#ifdef ZTS
+    tsrm_mutex_unlock(MAIN_MEM_STACK.lock);
+#endif
+
+    return prev;
+}
+
+/**
  * Add NDArray to global buffer
  */
 void add_to_buffer(NDArray* ndarray) {
