@@ -1287,6 +1287,77 @@ __global__ void tcuda_broadcast_by_offsets(const char *src, char *dst,
     for (int b = 0; b < elsize; b++) d[b] = s[b];
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+   Strided copy kernel: writes a contiguous, row-major NDArray from a view
+   over `src` whose layout is described by (ndim, shape[], strides_b[]).
+
+   Why this kernel exists: a per-row cudaMemcpy loop over a strided slice
+   (e.g. column extraction from a 256×256 matrix) pays ~1-2 µs of driver
+   latency per row, dominating actual byte movement. A single kernel launch
+   amortises the overhead; each thread copies one elsize-byte element after
+   decomposing its linear id into the multi-index and computing the source
+   offset via strides — signed, so negative-step slices like
+   `arr->slice([N-1, 0, -1])` work without a second code path on the host.
+
+   STRIDED_COPY_MAX_NDIM = 16 caps the on-kernel-arg dim count. Real NDArray
+   workloads are well under that (most code uses 1-4 dims); higher-ndim
+   slices fall back to the per-row cudaMemcpy path in NDArray_Slice. The cap
+   keeps the kernel parameter payload at ~200 bytes — well inside the 4 KB
+   CUDA kernel-arg budget on sm_70+. */
+#define STRIDED_COPY_MAX_NDIM 16
+
+struct StridedCopyDims {
+    long long strides_b[STRIDED_COPY_MAX_NDIM]; /* in bytes, signed */
+    int       shape    [STRIDED_COPY_MAX_NDIM];
+    int       ndim;
+    int       elsize;
+};
+
+__global__ void tcuda_strided_copy_kernel(
+    char       * __restrict__ dst,
+    const char * __restrict__ src,
+    long long n_elems,
+    struct StridedCopyDims dims)
+{
+    long long tid = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+    if (tid >= n_elems) return;
+
+    /* Row-major decomposition: rightmost axis varies fastest. shape[i] is
+       always ≥ 1 by construction (zero-element slices short-circuit on the
+       host). */
+    long long rem     = tid;
+    long long src_off = 0;
+    for (int i = dims.ndim - 1; i >= 0; i--) {
+        long long s   = dims.shape[i];
+        long long idx = rem % s;
+        rem          /= s;
+        src_off      += idx * dims.strides_b[i];
+    }
+
+    char       *d = dst + tid * dims.elsize;
+    const char *s = src + src_off;
+
+    /* Fast paths for the common dtype sizes; falls back to a byte loop for
+       anything exotic. The strides we receive are always multiples of elsize
+       (a slice can't break a dtype's internal alignment), so these aligned
+       loads/stores are safe. */
+    switch (dims.elsize) {
+        case 1:  d[0] = s[0]; break;
+        case 2:  *(uint16_t *)d = *(const uint16_t *)s; break;
+        case 4:  *(uint32_t *)d = *(const uint32_t *)s; break;
+        case 8:  *(uint64_t *)d = *(const uint64_t *)s; break;
+        case 16: {
+            uint64_t       *pd = (uint64_t *)d;
+            const uint64_t *ps = (const uint64_t *)s;
+            pd[0] = ps[0];
+            pd[1] = ps[1];
+            break;
+        }
+        default:
+            for (int b = 0; b < dims.elsize; b++) d[b] = s[b];
+    }
+}
+
 extern "C" {
 
     int
@@ -2460,6 +2531,54 @@ void cuda_broadcast(const char *src_gpu, char *dst_gpu,
     tcuda_broadcast_by_offsets<<<numBlocks, blockSize>>>(
         src_gpu, dst_gpu, src_offsets_gpu, n_out, elsize);
     cudaDeviceSynchronize();
+}
+
+/* Strided device-to-device copy wrapper. Single kernel launch covers any
+   slice pattern (any ndim ≤ 16, any signed strides). Returns 0 on success,
+   -1 if the call falls outside the kernel's supported envelope so the
+   caller can fall back to a per-row cudaMemcpy loop.
+   - dst_gpu, src_gpu: device pointers; dst has space for n_elems * elsize.
+   - host_shape, host_strides_b: per-axis shape and stride (bytes), read from
+     host memory and packed into the kernel parameter struct.
+   - n_elems: total number of output elements (product of host_shape).
+   - ndim: number of axes; must be in [1, STRIDED_COPY_MAX_NDIM].
+   - elsize: dtype byte size; fast paths cover 1/2/4/8/16, others use a byte loop. */
+int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
+                      long long n_elems, int ndim, int elsize,
+                      const int       *host_shape,
+                      const long long *host_strides_b) {
+    if (n_elems <= 0) return 0;                   /* nothing to copy */
+    if (ndim <= 0 || ndim > STRIDED_COPY_MAX_NDIM) return -1;
+    if (elsize <= 0) return -1;
+
+    struct StridedCopyDims dims;
+    dims.ndim   = ndim;
+    dims.elsize = elsize;
+    for (int i = 0; i < ndim; i++) {
+        dims.shape[i]     = host_shape[i];
+        dims.strides_b[i] = host_strides_b[i];
+    }
+    /* Zero-pad the unused tail so the struct never has indeterminate bytes
+       (the kernel only reads the first `ndim` entries, but valgrind-style
+       tooling on the host side prefers fully initialised payloads). */
+    for (int i = ndim; i < STRIDED_COPY_MAX_NDIM; i++) {
+        dims.shape[i]     = 1;
+        dims.strides_b[i] = 0;
+    }
+
+    const int blockSize = 256;
+    long long blocks_ll = (n_elems + blockSize - 1) / blockSize;
+    /* CUDA's grid x-dimension limit is 2^31 - 1 on all supported archs.
+       Realistic NDArrays never come close, but guard anyway. */
+    if (blocks_ll > 2147483647LL) return -1;
+    int numBlocks = (int)blocks_ll;
+
+    tcuda_strided_copy_kernel<<<numBlocks, blockSize>>>(
+        dst_gpu, src_gpu, n_elems, dims);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+    cudaDeviceSynchronize();
+    return 0;
 }
 
 }

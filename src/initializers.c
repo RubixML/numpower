@@ -428,13 +428,16 @@ Create_NDArray(int* shape, int ndim, const char* type, const int device) {
 NDArray*
 NDArray_FromNDArrayBase(NDArray *target, char *data_ptr, int* shape, int* strides, const int ndim) {
     NDArray* rtn = emalloc(sizeof(NDArray));
-    int total_num_elements = 1;
+    long total_num_elements = 1;
 
     rtn->strides = strides;
     rtn->dimensions = shape;
 
     for (int i = 0; i < ndim; i++) {
-        total_num_elements = total_num_elements * NDArray_SHAPE(rtn)[i];
+        total_num_elements = total_num_elements * (long)NDArray_SHAPE(rtn)[i];
+    }
+    if (ndim == 0) {
+        total_num_elements = 1;
     }
 
     rtn->flags = 0;
@@ -443,7 +446,12 @@ NDArray_FromNDArrayBase(NDArray *target, char *data_ptr, int* shape, int* stride
     rtn->ndim = ndim;
     rtn->refcount = 1;
     rtn->device = NDArray_DEVICE(target);
-    rtn->descriptor = Create_Descriptor(total_num_elements, sizeof(float), NDARRAY_TYPE_FLOAT32);
+    /* Preserve the source dtype/elsize. Hardcoding float32 here corrupted
+       any non-float32 view (squeeze, slice, atleast1d/2d/3d, …) by re-
+       interpreting the underlying bytes — see slice() across all dtypes. */
+    rtn->descriptor = Create_Descriptor(total_num_elements,
+                                        NDArray_ELSIZE(target),
+                                        NDArray_TYPE(target));
     NDArrayIterator_INIT(rtn);
     NDArray_ADDREF(target);
     return rtn;

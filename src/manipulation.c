@@ -186,110 +186,241 @@ NDArray_Flatten(NDArray *target) {
 }
 
 /**
- * @param array
- * @param indexes
- * @param num_indices
- * @param return_view
- * @return
+ * Slice an NDArray along one or more leading axes.
+ *
+ * Each entry in `indexes` describes the slice spec for the corresponding axis:
+ *   - NUMELEMENTS == 0  → empty `[]`: keep the whole axis (no slicing).
+ *   - NUMELEMENTS == 1  → single int: pick that index and DROP the axis.
+ *   - NUMELEMENTS == 2  → `[start, stop]` with step = 1.
+ *   - NUMELEMENTS == 3  → `[start, stop, step]`.
+ *
+ * Axes beyond `num_indices` are kept unchanged.
+ *
+ * The result is always a freshly allocated, contiguous, dtype-correct NDArray
+ * on the same device as the source (no aliasing, no view).
+ *
+ * @param array        Source NDArray.
+ * @param indexes      Per-axis slice specs (NUMELEMENTS encodes the form, see above).
+ * @param num_indices  Number of supplied slice specs (must be ≤ NDIM).
+ * @return             Contiguous copy of the slice, or NULL on error.
  */
 NDArray*
 NDArray_Slice(NDArray* array, NDArray** indexes, int num_indices) {
-    if (num_indices > NDArray_NDIM(array)) {
+    const int src_ndim   = NDArray_NDIM(array);
+    const int elsize     = NDArray_ELSIZE(array);
+    const int device     = NDArray_DEVICE(array);
+    const char *dtype    = NDArray_TYPE(array);
+
+    if (src_ndim == 0) {
+        zend_throw_error(NULL, "slice is not defined for a 0-d array");
+        return NULL;
+    }
+    if (num_indices > src_ndim) {
         zend_throw_error(NULL, "too many indices for array.");
         return NULL;
     }
+    if (num_indices < 1) {
+        zend_throw_error(NULL, "slice requires at least one argument.");
+        return NULL;
+    }
 
-    int new_strides[NDARRAY_MAX_DIMS];
-    int new_shape[NDARRAY_MAX_DIMS];
-    int i, start = 0, stop = 0, step = 0, n_steps = 0, new_dim = NDArray_NDIM(array), orig_dim = 0, new_dim_step = 0;
-    char *data_ptr = NDArray_DATA(array);
+    int view_shape[NDARRAY_MAX_DIMS];
+    int view_strides[NDARRAY_MAX_DIMS];
+    int view_ndim = 0;
+    char *data_ptr = (char *)NDArray_DATA(array);
 
-    SliceObject sliceobj;
+    int axis;
+    for (axis = 0; axis < num_indices; axis++) {
+        const int axis_len    = NDArray_SHAPE(array)[axis];
+        const int axis_stride = NDArray_STRIDES(array)[axis];
+        const long nargs      = NDArray_NUMELEMENTS(indexes[axis]);
 
+        if (nargs > 3) {
+            zend_throw_error(NULL,
+                "slice spec on axis %d has %ld values; expected 0-3", axis, nargs);
+            return NULL;
+        }
 
-    for (i = 0; i < num_indices; i++) {
-        sliceobj.start = NULL;
-        sliceobj.stop = NULL;
-        sliceobj.step = NULL;
-        if (NDArray_NUMELEMENTS(indexes[i]) >= 1) {
-            sliceobj.start = emalloc(sizeof(int));
-            sliceobj.start[0] = (int) NDArray_F32DATA(indexes[i])[0];
+        if (nargs == 1) {
+            /* Single integer index: pick that element and drop the axis. */
+            int raw = (int) NDArray_F32DATA(indexes[axis])[0];
+            int idx = raw;
+            if (idx < 0) idx += axis_len;
+            if (idx < 0 || idx >= axis_len) {
+                zend_throw_error(NULL,
+                    "index %d is out of bounds for axis %d with size %d",
+                    raw, axis, axis_len);
+                return NULL;
+            }
+            data_ptr += (size_t)axis_stride * (size_t)idx;
+            continue;
         }
-        if (NDArray_NUMELEMENTS(indexes[i]) >= 2) {
-            sliceobj.stop = emalloc(sizeof(int));
-            sliceobj.stop[0] = (int) NDArray_F32DATA(indexes[i])[1];
-        }
-        if (NDArray_NUMELEMENTS(indexes[i]) == 3) {
-            sliceobj.step = emalloc(sizeof(int));
-            sliceobj.step[0] = (int) NDArray_F32DATA(indexes[i])[2];
-        }
-        if(Slice_GetIndices(&sliceobj, NDArray_SHAPE(array)[orig_dim], &start, &stop, &step, &n_steps) < 0) {
-            zend_throw_error(NULL, "Slicing error");
-            goto failure;
-        }
-        if (n_steps <= 0) {
-            n_steps = 0;
-            step = 1;
-            start = 0;
-        }
-        data_ptr += NDArray_STRIDES(array)[orig_dim] * start;
-        new_strides[new_dim_step] = NDArray_STRIDES(array)[orig_dim] * step;
-        new_shape[new_dim_step] = n_steps;
 
-        if (NDArray_NUMELEMENTS(indexes[i]) == 1) {
-            new_dim--;
-            new_dim_step--;
+        /* nargs == 0 → full axis; nargs in {2, 3} → explicit slice. */
+        SliceObject so = { NULL, NULL, NULL };
+        int start_val = 0, stop_val = 0, step_val = 0;
+        if (nargs >= 2) {
+            so.start = &start_val;
+            start_val = (int) NDArray_F32DATA(indexes[axis])[0];
+            so.stop = &stop_val;
+            stop_val = (int) NDArray_F32DATA(indexes[axis])[1];
         }
-        new_dim_step += 1;
-        orig_dim += 1;
-        if (sliceobj.start != NULL) {
-            efree(sliceobj.start);
+        if (nargs == 3) {
+            so.step = &step_val;
+            step_val = (int) NDArray_F32DATA(indexes[axis])[2];
         }
-        if (sliceobj.stop != NULL) {
-            efree(sliceobj.stop);
+
+        int start = 0, stop = 0, step = 0, n_steps = 0;
+        if (Slice_GetIndices(&so, axis_len, &start, &stop, &step, &n_steps) < 0) {
+            return NULL;
         }
-        if (sliceobj.step != NULL) {
-            efree(sliceobj.step);
+        if (n_steps < 0) n_steps = 0;
+
+        if (n_steps > 0) {
+            data_ptr += (size_t)axis_stride * (size_t)start;
+        }
+        view_shape[view_ndim]   = n_steps;
+        view_strides[view_ndim] = axis_stride * step;
+        view_ndim++;
+    }
+
+    /* Trailing axes (not addressed by the caller) keep their original
+       shape and stride. */
+    for (axis = num_indices; axis < src_ndim; axis++) {
+        view_shape[view_ndim]   = NDArray_SHAPE(array)[axis];
+        view_strides[view_ndim] = NDArray_STRIDES(array)[axis];
+        view_ndim++;
+    }
+
+    /* ----------------------------------------------------------------
+       Materialise the view into a fresh contiguous NDArray of the same
+       dtype and on the same device.
+       ---------------------------------------------------------------- */
+
+    /* 0-D result: build a scalar NDArray and copy a single element. */
+    if (view_ndim == 0) {
+        int *out_shape = emalloc(sizeof(int));
+        out_shape[0] = 1;
+        NDArray *out = NDArray_Empty(out_shape, 0, dtype, device);
+        if (out == NULL) {
+            return NULL;
+        }
+        if (device == NDARRAY_DEVICE_CPU) {
+            memcpy(out->data, data_ptr, (size_t)elsize);
+        }
+#ifdef HAVE_CUBLAS
+        else {
+            cudaMemcpy(out->data, data_ptr, (size_t)elsize,
+                       cudaMemcpyDeviceToDevice);
+        }
+#endif
+        return out;
+    }
+
+    /* N-D result: allocate, then copy. */
+    long n_elems = 1;
+    for (axis = 0; axis < view_ndim; axis++) {
+        n_elems *= (long)view_shape[axis];
+    }
+
+    int *out_shape = emalloc(sizeof(int) * view_ndim);
+    memcpy(out_shape, view_shape, sizeof(int) * view_ndim);
+    NDArray *out = NDArray_Empty(out_shape, view_ndim, dtype, device);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (n_elems == 0) {
+        /* Empty result: nothing to copy. */
+        return out;
+    }
+
+    /* Find the longest trailing run of axes whose strides match a row-major
+       contiguous layout. Each such "row" can be copied as one block, which
+       is critical on GPU where per-element cudaMemcpy is unacceptably slow. */
+    long contig_run_bytes = (long)elsize;
+    int  contig_axes      = 0;
+    for (axis = view_ndim - 1; axis >= 0; axis--) {
+        if (view_strides[axis] != contig_run_bytes) break;
+        contig_run_bytes *= (long)view_shape[axis];
+        contig_axes++;
+    }
+
+    const int outer_ndim = view_ndim - contig_axes;
+    char *out_ptr = (char *)NDArray_DATA(out);
+
+    if (outer_ndim == 0) {
+        /* The entire slice is a single contiguous run in source memory. */
+        size_t nbytes = (size_t)n_elems * (size_t)elsize;
+        if (device == NDARRAY_DEVICE_CPU) {
+            memcpy(out_ptr, data_ptr, nbytes);
+        }
+#ifdef HAVE_CUBLAS
+        else {
+            cudaMemcpy(out_ptr, data_ptr, nbytes, cudaMemcpyDeviceToDevice);
+        }
+#endif
+        return out;
+    }
+
+    /* Strided copy.
+
+       GPU path: a single kernel launch resolves every output element's source
+       offset on-device, avoiding the ~1-2 µs per-call cudaMemcpy latency that
+       dominated a per-row loop. If the kernel rejects the request (dim/elsize
+       outside its envelope, or a transient launch error) we fall back to the
+       per-row cudaMemcpy below, which is correct for any ndim/elsize.
+
+       CPU path: a per-row memcpy is already near-optimal because the trailing
+       contiguous run collapses many tiny copies into one. */
+
+#ifdef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        long long strides_b_ll[NDARRAY_MAX_DIMS];
+        for (axis = 0; axis < view_ndim; axis++) {
+            strides_b_ll[axis] = (long long)view_strides[axis];
+        }
+        if (cuda_strided_copy((char *)NDArray_DATA(out), data_ptr,
+                              (long long)n_elems, view_ndim, elsize,
+                              view_shape, strides_b_ll) == 0) {
+            return out;
+        }
+        /* Fall through to the per-row cudaMemcpy fallback. */
+    }
+#endif
+
+    /* Per-row fallback. Walks the outer axes and copies `contig_run_bytes`
+       per inner block. */
+    int idx_vec[NDARRAY_MAX_DIMS];
+    long outer_count = 1;
+    for (axis = 0; axis < outer_ndim; axis++) {
+        idx_vec[axis] = 0;
+        outer_count *= (long)view_shape[axis];
+    }
+
+    for (long o = 0; o < outer_count; o++) {
+        char *src = data_ptr;
+        for (axis = 0; axis < outer_ndim; axis++) {
+            src += (size_t)view_strides[axis] * (size_t)idx_vec[axis];
+        }
+        if (device == NDARRAY_DEVICE_CPU) {
+            memcpy(out_ptr, src, (size_t)contig_run_bytes);
+        }
+#ifdef HAVE_CUBLAS
+        else {
+            cudaMemcpy(out_ptr, src, (size_t)contig_run_bytes,
+                       cudaMemcpyDeviceToDevice);
+        }
+#endif
+        out_ptr += contig_run_bytes;
+
+        /* Increment idx_vec in row-major order. */
+        for (axis = outer_ndim - 1; axis >= 0; axis--) {
+            if (++idx_vec[axis] < view_shape[axis]) break;
+            idx_vec[axis] = 0;
         }
     }
 
-    int *strides_ptr = emalloc(sizeof(int) * new_dim);
-    memcpy(strides_ptr, NDArray_STRIDES(array), sizeof(int) * NDArray_NDIM(array));
-    for (i = 0; i < new_dim; i++) {
-        strides_ptr[i] = new_strides[i];
-    }
-    int *shape_ptr = emalloc(sizeof(int) * new_dim);
-    memcpy(shape_ptr, NDArray_SHAPE(array), sizeof(int) * NDArray_NDIM(array));
-    for (i = 0; i < new_dim; i++) {
-        shape_ptr[i] = new_shape[i];
-    }
-
-    if (num_indices < NDArray_NDIM(array)) {
-        new_dim = NDArray_NDIM(array);
-    }
-
-    NDArray *ret = NULL;
-    NDArray *fret = NDArray_FromNDArrayBase(array, data_ptr, shape_ptr, strides_ptr, new_dim);
-
-    if (num_indices > 1) {
-        NDArray_enableFlags(fret, NDARRAY_ARRAY_F_CONTIGUOUS);
-        ret = NDArray_ToContiguous(fret);
-        NDArray_FREE(fret);
-    } else {
-        ret = fret;
-    }
-    return ret;
-failure:
-    if (sliceobj.start != NULL) {
-        efree(sliceobj.start);
-    }
-    if (sliceobj.stop != NULL) {
-        efree(sliceobj.stop);
-    }
-    if (sliceobj.step != NULL) {
-        efree(sliceobj.step);
-    }
-    return NULL;
+    return out;
 }
 
 NDArray*

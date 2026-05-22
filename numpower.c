@@ -5470,49 +5470,153 @@ PHP_METHOD(NumPower, array) {
     ZVAL_LONG(OBJ_PROP_NUM(Z_OBJ_P(return_value), 0), NDArray_UUID(nda));
 }
 
-ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slice, 0, 0, IS_MIXED, 0)
-ZEND_ARG_VARIADIC_TYPE_INFO(0, arg, IS_MIXED, 0)
-ZEND_END_ARG_INFO()
-PHP_METHOD(NDArray, slice) {
-    int j;
-    zend_object *obj = Z_OBJ_P(ZEND_THIS);
-    NDArray *rtn = NULL;
-    zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
-    NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
-    NDArray** indices_axis;
+/**
+ * Convert a variadic list of slice-spec zvals into NDArray pointers, invoke
+ * NDArray_Slice, and release any temporaries auto-created from PHP scalars
+ * or arrays. Shared by the instance and static slice methods so they use
+ * identical plumbing.
+ *
+ * On any conversion error the function frees everything already allocated
+ * and returns NULL with a PHP exception in flight; the caller must only
+ * forward the NULL.
+ *
+ * @param src           Source NDArray; not retained by this call.
+ * @param idx_args      Variadic argument array as produced by Z_PARAM_VARIADIC.
+ * @param num_idx_args  Number of slice-spec zvals in `idx_args`.
+ * @return              Freshly-allocated slice NDArray (uuid == -1) on
+ *                      success, NULL if any conversion or slice failed.
+ */
+static NDArray *
+php_ndarray_slice_run(NDArray *src, zval *idx_args, int num_idx_args) {
+    NDArray **indices = emalloc(sizeof(NDArray *) * num_idx_args);
 
-    int num_args = ZEND_NUM_ARGS();
-
-    // Check if at least one argument is passed
-    if (num_args < 1) {
-        php_error_docref(NULL, E_ERROR, "At least one argument is required");
-        RETURN_NULL();
+    for (int j = 0; j < num_idx_args; j++) {
+        indices[j] = ZVAL_TO_NDARRAY(&idx_args[j]);
+        if (indices[j] == NULL) {
+            for (int k = 0; k < j; k++) {
+                CHECK_INPUT_AND_FREE(&idx_args[k], indices[k]);
+            }
+            efree(indices);
+            return NULL;
+        }
     }
 
-    // Process the arguments
+    NDArray *rtn = NDArray_Slice(src, indices, num_idx_args);
+
+    /* CHECK_INPUT_AND_FREE only releases temporaries that were auto-created
+       from PHP scalars/arrays; existing NDArray inputs keep their refcount,
+       which is exactly what we want so the user's index variable survives. */
+    for (int j = 0; j < num_idx_args; j++) {
+        CHECK_INPUT_AND_FREE(&idx_args[j], indices[j]);
+    }
+    efree(indices);
+    return rtn;
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_slice, 0, 0, IS_MIXED, 0)
+    ZEND_ARG_VARIADIC_TYPE_INFO(0, arg, IS_MIXED, 0)
+ZEND_END_ARG_INFO()
+
+/**
+ * NDArray::slice(...$indices) — MUTATES $this in place.
+ *
+ * The underlying NDArray pointed to by $this is replaced with the slice
+ * result. The PHP object identity is preserved (the same uuid → buffer slot
+ * keeps holding $this), so any other PHP reference to the array sees the
+ * mutation. Chained calls work because the method returns $this for non-0-D
+ * results.
+ *
+ * For a 0-D result the method returns a dtype-correct scalar
+ * (int / float / string per NDArray_ScalarToZval's rules), and $this is
+ * still mutated to a 0-D NDArray.
+ *
+ * For a side-effect-free version, use the static NumPower::slice().
+ *
+ * @return NDArray|int|float|string $this on N-D, scalar on 0-D.
+ */
+PHP_METHOD(NDArray, slice) {
+    zend_object *obj      = Z_OBJ_P(ZEND_THIS);
+    zval        *obj_uuid = OBJ_PROP_NUM(obj, 0);
+    NDArray     *ndarray  = ZVALUUID_TO_NDARRAY(obj_uuid);
+
     zval *arg;
-    int num_inputed_args = 0;
+    int   num_inputed_args = 0;
     ZEND_PARSE_PARAMETERS_START(1, -1)
-    Z_PARAM_VARIADIC('+', arg, num_inputed_args)
+        Z_PARAM_VARIADIC('+', arg, num_inputed_args)
     ZEND_PARSE_PARAMETERS_END();
 
-    indices_axis = emalloc(sizeof(NDArray*) * num_inputed_args);
-    // Access individual arguments
-    for (j = 0; j < num_inputed_args; j++) {
-        zval *current_arg = &arg[j];
-        // Process each argument as needed
-        // ...
-        indices_axis[j] = ZVAL_TO_NDARRAY(current_arg);
-    }
-    rtn = NDArray_Slice(ndarray, indices_axis, num_inputed_args);
-
-    for (j = 0; j < num_inputed_args; j++) {
-        NDArray_FREE(indices_axis[j]);
-    }
-    efree(indices_axis);
+    NDArray *rtn = php_ndarray_slice_run(ndarray, arg, num_inputed_args);
     if (rtn == NULL) {
         return;
     }
+
+    /* Install `rtn` into $this's buffer slot atomically, then release the
+       previous occupant. buffer_replace updates rtn->uuid for us and takes
+       the global lock on ZTS builds so concurrent buffer_get/free calls
+       never observe a torn slot. */
+    int slot = (int) Z_LVAL_P(obj_uuid);
+    NDArray *prev = buffer_replace(slot, rtn);
+    NDArray_FREE(prev);
+
+    if (NDArray_NDIM(rtn) > 0) {
+        /* Chainable: return $this so `$a->slice(...)->slice(...)` works. */
+        ZVAL_OBJ_COPY(return_value, obj);
+    } else {
+        /* 0-D: dtype-aware scalar (int for integer dtypes, string for
+           float128/uint64, float otherwise). $this is still a 0-D NDArray
+           after the call, mirroring numpy's "you sliced down to a scalar"
+           state. */
+        NDArray_ScalarToZval(rtn, return_value);
+    }
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_numpower_slice, 0, 0, IS_MIXED, 0)
+    ZEND_ARG_INFO(0, array)
+    ZEND_ARG_VARIADIC_TYPE_INFO(0, indices, IS_MIXED, 0)
+ZEND_END_ARG_INFO()
+
+/**
+ * NumPower::slice($array, ...$indices) — returns a NEW NDArray.
+ *
+ * Pure-function counterpart of NDArray::slice(): the source `$array` is
+ * never mutated. Accepts the same wide input set as every other NumPower
+ * static — NDArray, nested PHP array, or scalar — and the same
+ * `int | [] | [start,stop] | [start,stop,step]` slice-spec grammar.
+ *
+ * Both the instance and static forms dispatch to the same underlying
+ * NDArray_Slice algorithm, so per-device performance and edge-case behaviour
+ * are identical.
+ *
+ * @return NDArray|int|float|string Fresh NDArray on N-D, dtype-correct
+ *                                  scalar on 0-D (string for float128 and
+ *                                  uint64, int for integer dtypes, float
+ *                                  otherwise).
+ */
+PHP_METHOD(NumPower, slice) {
+    zval *array_zv;
+    zval *idx_args;
+    int   num_idx_args = 0;
+
+    ZEND_PARSE_PARAMETERS_START(2, -1)
+        Z_PARAM_ZVAL(array_zv)
+        Z_PARAM_VARIADIC('+', idx_args, num_idx_args)
+    ZEND_PARSE_PARAMETERS_END();
+
+    NDArray *src = ZVAL_TO_NDARRAY(array_zv);
+    if (src == NULL) {
+        return;
+    }
+
+    NDArray *rtn = php_ndarray_slice_run(src, idx_args, num_idx_args);
+    CHECK_INPUT_AND_FREE(array_zv, src);
+
+    if (rtn == NULL) {
+        return;
+    }
+    /* ndarray_init_new_object handles both wrappings:
+       - ndim  > 0 → wraps `rtn` in a fresh NDArray PHP object.
+       - ndim == 0 → routes through NDArray_ScalarToZval (dtype-aware) and
+                      frees `rtn`. */
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -5902,6 +6006,7 @@ static const zend_function_entry class_NumPower_methods[] = {
 
     // MANIPULATION
     ZEND_ME(NumPower, reshape, arginfo_reshape, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
+    ZEND_ME(NumPower, slice, arginfo_numpower_slice, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NumPower, copy, arginfo_ndarray_copy, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NumPower, flatten, arginfo_ndarray_flat, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
     ZEND_ME(NumPower, atleast1d, arginfo_ndarray_atleast_1d, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
