@@ -5632,17 +5632,33 @@ PHP_METHOD(NDArray, size) {
 }
 
 /**
- * @param execute_data
- * @param return_value
+ * @brief NDArray::count() — implements the Countable interface.
+ *
+ * Returns the length of axis 0 (the leading dimension), which is the number
+ * of sub-arrays produced by iterating with foreach. This is the value that
+ * PHP's count() built-in returns when called on an NDArray, since the class
+ * implements Countable: count($a) === $a->count() by construction.
+ *
+ * Semantics by rank:
+ *   - 0-D scalar (shape []): returns 0. There is no axis 0 to enumerate,
+ *     so the count matches an empty PHP array — consistent with shape()
+ *     returning [] for the same array.
+ *   - N-D (N >= 1): returns shape[0]. Cost is O(1) regardless of dtype,
+ *     total element count, or device — count() reads only the cached
+ *     dimension metadata, so it never touches the buffer or triggers a
+ *     CPU/GPU transfer, and no memory is allocated.
+ *
+ * @return long Number of elements along axis 0, or 0 for 0-D scalars.
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_count, 0)
-ZEND_END_ARG_INFO()
 PHP_METHOD(NDArray, count) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    if (NDArray_NDIM(ndarray) == 0) {
+        RETURN_LONG(0);
+    }
     RETURN_LONG(NDArray_SHAPE(ndarray)[0]);
 }
 
