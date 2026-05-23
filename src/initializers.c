@@ -12,7 +12,9 @@
 #include "Zend/zend_hash.h"
 #include "iterators.h"
 #include "indexing.h"
+#include <limits.h>
 #include <math.h>
+#include <stdint.h>
 #include <time.h>
 
 #ifdef HAVE_CUBLAS
@@ -1024,54 +1026,258 @@ NDArray_Copy(NDArray *a, int device) {
     }
 }
 
-/*
- * Like ceil(value), but check for overflow.
+/**
+ * @brief Return the arange arithmetic kind selected by @p type.
  *
- * Return 0 on success, -1 on failure
+ * Public; see initializers.h for the contract. Used by the PHP layer to
+ * decide how to parse the (start, stop, step) zvals before calling
+ * `NDArray_Arange`.
  */
-static int safe_ceil_to_int(double value, int* ret) {
-    double ivalue;
-
-    ivalue = ceil(value);
-    if (ivalue < INT_MIN || ivalue > INT_MAX) {
-        return -1;
-    }
-
-    *ret = (int)ivalue;
-    return 0;
+NDArrayArangeKind NDArray_ArangeKindFor(const char *type) {
+    if (!strcmp(type, "float128")) return NDARRAY_ARANGE_KIND_FP128;
+    if (!strcmp(type, "int64"))    return NDARRAY_ARANGE_KIND_INT64;
+    if (!strcmp(type, "uint64"))   return NDARRAY_ARANGE_KIND_UINT64;
+    return NDARRAY_ARANGE_KIND_DOUBLE;
 }
 
 /**
- * NDArray::arange
+ * @brief Sentinel returned by every `arange_length_*` helper to flag a
+ *        step == 0 (or NaN) input or a length that would overflow a long.
+ */
+#define NDARRAY_ARANGE_LEN_ERROR ((long)-1)
+
+/* Length helpers — each returns the non-negative element count for its
+   arithmetic kind, 0 when the sign of `step` is incompatible with the
+   (start, stop) interval (mirroring numpy's empty-result behaviour), or
+   NDARRAY_ARANGE_LEN_ERROR when the input is degenerate (step == 0,
+   NaN, or the result overflows). */
+
+static long arange_length_double(double start, double stop, double step) {
+    if (step == 0.0 || isnan(step) || isnan(start) || isnan(stop)) {
+        return NDARRAY_ARANGE_LEN_ERROR;
+    }
+    double ratio = (stop - start) / step;
+    if (!isfinite(ratio) || ratio <= 0.0) {
+        return 0;
+    }
+    double l = ceil(ratio);
+    if (l > (double)LONG_MAX) {
+        return NDARRAY_ARANGE_LEN_ERROR;
+    }
+    return (long)l;
+}
+
+static long arange_length_int64(int64_t start, int64_t stop, int64_t step) {
+    if (step == 0) return NDARRAY_ARANGE_LEN_ERROR;
+    if (step > 0) {
+        if (stop <= start) return 0;
+        /* Ceiling division of (stop - start) by step, with the explicit
+           `step - 1` adjustment that's only safe because (stop > start)
+           guarantees a positive diff. */
+        int64_t diff = stop - start;
+        return (long)((diff + step - 1) / step);
+    }
+    if (stop >= start) return 0;
+    int64_t diff     = start - stop;
+    int64_t pos_step = -step;
+    return (long)((diff + pos_step - 1) / pos_step);
+}
+
+static long arange_length_uint64(uint64_t start, uint64_t stop, uint64_t step) {
+    if (step == 0) return NDARRAY_ARANGE_LEN_ERROR;
+    if (stop <= start) return 0;
+    uint64_t diff = stop - start;
+    return (long)((diff + step - 1) / step);
+}
+
+static long arange_length_fp128(ndarray_fp128_t start,
+                                ndarray_fp128_t stop,
+                                ndarray_fp128_t step) {
+    if (NDARRAY_FP128_ISZERO(step)) return NDARRAY_ARANGE_LEN_ERROR;
+    ndarray_fp128_t ratio = NDARRAY_FP128_DIV(
+        NDARRAY_FP128_SUB(stop, start), step);
+    /* ratio < 0 (sign mismatch) → empty result, matching numpy. */
+    if (NDARRAY_FP128_LT(ratio, NDARRAY_FP128_ZERO()) ||
+        NDARRAY_FP128_ISZERO(ratio)) {
+        return 0;
+    }
+    /* The ceil is taken on double — `ratio` already represents an integer
+       count (bounded by LONG_MAX << 2^53), so the round-trip through
+       double is exact. */
+    double rd = NDARRAY_FP128_TO_D(ratio);
+    if (!isfinite(rd) || rd > (double)LONG_MAX) {
+        return NDARRAY_ARANGE_LEN_ERROR;
+    }
+    return (long)ceil(rd);
+}
+
+/* Fill helpers — each writes `n` elements into `out` (a host buffer of
+   `n * elsize` bytes). For non-fp128 / non-int64 / non-uint64 dtypes the
+   double path delegates the per-element cast to `ndarray_set_from_double`
+   so it works uniformly for every "narrow" dtype. */
+
+static void arange_fill_double(char *out, long n, const char *type,
+                                double start, double step) {
+    for (long i = 0; i < n; i++) {
+        ndarray_set_from_double(type, out, (size_t)i,
+                                start + (double)i * step);
+    }
+}
+
+static void arange_fill_fp128(char *out, long n,
+                               ndarray_fp128_t start,
+                               ndarray_fp128_t step) {
+    ndarray_fp128_t *p = (ndarray_fp128_t *)out;
+    for (long i = 0; i < n; i++) {
+        ndarray_fp128_t inc = NDARRAY_FP128_MUL(
+            NDARRAY_FP128_FROM_I64((int64_t)i), step);
+        p[i] = NDARRAY_FP128_ADD(start, inc);
+    }
+}
+
+static void arange_fill_int64(char *out, long n, int64_t start, int64_t step) {
+    int64_t *p = (int64_t *)out;
+    for (long i = 0; i < n; i++) {
+        p[i] = start + (int64_t)i * step;
+    }
+}
+
+static void arange_fill_uint64(char *out, long n, uint64_t start, uint64_t step) {
+    uint64_t *p = (uint64_t *)out;
+    for (long i = 0; i < n; i++) {
+        p[i] = start + (uint64_t)i * step;
+    }
+}
+
+/**
+ * @brief Build a 1-D arange NDArray of the requested dtype on the requested device.
  *
- * @param start
- * @param stop
- * @param step
- * @return
+ * Each dtype follows the arithmetic kind dictated by `NDArray_ArangeKindFor`:
+ *  - `float128`   → fp128 arithmetic (113-bit / DD).
+ *  - `int64`      → 64-bit signed integer arithmetic.
+ *  - `uint64`     → 64-bit unsigned integer arithmetic.
+ *  - everything else → double arithmetic.
+ *
+ * The host fill is computed by closed form `a[i] = start + i * step` (not
+ * cumulative add) so floating-point dtypes don't drift across the array.
+ * For GPU the closed-form result is computed on host and then handed to
+ * `NDArray_TypedH2D`, which converts host __float128/DD bytes into the
+ * on-device DD pair for fp128. The host scratch is freed on every exit.
+ *
+ * Pre-existing bugs fixed:
+ *  - The old `NDArray_Arange(double, double, double)` was float32 / CPU
+ *    hardcoded and would have allocated `numElements * sizeof(float)`
+ *    bytes regardless of dtype.
+ *  - It threw on `length == 0` instead of returning the empty array
+ *    numpy produces for `arange(5, 0, 1)`.
+ *  - The element generation used cumulative add (`a[i] = a[i-1] + step`),
+ *    which accumulates rounding error proportional to the array length.
+ *  - The wasted `NDArray_Zeros` (full memset) before overwriting every
+ *    element is gone — `NDArray_Empty` allocates uninitialised storage.
+ *
+ * @param[in] spec   Discriminated (start, stop, step) triple in the
+ *                   arithmetic kind dictated by @p type.
+ * @param[in] type   Canonical NDArray dtype string.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New 1-D arange NDArray, or NULL on failure (Error in flight).
  */
 NDArray*
-NDArray_Arange(double start, double stop, double step) {
-    NDArray *rtn;
-    int i;
-    int length;
-
-    if (safe_ceil_to_int((stop - start) / step, &length)) {
-        zend_throw_error(NULL, "arange: overflow while computing length");
+NDArray_Arange(const NDArrayArangeSpec *spec, const char *type, int device) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
         return NULL;
     }
 
-    if (length <= 0) {
-        zend_throw_error(NULL, "arange: zero length");
+    long length = NDARRAY_ARANGE_LEN_ERROR;
+    switch (spec->kind) {
+        case NDARRAY_ARANGE_KIND_DOUBLE:
+            length = arange_length_double(
+                spec->v.d.start, spec->v.d.stop, spec->v.d.step);
+            break;
+        case NDARRAY_ARANGE_KIND_FP128:
+            length = arange_length_fp128(
+                spec->v.f128.start, spec->v.f128.stop, spec->v.f128.step);
+            break;
+        case NDARRAY_ARANGE_KIND_INT64:
+            length = arange_length_int64(
+                spec->v.i64.start, spec->v.i64.stop, spec->v.i64.step);
+            break;
+        case NDARRAY_ARANGE_KIND_UINT64:
+            length = arange_length_uint64(
+                spec->v.u64.start, spec->v.u64.stop, spec->v.u64.step);
+            break;
+    }
+
+    if (length == NDARRAY_ARANGE_LEN_ERROR) {
+        zend_throw_error(NULL,
+            "arange: step must be non-zero and finite");
+        return NULL;
+    }
+    if (length > (long)INT_MAX) {
+        zend_throw_error(NULL,
+            "arange: computed length %ld exceeds INT_MAX", length);
         return NULL;
     }
 
-    int *rtn_shape = emalloc(sizeof(int));
-    rtn_shape[0] = length;
-    rtn = NDArray_Zeros(rtn_shape, 1, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-    NDArray_F32DATA(rtn)[0] = (float)start;
-    for (i = 1; i < length; i++) {
-        NDArray_F32DATA(rtn)[i] = NDArray_F32DATA(rtn)[i - 1] + step;
+    int *shape = emalloc(sizeof(int));
+    shape[0] = (int)length;
+
+    NDArray *rtn = NDArray_Empty(shape, 1, type, device);
+    if (rtn == NULL) {
+        return NULL;
     }
+    if (length == 0) {
+        return rtn;
+    }
+
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
+    /* CPU writes the closed-form values straight into NDArray_DATA. GPU
+       writes to a host staging buffer first (size n * elsize, freed on
+       exit), then `NDArray_TypedH2D` ships the bytes to VRAM — handling
+       the host-fp128 → on-device DD conversion for the fp128 case. The
+       result matrix itself is built directly in VRAM. */
+    char *host_data = (char *)rtn->data;
+    int   to_gpu    = 0;
+#ifdef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        host_data = emalloc((size_t)length * (size_t)elsize);
+        to_gpu    = 1;
+    }
+#endif
+
+    switch (spec->kind) {
+        case NDARRAY_ARANGE_KIND_DOUBLE:
+            arange_fill_double(host_data, length, type,
+                               spec->v.d.start, spec->v.d.step);
+            break;
+        case NDARRAY_ARANGE_KIND_FP128:
+            arange_fill_fp128(host_data, length,
+                              spec->v.f128.start, spec->v.f128.step);
+            break;
+        case NDARRAY_ARANGE_KIND_INT64:
+            arange_fill_int64(host_data, length,
+                              spec->v.i64.start, spec->v.i64.step);
+            break;
+        case NDARRAY_ARANGE_KIND_UINT64:
+            arange_fill_uint64(host_data, length,
+                               spec->v.u64.start, spec->v.u64.step);
+            break;
+    }
+
+#ifdef HAVE_CUBLAS
+    if (to_gpu) {
+        NDArray_TypedH2D((char *)rtn->data, host_data, length, type);
+        efree(host_data);
+    }
+#endif
+
     return rtn;
 }
 

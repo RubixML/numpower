@@ -2226,37 +2226,261 @@ PHP_METHOD(NumPower, ones) {
 }
 
 /**
- * NumPower::arange
+ * @brief Coerce a PHP scalar @p z into a double for arange's "narrow"
+ *        arithmetic path.
  *
- * @param execute_data
- * @param return_value
+ * Accepts `int`, `float`, and numeric `string` inputs. The string path
+ * uses `zend_string` → `strtod`, matching PHP's standard numeric-string
+ * coercion. The double @p out_dst is set only on success; on failure a
+ * catchable `\Error` is in flight.
+ *
+ * @param[in]  z         PHP scalar.
+ * @param[in]  name      Argument label for the error message.
+ * @param[out] out_dst   Receives the coerced double on success.
+ * @return 1 on success, 0 on a type rejection.
+ */
+static int
+arange_coerce_zval_double(zval *z, const char *name, double *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = (double) Z_LVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = Z_DVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = strtod(Z_STRVAL_P(z), NULL);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into an `int64_t` for the int64 arange path.
+ *
+ * IS_LONG is taken verbatim (PHP's native long is 64-bit signed on every
+ * supported platform). IS_DOUBLE is cast through `(int64_t)`. IS_STRING
+ * routes through `strtoll` so values outside PHP's long range stay
+ * byte-correct.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the int64 value on success.
+ * @return 1 on success, 0 on type rejection (Error in flight).
+ */
+static int
+arange_coerce_zval_int64(zval *z, const char *name, int64_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = (int64_t) Z_LVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = (int64_t) Z_DVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = (int64_t) strtoll(Z_STRVAL_P(z), NULL, 10);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into a `uint64_t` for the uint64 arange path.
+ *
+ * IS_LONG is range-checked (a negative value is rejected for unsigned).
+ * IS_STRING routes through `strtoull` so `"18446744073709551615"` and
+ * other values above `LLONG_MAX` survive intact.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the uint64 value on success.
+ * @return 1 on success, 0 on type rejection or negative-long.
+ */
+static int
+arange_coerce_zval_uint64(zval *z, const char *name, uint64_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        zend_long lv = Z_LVAL_P(z);
+        if (lv < 0) {
+            zend_throw_error(NULL,
+                "arange: %s must be non-negative for uint64 dtype", name);
+            return 0;
+        }
+        *out_dst = (uint64_t) lv;
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        double dv = Z_DVAL_P(z);
+        if (dv < 0.0) {
+            zend_throw_error(NULL,
+                "arange: %s must be non-negative for uint64 dtype", name);
+            return 0;
+        }
+        *out_dst = (uint64_t) dv;
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = (uint64_t) strtoull(Z_STRVAL_P(z), NULL, 10);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into `ndarray_fp128_t` for the float128 path.
+ *
+ * IS_STRING is the precision-loss-free path (via `strtoflt128` on glibc,
+ * or the DD fallback). IS_LONG / IS_DOUBLE go through the dtype's
+ * standard conversion helpers.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the fp128 value on success.
+ * @return 1 on success, 0 on type rejection.
+ */
+static int
+arange_coerce_zval_fp128(zval *z, const char *name, ndarray_fp128_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = ndarray_string_to_fp128(Z_STRVAL_P(z));
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = NDARRAY_FP128_FROM_I64((int64_t) Z_LVAL_P(z));
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = ndarray_double_to_fp128(Z_DVAL_P(z));
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief `NumPower::arange(stop, start = 0, step = 1, dtype = "float32", device = 0): NDArray`.
+ *
+ * Generates a 1-D NDArray whose values follow `a[i] = start + i * step`
+ * for `i` in `[0, ceil((stop - start) / step))`. The sign of `step` must
+ * be consistent with the (start, stop) interval; otherwise an empty
+ * array is returned (numpy behaviour).
+ *
+ * The first three parameters accept `int`, `float`, and numeric `string`
+ * inputs. The string form is the only loss-free route for the wide
+ * dtypes: `float128` strings flow through `strtoflt128` / the DD parser,
+ * `uint64` strings through `strtoull`, and `int64` strings through
+ * `strtoll`. For every other dtype the value is coerced through `double`
+ * (which represents every smaller dtype's range exactly).
+ *
+ * For `device == 1` (GPU) the destination matrix is allocated directly
+ * in VRAM via `NDArray_Empty`; the closed-form values are computed in a
+ * transient host scratch and then shipped to the device via
+ * `NDArray_TypedH2D` (which handles fp128's host→DD layout conversion).
+ * Writing the elements via a custom on-device kernel would be a pure-
+ * VRAM alternative; the current shape of the code keeps host involvement
+ * to the `n * elsize` scratch which is freed immediately afterwards.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arange, 0, 0, 1)
     ZEND_ARG_INFO(0, stop)
     ZEND_ARG_INFO(0, start)
     ZEND_ARG_INFO(0, step)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arange) {
-    NDArray *rtn = NULL;
-    double start, stop, step;
+    zval *stop_zv;
+    zval *start_zv = NULL;
+    zval *step_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
 
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        Z_PARAM_DOUBLE(stop)
-    Z_PARAM_OPTIONAL
-        Z_PARAM_DOUBLE(start)
-        Z_PARAM_DOUBLE(step)
+    ZEND_PARSE_PARAMETERS_START(1, 5)
+        Z_PARAM_ZVAL(stop_zv)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(start_zv)
+        Z_PARAM_ZVAL(step_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (ZEND_NUM_ARGS() == 1) {
-        start = 0.0f;
-        step  = 1.0f;
-    }
-    if (ZEND_NUM_ARGS() == 2) {
-        step  = 1.0f;
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
     }
 
-    rtn = NDArray_Arange(start, stop, step);
-    ndarray_init_new_object(rtn, return_value);
+    /* Defaults are dtype-aware: `start = 0` and `step = 1` are encoded
+       in the same precision as the explicit args so the four dispatch
+       paths stay symmetric. */
+    NDArrayArangeSpec spec;
+    spec.kind = NDArray_ArangeKindFor(ndarrayDataType);
+
+    switch (spec.kind) {
+        case NDARRAY_ARANGE_KIND_FP128: {
+            spec.v.f128.start = NDARRAY_FP128_ZERO();
+            spec.v.f128.step  = NDARRAY_FP128_FROM_I64(1);
+            if (!arange_coerce_zval_fp128(stop_zv, "stop", &spec.v.f128.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_fp128(start_zv, "start", &spec.v.f128.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_fp128(step_zv,  "step",  &spec.v.f128.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_INT64: {
+            spec.v.i64.start = 0;
+            spec.v.i64.step  = 1;
+            if (!arange_coerce_zval_int64(stop_zv, "stop", &spec.v.i64.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_int64(start_zv, "start", &spec.v.i64.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_int64(step_zv,  "step",  &spec.v.i64.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_UINT64: {
+            spec.v.u64.start = 0;
+            spec.v.u64.step  = 1;
+            if (!arange_coerce_zval_uint64(stop_zv, "stop", &spec.v.u64.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_uint64(start_zv, "start", &spec.v.u64.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_uint64(step_zv,  "step",  &spec.v.u64.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_DOUBLE:
+        default: {
+            spec.kind = NDARRAY_ARANGE_KIND_DOUBLE;
+            spec.v.d.start = 0.0;
+            spec.v.d.step  = 1.0;
+            if (!arange_coerce_zval_double(stop_zv, "stop", &spec.v.d.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_double(start_zv, "start", &spec.v.d.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_double(step_zv,  "step",  &spec.v.d.step)) return;
+            break;
+        }
+    }
+
+    NDArray *rtn = NDArray_Arange(&spec, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* arange always returns at least a 1-D array (possibly empty), so the
+       0-D scalar collapse in `ndarray_init_new_object` never triggers;
+       use `ndarray_install_object` for uniformity with the other typed
+       factories. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
