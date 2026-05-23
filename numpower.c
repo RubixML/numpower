@@ -5662,26 +5662,78 @@ PHP_METHOD(NDArray, count) {
     RETURN_LONG(NDArray_SHAPE(ndarray)[0]);
 }
 
+/**
+ * @brief NDArray::current() — Iterator value at the current axis-0 index.
+ *
+ * Returns a dtype-correct PHP scalar for 1-D source (int for int8..int64 and
+ * uint8..uint32, string for uint64 / float128, float for the rest) and an
+ * NDArray sub-view for N-D source. For 0-D source — or when the iterator has
+ * advanced past the end — returns NULL, matching PHP's standard Iterator
+ * convention (PHP's foreach machinery checks valid() first, but direct calls
+ * are kept safe).
+ *
+ * The sub-view shares memory with $this (rtn->base = $this, refcount bumped)
+ * and is registered in the global buffer by ndarray_init_new_object, which
+ * also routes 0-D results through NDArray_ScalarToZval and frees them — so
+ * no buffer slot is leaked per iteration.
+ *
+ * @return NDArray|int|float|string|null Per the dtype/rank rules above.
+ */
 PHP_METHOD(NDArray, current) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
-    NDArray* result  = NDArrayIteratorPHP_GET(ndarray);
-    add_to_buffer(result);
+
+    /* Guard mirrors PHP's standard Iterator: when the cursor is past the end
+       (or the source has no axis 0), current() yields null instead of reading
+       off the buffer. PHP foreach normally checks valid() first, but a hand-
+       driven loop might not — this keeps that case safe. */
+    if (NDArrayIteratorPHP_ISDONE(ndarray)) {
+        RETURN_NULL();
+    }
+
+    NDArray* result = NDArrayIteratorPHP_GET(ndarray);
+    if (result == NULL) {
+        RETURN_NULL();
+    }
+    /* ndarray_init_new_object handles both wrappings: ndim > 0 registers the
+       view in the global buffer and exposes it as an NDArray PHP object;
+       ndim == 0 routes through NDArray_ScalarToZval (dtype-aware) and frees
+       the temporary view. Calling add_to_buffer() here would register a slot
+       that the ndim==0 path then frees via NDArray_FREE without clearing,
+       leaking one buffer entry per iteration on 1-D foreach. */
     ndarray_init_new_object(result, return_value);
 }
 
+/**
+ * @brief NDArray::key() — Iterator key (axis-0 index at the cursor).
+ *
+ * Returns 0 for 0-D source or an NDArray whose php_iterator was never
+ * installed (the scalar factory paths skip NDArrayIterator_INIT for ndim==0
+ * results). PHP foreach pairs this with valid() === false on those inputs
+ * so the loop body never observes the placeholder zero.
+ *
+ * @return int Current axis-0 index, or 0 when no axis 0 exists.
+ */
 PHP_METHOD(NDArray, key) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    if (NDArray_NDIM(ndarray) == 0 || ndarray->php_iterator == NULL) {
+        RETURN_LONG(0);
+    }
     RETURN_LONG(ndarray->php_iterator->currentIndex);
 }
 
+/**
+ * @brief NDArray::next() — Advance the PHP iterator by one axis-0 step.
+ *
+ * @return void
+ */
 PHP_METHOD(NDArray, next) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
@@ -5691,6 +5743,11 @@ PHP_METHOD(NDArray, next) {
     NDArrayIteratorPHP_NEXT(ndarray);
 }
 
+/**
+ * @brief NDArray::rewind() — Reset the PHP iterator to the first element.
+ *
+ * @return void
+ */
 PHP_METHOD(NDArray, rewind) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
@@ -5708,6 +5765,11 @@ PHP_METHOD(NDArray, offsetExists) {
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    /* 0-D source has no axis 0 — every offset is out of range. Reading
+       NDArray_SHAPE(ndarray)[0] on a 0-D array is undefined memory access. */
+    if (NDArray_NDIM(ndarray) == 0) {
+        RETURN_BOOL(0);
+    }
     if (offset < 0) {
         RETURN_BOOL(0);
         return;
@@ -5727,6 +5789,14 @@ PHP_METHOD(NDArray, offsetGet) {
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    /* 0-D scalars have no axis 0 to index, and their iterator was never
+       installed (scalar factories skip NDArrayIterator_INIT) — without this
+       guard, `$scalar[0]` would dereference NULL when setting
+       iterator->currentIndex below. */
+    if (NDArray_NDIM(ndarray) == 0) {
+        zend_throw_error(NULL, "Cannot index a 0-D NDArray (no axis 0)");
+        return;
+    }
     if (Z_TYPE_P(offset) == IS_LONG) {
         if (Z_LVAL_P(offset) < 0) {
             zend_throw_error(NULL, "Negative indexes are not implemented.");
@@ -5831,6 +5901,13 @@ PHP_METHOD(NDArray, offsetSet) {
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    /* 0-D scalars cannot be indexed (same reasoning as offsetGet). Guard
+       prevents reading shape[0] from a 0-D array and dereferencing the NULL
+       iterator the scalar factories leave behind. */
+    if (NDArray_NDIM(ndarray) == 0) {
+        zend_throw_error(NULL, "Cannot index a 0-D NDArray (no axis 0)");
+        return;
+    }
     if (Z_TYPE_P(offset) == IS_LONG || Z_TYPE_P(offset) == IS_DOUBLE) {
         if (zval_get_long(offset) < 0) {
             zend_throw_error(NULL, "Negative indexes are not implemented.");
@@ -5974,18 +6051,22 @@ PHP_METHOD(NDArray, offsetUnset) {
     zend_throw_error(NULL, "Cannot unset values of NDArrays");
 }
 
+/**
+ * @brief NDArray::valid() — Iterator validity at the current cursor.
+ *
+ * Returns false once the cursor has reached or passed axis-0 length, and
+ * unconditionally false for 0-D source (no axis 0 to enumerate). This is the
+ * gate PHP foreach uses before each current()/key().
+ *
+ * @return bool true if current()/key() would return a meaningful value.
+ */
 PHP_METHOD(NDArray, valid) {
-    int is_valid = 0, is_done = 0;
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
     NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
-    is_done = NDArrayIteratorPHP_ISDONE(ndarray);
-    if (is_done == 0) {
-        RETURN_BOOL(1);
-    }
-    RETURN_BOOL(0);
+    RETURN_BOOL(!NDArrayIteratorPHP_ISDONE(ndarray));
 }
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_ndarray_prod___toString, 0, 0, IS_STRING, 0)
@@ -6010,7 +6091,12 @@ static const zend_function_entry class_arithmetic_methods[] = {
 };
 
 static const zend_function_entry class_NumPower_methods[] = {
-    ZEND_ME(NumPower, __construct, arginfo_NumPower_construct, ZEND_ACC_PUBLIC)
+    /* Private + final: NumPower is a static factory only. `new NumPower()`
+       must fail with "Call to private NumPower::__construct() from global
+       scope" — there is no per-instance state for a constructor to set up.
+       Combined with ZEND_ACC_FINAL on the class entry, this also blocks any
+       subclass from re-exposing a public constructor. */
+    ZEND_ME(NumPower, __construct, arginfo_NumPower_construct, ZEND_ACC_PRIVATE | ZEND_ACC_FINAL)
 
     // EXTREMA
     ZEND_ME(NumPower, min, arginfo_ndarray_min, ZEND_ACC_PUBLIC | ZEND_ACC_STATIC)
@@ -6213,13 +6299,35 @@ static zend_class_entry *register_class_NDArray(zend_class_entry *class_entry_It
     return class_entry;
 }
 
+/**
+ * @brief Register the NumPower factory class.
+ *
+ * NumPower is a static factory: every operation it exposes is `ZEND_ACC_STATIC`
+ * (zeros, ones, array, matmul, …). It deliberately does NOT implement
+ * Iterator / Countable / ArrayAccess — those interfaces would force PHP to
+ * mark the class abstract (the methods are not provided), forbidding
+ * `new NumPower()` entirely. The empty `__construct` is retained for binary
+ * compatibility but stores no per-instance state.
+ *
+ * The unused `class_entry_Iterator / Countable / ArrayAccess` parameters are
+ * kept to preserve the call site in MINIT and the signature shared with
+ * register_class_NDArray.
+ *
+ * @return Registered class entry.
+ */
 static zend_class_entry *register_class_NumPower(zend_class_entry *class_entry_Iterator, zend_class_entry *class_entry_Countable, zend_class_entry *class_entry_ArrayAccess) {
+    (void)class_entry_Iterator;
+    (void)class_entry_Countable;
+    (void)class_entry_ArrayAccess;
     zend_class_entry ce, *class_entry;
     INIT_CLASS_ENTRY(ce, "NumPower", class_NumPower_methods);
     ndarray_objects_init(&ce);
     ce.create_object = ndarray_create_object;
     class_entry = zend_register_internal_class(&ce);
-    zend_class_implements(class_entry, 3, class_entry_Iterator, class_entry_Countable, class_entry_ArrayAccess);
+    /* Static-factory class: subclassing makes no sense and would inherit a
+       no-op constructor plus 130 unrelated statics. Mark final to match the
+       stub.php declaration and forbid `class X extends NumPower`. */
+    class_entry->ce_flags |= ZEND_ACC_FINAL;
 
     zval property_id_default_value;
     ZVAL_UNDEF(&property_id_default_value);

@@ -6,77 +6,182 @@
 #include "initializers.h"
 
 /**
- * @param iterator
+ * @brief Test whether @p iter has advanced past the last axis-0 element.
+ *
+ * 0-D arrays carry no axis 0, so they are treated as already done — this lets
+ * PHP foreach yield no values and never call current()/key() (which would
+ * otherwise dereference a non-existent shape[0]).
+ *
+ * @param[in] array Source NDArray.
+ * @param[in] iter  Iterator state to consult.
+ * @return 1 if @p iter has reached or passed the end, 0 otherwise.
  */
-int
-NDArrayIterator_ISDONE(NDArray* array) {
-    if (array->iterator->currentIndex >= NDArray_SHAPE(array)[0]) {
+static int
+iterator_is_done(const NDArray* array, const NDArrayIterator* iter) {
+    /* 0-D or missing iterator state -> nothing to walk, done up-front. */
+    if (array->ndim == 0 || iter == NULL) {
         return 1;
     }
-    return 0;
+    return iter->currentIndex >= NDArray_SHAPE(array)[0] ? 1 : 0;
 }
 
 /**
- * @param iterator
+ * @brief Produce a borrowed-data sub-view at @p iter's current axis-0 index.
+ *
+ * The returned NDArray aliases @p array's data buffer (rtn->data points into
+ * it, rtn->base holds @p array) and bumps @p array's refcount so the view
+ * stays valid while in use. For an N-D input the view is (N-1)-D; for a 1-D
+ * input the view is 0-D so the caller (NDArray_ScalarToZval) can read a
+ * single dtype-correct scalar. 0-D inputs have no element to return, so this
+ * function returns NULL and callers must guard with iterator_is_done() first.
+ *
+ * @param[in] array Source NDArray.
+ * @param[in] iter  Iterator state describing the offset along axis 0.
+ * @return Newly-allocated view NDArray, or NULL when @p array is 0-D.
  */
-void
-NDArrayIterator_NEXT(NDArray* array) {
-    array->iterator->currentIndex = array->iterator->currentIndex + 1;
-}
-
-/**
- * @param iterator
- */
-void
-NDArrayIterator_REWIND(NDArray* array) {
-    array->iterator->currentIndex = 0;
-}
-
-/**
- * @param iterator
- */
-int
-NDArrayIteratorPHP_ISDONE(NDArray* array) {
-    if (array->php_iterator->currentIndex >= NDArray_SHAPE(array)[0]) {
-        return 1;
+static NDArray*
+iterator_view_at(NDArray* array, const NDArrayIterator* iter) {
+    if (array->ndim == 0 || iter == NULL) {
+        return NULL;
     }
-    return 0;
-}
 
-/**
- * @param iterator
- */
-void
-NDArrayIteratorPHP_NEXT(NDArray* array) {
-    array->php_iterator->currentIndex = array->php_iterator->currentIndex + 1;
-}
-
-/**
- * @param iterator
- */
-void
-NDArrayIteratorPHP_REWIND(NDArray* array) {
-    array->php_iterator->currentIndex = 0;
-}
-
-/**
- * @param iterator
- */
-NDArray*
-NDArrayIteratorPHP_GET(NDArray* array) {
-    NDArray_ADDREF(array);
     int output_ndim = array->ndim - 1;
-    int* output_shape = emalloc(sizeof(int) * output_ndim);
-    memcpy(output_shape, NDArray_SHAPE(array) + 1, sizeof(int) * output_ndim);
-    NDArray* rtn = Create_NDArray(output_shape, output_ndim, NDArray_TYPE(array), NDArray_DEVICE(array));
+    /* Always allocate at least one int — emalloc(0) is technically valid but
+       the descendant Create_NDArray reads shape[0] before the ndim==0 guard
+       (where it overwrites to 1), and reading a zero-byte allocation trips
+       Valgrind / ASan. The slot is harmlessly unused for output_ndim == 0. */
+    int shape_slots = output_ndim > 0 ? output_ndim : 1;
+    int* output_shape = emalloc(sizeof(int) * (size_t)shape_slots);
+    if (output_ndim > 0) {
+        memcpy(output_shape, NDArray_SHAPE(array) + 1,
+               sizeof(int) * (size_t)output_ndim);
+    } else {
+        output_shape[0] = 0;
+    }
+
+    NDArray_ADDREF(array);
+    NDArray* rtn = Create_NDArray(output_shape, output_ndim,
+                                  NDArray_TYPE(array), NDArray_DEVICE(array));
     rtn->device = NDArray_DEVICE(array);
-    rtn->data = array->data + (array->php_iterator->currentIndex * NDArray_STRIDES(array)[0]);
+    rtn->data = array->data
+                + ((size_t)iter->currentIndex
+                   * (size_t)NDArray_STRIDES(array)[0]);
     rtn->base = array;
     return rtn;
 }
 
 /**
- * @param array
+ * @brief Internal-iterator ISDONE check. @see iterator_is_done.
+ *
+ * @param[in] array Source NDArray.
+ * @return 1 if the iterator has reached or passed the end, 0 otherwise.
+ */
+int
+NDArrayIterator_ISDONE(NDArray* array) {
+    return iterator_is_done(array, array->iterator);
+}
+
+/**
+ * @brief Advance the internal iterator by one axis-0 step.
+ *
+ * No-op on 0-D arrays (no axis 0 to walk) and on arrays whose iterator state
+ * was never installed — the 0-D scalar factory paths skip
+ * NDArrayIterator_INIT, so callers driving foreach on a freshly-built scalar
+ * would otherwise dereference an uninitialized pointer.
+ *
+ * @param[in,out] array NDArray whose internal iterator advances.
+ */
+void
+NDArrayIterator_NEXT(NDArray* array) {
+    if (array->ndim == 0 || array->iterator == NULL) {
+        return;
+    }
+    array->iterator->currentIndex++;
+}
+
+/**
+ * @brief Reset the internal iterator to the first axis-0 element.
+ *
+ * Same 0-D / NULL guard as NDArrayIterator_NEXT.
+ *
+ * @param[in,out] array NDArray whose internal iterator is reset.
+ */
+void
+NDArrayIterator_REWIND(NDArray* array) {
+    if (array->ndim == 0 || array->iterator == NULL) {
+        return;
+    }
+    array->iterator->currentIndex = 0;
+}
+
+/**
+ * @brief PHP-iterator ISDONE check (drives valid()). @see iterator_is_done.
+ *
+ * @param[in] array Source NDArray.
+ * @return 1 if the PHP iterator has reached or passed the end, 0 otherwise.
+ */
+int
+NDArrayIteratorPHP_ISDONE(NDArray* array) {
+    return iterator_is_done(array, array->php_iterator);
+}
+
+/**
+ * @brief Advance the PHP iterator by one axis-0 step (drives next()).
+ *
+ * No-op on 0-D arrays (no axis 0 to walk) and on arrays whose php_iterator
+ * was never installed — the 0-D scalar factory paths skip
+ * NDArrayIterator_INIT, so a foreach over a freshly-built scalar must not
+ * dereference an uninitialized pointer.
+ *
+ * @param[in,out] array NDArray whose PHP iterator advances.
+ */
+void
+NDArrayIteratorPHP_NEXT(NDArray* array) {
+    if (array->ndim == 0 || array->php_iterator == NULL) {
+        return;
+    }
+    array->php_iterator->currentIndex++;
+}
+
+/**
+ * @brief Reset the PHP iterator to the first axis-0 element (drives rewind()).
+ *
+ * Same 0-D / NULL guard as NDArrayIteratorPHP_NEXT.
+ *
+ * @param[in,out] array NDArray whose PHP iterator is reset.
+ */
+void
+NDArrayIteratorPHP_REWIND(NDArray* array) {
+    if (array->ndim == 0 || array->php_iterator == NULL) {
+        return;
+    }
+    array->php_iterator->currentIndex = 0;
+}
+
+/**
+ * @brief Borrow the axis-0 sub-view at the PHP iterator's current index.
+ *
+ * Used by current(). Callers must check NDArrayIteratorPHP_ISDONE() first —
+ * 0-D source arrays and out-of-range indices return NULL here rather than
+ * dereferencing missing shape metadata or reading off the buffer end.
+ *
+ * @param[in] array Source NDArray.
+ * @return Newly-allocated view NDArray (caller owns), or NULL for 0-D inputs.
+ */
+NDArray*
+NDArrayIteratorPHP_GET(NDArray* array) {
+    return iterator_view_at(array, array->php_iterator);
+}
+
+/**
+ * @brief Allocate and zero both iterator state structs on @p array.
+ *
+ * Called once per NDArray at construction time. The two iterators are
+ * independent — the PHP one is driven by foreach / current() / next(), while
+ * the internal one is used by C-level traversals (broadcast, axis reductions,
+ * etc.) — so a foreach in user code does not perturb internal algorithms.
+ *
+ * @param[in,out] array NDArray to initialize.
  */
 void
 NDArrayIterator_INIT(NDArray* array) {
@@ -89,29 +194,26 @@ NDArrayIterator_INIT(NDArray* array) {
 }
 
 /**
- * @param iterator
+ * @brief Borrow the axis-0 sub-view at the internal iterator's current index.
+ *
+ * Counterpart of NDArrayIteratorPHP_GET for C-internal traversals. The same
+ * NULL-on-0-D contract applies; callers must check NDArrayIterator_ISDONE().
+ *
+ * @param[in] array Source NDArray.
+ * @return Newly-allocated view NDArray (caller owns), or NULL for 0-D inputs.
  */
 NDArray*
 NDArrayIterator_GET(NDArray* array) {
-    NDArray_ADDREF(array);
-    int output_ndim = array->ndim - 1;
-    int* output_shape;
-
-    if (output_ndim >= 1) {
-         output_shape = emalloc(sizeof(int) * output_ndim);
-    } else {
-        output_shape = emalloc(sizeof(int));
-    }
-    memcpy(output_shape, NDArray_SHAPE(array) + 1, sizeof(int) * output_ndim);
-    NDArray* rtn = Create_NDArray(output_shape, output_ndim, NDArray_TYPE(array), NDArray_DEVICE(array));
-    rtn->device = NDArray_DEVICE(array);
-    rtn->data = array->data + (array->iterator->currentIndex * NDArray_STRIDES(array)[0]);
-    rtn->base = array;
-    return rtn;
+    return iterator_view_at(array, array->iterator);
 }
 
 /**
- * @param array
+ * @brief Release the iterator state structs owned by @p array.
+ *
+ * Called from NDArray_FREE on the final refcount drop, so the matching
+ * emalloc()s in NDArrayIterator_INIT are returned to the Zend MM.
+ *
+ * @param[in,out] array NDArray whose iterators are freed.
  */
 void
 NDArrayIterator_FREE(NDArray* array) {

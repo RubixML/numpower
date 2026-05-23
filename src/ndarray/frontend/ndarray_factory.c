@@ -278,7 +278,8 @@ NDArray *_createFloat32FromLongScalar(long scalar) {
     rtn->device = NDARRAY_DEVICE_CPU;
     rtn->strides = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base = NULL;
     rtn->refcount = 1;
     ((float *) rtn->data)[0] = (float) scalar;
@@ -308,7 +309,8 @@ NDArray *_createFloat32FromDoubleScalar(double scalar) {
     rtn->device = NDARRAY_DEVICE_CPU;
     rtn->strides = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base = NULL;
     rtn->refcount = 1;
     ((float *) rtn->data)[0] = (float) scalar;
@@ -338,7 +340,8 @@ NDArray *_createDouble64FromLongScalar(long scalar) {
     rtn->device = NDARRAY_DEVICE_CPU;
     rtn->strides = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base = NULL;
     rtn->refcount = 1;
     ((double *) rtn->data)[0] = (double) scalar;
@@ -368,7 +371,8 @@ NDArray *_createDouble64FromDoubleScalar(double scalar) {
     rtn->device = NDARRAY_DEVICE_CPU;
     rtn->strides = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base = NULL;
     rtn->refcount = 1;
     ((double *) rtn->data)[0] = scalar;
@@ -415,7 +419,8 @@ static NDArray *_createScalarFromDouble(double val, const char *type) {
     rtn->device     = NDARRAY_DEVICE_CPU;
     rtn->strides    = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator   = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base       = NULL;
     rtn->refcount   = 1;
     ndarray_set_from_double(type, rtn->data, 0, val);
@@ -439,7 +444,8 @@ static NDArray *_createScalarFromString(const char *str, const char *type) {
     rtn->device     = NDARRAY_DEVICE_CPU;
     rtn->strides    = emalloc(sizeof(int));
     rtn->dimensions = emalloc(sizeof(int));
-    rtn->iterator   = NULL;
+    rtn->iterator     = NULL;
+    rtn->php_iterator = NULL;
     rtn->base       = NULL;
     rtn->refcount   = 1;
     ndarray_set_from_string(type, rtn->data, 0, str);
