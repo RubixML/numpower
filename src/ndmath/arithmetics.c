@@ -164,7 +164,13 @@ ndarray_reduce_dispatch_gpu(NDArray *a, enum ndarray_reduce_op op) {
         return 0.0;
     }
     double seed = ndarray_reduce_identity(op);
-    cudaMemcpy(d_acc, &seed, sizeof(double), cudaMemcpyHostToDevice);
+    cudaError_t cerr = cudaMemcpy(d_acc, &seed, sizeof(double), cudaMemcpyHostToDevice);
+    if (cerr != cudaSuccess) {
+        vfree(d_acc);
+        zend_throw_error(NULL, "GPU reduction seed copy failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
 
     int dispatched = 0;
 #define DISPATCH_PAIR(DT_STR, TAG, T)                                              \
@@ -203,9 +209,25 @@ ndarray_reduce_dispatch_gpu(NDArray *a, enum ndarray_reduce_op op) {
                          "GPU reduction is not implemented for dtype \"%s\"", t);
         return 0.0;
     }
+    /* After the kernel launch, surface any configuration / launch error so
+       it doesn't silently appear inside an unrelated call later. The result
+       D2H below is a blocking cudaMemcpy on the same default stream, which
+       also synchronises and flushes any pending async error. */
+    cerr = cudaPeekAtLastError();
+    if (cerr != cudaSuccess) {
+        vfree(d_acc);
+        zend_throw_error(NULL, "GPU reduction kernel launch failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
     double result = seed;
-    cudaMemcpy(&result, d_acc, sizeof(double), cudaMemcpyDeviceToHost);
+    cerr = cudaMemcpy(&result, d_acc, sizeof(double), cudaMemcpyDeviceToHost);
     vfree(d_acc);
+    if (cerr != cudaSuccess) {
+        zend_throw_error(NULL, "GPU reduction result copy failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
     return result;
 }
 #endif /* HAVE_CUBLAS */

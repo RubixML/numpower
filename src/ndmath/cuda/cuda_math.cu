@@ -1652,6 +1652,14 @@ extern "C" {
             rc = -1; goto cleanup;                                                  \
         }                                                                           \
     } while (0)
+#define SVD_FAIL_VMALLOC(ptr) do {                                                  \
+        if ((ptr) == NULL) {                                                        \
+            fprintf(stderr,                                                         \
+                "cuda_svd_float: vmalloc failed at %s:%d\n",                        \
+                __FILE__, __LINE__);                                                \
+            rc = -1; goto cleanup;                                                  \
+        }                                                                           \
+    } while (0)
     int
     cuda_svd_float(float *d_A, float *d_U, float *d_V, float *d_S, int m, int n) {
         cusolverDnHandle_t cusolverH = NULL;
@@ -1670,27 +1678,39 @@ extern "C" {
         SVD_FAIL_CUSOLVER(cusolverDnXgesvdjSetTolerance(gesvdj_params, 1.e-7));
         SVD_FAIL_CUSOLVER(cusolverDnXgesvdjSetMaxSweeps(gesvdj_params, 15));
 
-        SVD_FAIL_CUDA(cudaMalloc((void **) &devInfo, sizeof(int)));
+        /* Route both device scratch buffers through vmalloc so NDARRAY_VCHECK=1
+           accounts for them — raw cudaMalloc was invisible to the counter. */
+        vmalloc((void **) &devInfo, sizeof(int));
+        SVD_FAIL_VMALLOC(devInfo);
         SVD_FAIL_CUSOLVER(cusolverDnSgesvdj_bufferSize(
                 cusolverH, CUSOLVER_EIG_MODE_VECTOR, 0,
                 m, n, d_A, m, d_S, d_U, m, d_V, n, &lwork, gesvdj_params));
 
-        SVD_FAIL_CUDA(cudaMalloc((void **) &d_work, sizeof(float) * (size_t) lwork));
+        vmalloc((void **) &d_work, sizeof(float) * (size_t) lwork);
+        SVD_FAIL_VMALLOC(d_work);
         SVD_FAIL_CUSOLVER(cusolverDnSgesvdj(
                 cusolverH, CUSOLVER_EIG_MODE_VECTOR, 0,
                 m, n, d_A, m, d_S, d_U, m, d_V, n,
                 d_work, lwork, devInfo, gesvdj_params));
 
-        SVD_FAIL_CUDA(cudaDeviceSynchronize());
+        /* cusolverDnSgesvdj runs on `stream` (cudaStreamNonBlocking), which
+           is unordered with the caller's default stream. The output buffers
+           d_U / d_V / d_S are read on the default stream after we return,
+           so we need a barrier here. cudaStreamSynchronize is the targeted
+           form (avoids syncing every other stream the user may have spun
+           up); kept instead of the broader cudaDeviceSynchronize that was
+           dropped elsewhere in the cuda-sync-cleanup pass. */
+        SVD_FAIL_CUDA(cudaStreamSynchronize(stream));
 
     cleanup:
-        if (d_work)        cudaFree(d_work);
-        if (devInfo)       cudaFree(devInfo);
+        if (d_work)        vfree(d_work);
+        if (devInfo)       vfree(devInfo);
         if (gesvdj_params) cusolverDnDestroyGesvdjInfo(gesvdj_params);
         if (cusolverH)     cusolverDnDestroy(cusolverH);
         if (stream)        cudaStreamDestroy(stream);
         return rc;
     }
+#undef SVD_FAIL_VMALLOC
 #undef SVD_FAIL_CUDA
 #undef SVD_FAIL_CUSOLVER
 
@@ -1734,16 +1754,20 @@ extern "C" {
 
     int
     cuda_equal_float(int nblocks, float *a, float *b, int nelements) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
+        int blockSize = 256;  /* threads per block — typical choice */
         int result = 1;
-        int *d_equal;
-        // Allocate GPU memory for the result
-        cudaMalloc(&d_equal, sizeof(int));
+        int *d_equal = NULL;
+        /* Allocate the GPU scratch slot through vmalloc so NDARRAY_VCHECK=1
+           sees it; the previous raw cudaMalloc was invisible to the counter. */
+        vmalloc((void **) &d_equal, sizeof(int));
+        if (d_equal == NULL) {
+            return 0;
+        }
         cudaMemcpy(d_equal, &result, sizeof(int), cudaMemcpyHostToDevice);
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
+        int numBlocks = (nblocks + blockSize - 1) / blockSize;
         array_equals_float<<<numBlocks, blockSize>>>(a, b, d_equal, nelements);
         cudaMemcpy(&result, d_equal, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaFree(d_equal);
+        vfree(d_equal);
         return result;
     }
 
@@ -2096,12 +2120,16 @@ extern "C" {
         const int threadsPerBlock = 256;
         int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
 
-        float* d_medians;
-        cudaMalloc((void**)&d_medians, blocksPerGrid * sizeof(float));
+        /* vmalloc — tracked by NDARRAY_VCHECK=1; matched vfree at exit. */
+        float *d_medians = NULL;
+        vmalloc((void **) &d_medians, (size_t) blocksPerGrid * sizeof(float));
+        if (d_medians == NULL) {
+            return 0.0f;
+        }
 
         findMedianKernelFloat<<<blocksPerGrid, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(a_array, n, d_medians);
 
-        // Perform a final reduction to find the overall median
+        /* Perform a final reduction to find the overall median. */
         while (blocksPerGrid > 1)
         {
             int newBlocks = (blocksPerGrid + threadsPerBlock - 1) / threadsPerBlock;
@@ -2111,9 +2139,7 @@ extern "C" {
 
         float median;
         cudaMemcpy(&median, d_medians, sizeof(float), cudaMemcpyDeviceToHost);
-
-        cudaFree(d_medians);
-
+        vfree(d_medians);
         return median;
     }
 
