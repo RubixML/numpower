@@ -19,7 +19,17 @@
 #endif
 
 /**
- * Dump NDArray
+ * @brief Print a developer-facing summary of every field on @p array.
+ *
+ * Used by `NDArray::dump()` from PHP. Walks the descriptor, dimensions
+ * and strides, and includes the iterator cursor when one is installed.
+ * 0-D scalars built via the per-dtype scalar factories
+ * (`_createScalarFromDouble` and friends) leave `iterator` and
+ * `php_iterator` as `NULL` by design — there is no axis to iterate. We
+ * guard the iterator deref so dumping such a scalar (e.g. one created
+ * with `new NDArray(1, 'float128')`) does not segfault.
+ *
+ * @param[in] array NDArray to print.
  */
 void
 NDArray_Dump(NDArray* array) {
@@ -48,7 +58,11 @@ NDArray_Dump(NDArray* array) {
     php_printf("NDArray.descriptor.elsize\t%d\n", array->descriptor->elsize);
     php_printf("NDArray.descriptor.numElements\t%ld\n", array->descriptor->numElements);
     php_printf("NDArray.descriptor.type\t\t%s\n", array->descriptor->type);
-    php_printf("NDArray.iterator.current_index\t%d", array->iterator->currentIndex);
+    if (array->iterator != NULL) {
+        php_printf("NDArray.iterator.current_index\t%d", array->iterator->currentIndex);
+    } else {
+        php_printf("NDArray.iterator.current_index\t(none)");
+    }
     php_printf("\n=================================================\n");
 }
 
@@ -493,54 +507,78 @@ char *print_matrix_generic(
     return rtn;
 }
 
+/**
+ * @brief Print a human-readable summary of every visible CUDA device.
+ *
+ * Lists compute capability, memory, and grid/block limits for each
+ * device. When the extension is built without CUDA support, prints a
+ * single notice line so portable scripts that probe device availability
+ * still receive useful output. All output is routed through
+ * `php_printf` so PHP output buffering and non-CLI SAPIs receive it
+ * correctly.
+ *
+ * Errors retrieving per-device properties are reported inline; the
+ * function never raises a PHP exception (it is debug output).
+ */
 void
-NDArray_DumpDevices() {
+NDArray_DumpDevices(void) {
 #ifdef HAVE_CUBLAS
-    int deviceCount;
+    int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
 
+    php_printf("\n==============================================================================\n");
     if (err != cudaSuccess) {
-        printf("Failed to retrieve device count: %s\n", cudaGetErrorString(err));
+        php_printf("Failed to retrieve device count: %s\n", cudaGetErrorString(err));
+        php_printf("==============================================================================\n");
         return;
     }
-
-    printf("\n==============================================================================\n");
-    printf("Number of CUDA devices: %d\n", deviceCount);
+    php_printf("Number of CUDA devices: %d\n", deviceCount);
     for (int i = 0; i < deviceCount; ++i) {
         struct cudaDeviceProp deviceProp;
         err = cudaGetDeviceProperties(&deviceProp, i);
 
+        php_printf("\n---------------------------------------------------------------------------\n");
         if (err != cudaSuccess) {
-            printf("Failed to get properties for device %d: %s\n", i, cudaGetErrorString(err));
-            return;
+            php_printf("Device %d: failed to read properties: %s\n", i, cudaGetErrorString(err));
+            php_printf("---------------------------------------------------------------------------\n");
+            continue;
         }
-        printf("\n---------------------------------------------------------------------------");
-        printf("\nDevice %d: %s\n", i, deviceProp.name);
-        printf("  Compute capability: %d.%d\n", deviceProp.major, deviceProp.minor);
-        printf("  Total global memory: %zu bytes\n", deviceProp.totalGlobalMem);
-        printf("  Max threads per block: %d\n", deviceProp.maxThreadsPerBlock);
-        printf("  Warp size: %d\n", deviceProp.warpSize);
-        printf("  Multi processor count: %d\n", deviceProp.multiProcessorCount);
-        printf("  Max threads in X-dimension of block: %d\n", deviceProp.maxThreadsDim[0]);
-        printf("  Max threads in Y-dimension of block: %d\n", deviceProp.maxThreadsDim[1]);
-        printf("  Max threads in Z-dimension of block: %d\n", deviceProp.maxThreadsDim[2]);
-        printf("  Max grid size in X-dimension: %d\n", deviceProp.maxGridSize[0]);
-        printf("  Max grid size in Y-dimension: %d\n", deviceProp.maxGridSize[1]);
-        printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
-        printf("---------------------------------------------------------------------------\n");
+        php_printf("Device %d: %s\n", i, deviceProp.name);
+        php_printf("  Compute capability: %d.%d\n", deviceProp.major, deviceProp.minor);
+        php_printf("  Total global memory: %zu bytes\n", deviceProp.totalGlobalMem);
+        php_printf("  Max threads per block: %d\n", deviceProp.maxThreadsPerBlock);
+        php_printf("  Warp size: %d\n", deviceProp.warpSize);
+        php_printf("  Multi processor count: %d\n", deviceProp.multiProcessorCount);
+        php_printf("  Max threads in X-dimension of block: %d\n", deviceProp.maxThreadsDim[0]);
+        php_printf("  Max threads in Y-dimension of block: %d\n", deviceProp.maxThreadsDim[1]);
+        php_printf("  Max threads in Z-dimension of block: %d\n", deviceProp.maxThreadsDim[2]);
+        php_printf("  Max grid size in X-dimension: %d\n", deviceProp.maxGridSize[0]);
+        php_printf("  Max grid size in Y-dimension: %d\n", deviceProp.maxGridSize[1]);
+        php_printf("  Max grid size in Z-dimension: %d\n", deviceProp.maxGridSize[2]);
+        php_printf("---------------------------------------------------------------------------\n");
     }
-    printf("\n==============================================================================\n");
+    php_printf("==============================================================================\n");
 #else
     php_printf("\nNo GPU devices available. CUDA not enabled.\n");
 #endif
 }
 
 /**
- * @param a
+ * @brief Print the internal iterator's cursor for @p a.
+ *
+ * Same 0-D guard as `NDArray_Dump` — 0-D scalars created via the
+ * dtype-specific scalar factories carry `iterator == NULL` because
+ * there is no axis to iterate; dereferencing it would segfault.
+ *
+ * @param[in] a NDArray whose internal iterator state is printed.
  */
 void
 NDArrayIterator_DUMP(NDArray *a) {
-    printf("\n====================================\n");
-    printf("iterator.current_index:\t\t%d",a->iterator->currentIndex);
-    printf("\n====================================\n");
+    php_printf("\n====================================\n");
+    if (a->iterator != NULL) {
+        php_printf("iterator.current_index:\t\t%d", a->iterator->currentIndex);
+    } else {
+        php_printf("iterator.current_index:\t\t(none)");
+    }
+    php_printf("\n====================================\n");
 }

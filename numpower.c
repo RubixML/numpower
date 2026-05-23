@@ -233,6 +233,38 @@ void ndarray_init_new_object(NDArray* array, zval* return_value) {
     }
 }
 
+/**
+ * @brief Install @p array as a freshly-built `NDArray` PHP object in
+ *        @p return_value, regardless of ndim.
+ *
+ * The general-purpose `ndarray_init_new_object()` collapses 0-D results
+ * into a primitive scalar zval (`int`/`float`/`string` per the dtype)
+ * for ergonomic reasons — `NumPower::array(5.0)` returns a PHP float,
+ * not an `NDArray(0-D)`. Device-transfer methods (`->gpu()` / `->cpu()`)
+ * are different: callers chain them (`$a = (new NDArray(...))->gpu();`)
+ * and then expect `$a` to behave like an NDArray (clone it, call other
+ * methods on it). Collapsing to a primitive breaks that contract and
+ * also breaks the rule that operations on a GPU-resident NDArray must
+ * stay on GPU (a primitive lives entirely on the host).
+ *
+ * This helper always builds an NDArray object — both ndim > 0 and 0-D
+ * paths produce an `NDArray` zval whose UUID property points at the
+ * buffer slot.
+ *
+ * @param[in]  array        Freshly-built NDArray (ownership transfers to
+ *                          the buffer slot).
+ * @param[out] return_value zval to populate.
+ */
+static void ndarray_install_object(NDArray *array, zval *return_value) {
+    if (array == NULL) {
+        RETURN_THROWS();
+        return;
+    }
+    add_to_buffer(array);
+    object_init_ex(return_value, phpsci_ce_NDArray);
+    ZVAL_LONG(OBJ_PROP_NUM(Z_OBJ_P(return_value), 0), NDArray_UUID(array));
+}
+
 ZEND_BEGIN_ARG_INFO(arginfo_gpu, 0)
 ZEND_END_ARG_INFO();
 PHP_METHOD(NDArray, gpu) {
@@ -250,23 +282,15 @@ PHP_METHOD(NDArray, gpu) {
     }
 
     /* Already on the GPU: no allocation, no cudaMemcpy, no buffer copy.
-       For ndim > 0 the legacy API returns an NDArray, so we hand $this
-       back unchanged. For ndim == 0 the legacy API collapses the array
-       into a scalar zval; we read that scalar directly from the existing
-       array (which is a single DeviceToHost word and is unavoidable —
-       PHP needs the value — but no buffer is duplicated). */
+       Return $this unchanged regardless of ndim — see
+       ndarray_install_object() for why 0-D must stay an NDArray. */
     if (NDArray_DEVICE(ndarray) == NDARRAY_DEVICE_GPU) {
-        if (NDArray_NDIM(ndarray) > 0) {
-            ZVAL_COPY(return_value, obj_zval);
-        } else {
-            NDArray_ScalarToZval(ndarray, return_value);
-        }
+        ZVAL_COPY(return_value, obj_zval);
         return;
     }
 
     rtn = NDArray_ToGPU(ndarray);
-
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_install_object(rtn, return_value);
 #else
     zend_throw_error(NULL, "No GPU device available or CUDA not enabled");
     RETURN_NULL();
@@ -823,11 +847,56 @@ static void ndarray_destructor(zend_object* object) {
     zend_object_std_dtor(object); // всегда вызывается
 }
 
+/**
+ * @brief `clone $ndarray` handler — deep-copy the underlying buffer and
+ *        attach our custom operator/iterator handlers to the new object.
+ *
+ * The default `zend_objects_clone_obj` allocates the destination through
+ * a path that may not invoke `ndarray_create_object`, so the cloned
+ * object can end up with `&std_object_handlers` instead of
+ * `&ndarray_object_handlers`. That makes `$clone + 2` throw
+ * `Unsupported operand types: NDArray + int` because the do_operation
+ * slot is NULL on the clone. We allocate ourselves to guarantee the
+ * right handler table.
+ *
+ * Beyond fixing the handler, we also do a real device-aware deep copy
+ * via `NDArray_Copy()` (CPU buffers via `memcpy`, GPU buffers via
+ * `cudaMemcpy DeviceToDevice`). Without the deep copy the clone's `id`
+ * property would still point at the original's buffer slot, so a later
+ * `$clone->cpu()` or `$clone->gpu()` would also move the source.
+ *
+ * @param[in] old_object Source NDArray PHP object.
+ * @return Freshly-allocated cloned `NDArray` PHP object with a private
+ *         deep copy of the buffer on the same device as the source.
+ */
+static zend_object *ndarray_clone_obj(zend_object *old_object) {
+    NDArrayObject *intern = (NDArrayObject *) zend_object_alloc(
+        sizeof(NDArrayObject), old_object->ce);
+    zend_object_std_init(&intern->std, old_object->ce);
+    object_properties_init(&intern->std, old_object->ce);
+    intern->std.handlers = &ndarray_object_handlers;
+
+    zval *src_id = OBJ_PROP_NUM(old_object, 0);
+    if (Z_TYPE_P(src_id) == IS_LONG) {
+        NDArray *src = buffer_get((int) Z_LVAL_P(src_id));
+        if (src != NULL) {
+            NDArray *copy = NDArray_Copy(src, NDArray_DEVICE(src));
+            if (copy != NULL) {
+                add_to_buffer(copy);
+                ZVAL_LONG(OBJ_PROP_NUM(&intern->std, 0), NDArray_UUID(copy));
+            }
+        }
+    }
+
+    return &intern->std;
+}
+
 static void ndarray_objects_init(zend_class_entry *class_type) {
     memcpy(&ndarray_object_handlers, &std_object_handlers, sizeof(zend_object_handlers));
     ndarray_object_handlers.compare = ndarray_objects_compare;
     ndarray_object_handlers.do_operation = ndarray_do_operation;
     ndarray_object_handlers.free_obj = ndarray_destructor;
+    ndarray_object_handlers.clone_obj = ndarray_clone_obj;
 }
 
 static void numpower_objects_init(zend_class_entry *class_type) {
@@ -1034,18 +1103,15 @@ PHP_METHOD(NDArray, cpu) {
     if (array == NULL) {
         return;
     }
-    /* Already on the CPU: no allocation, no copy. See PHP_METHOD(NDArray, gpu)
-       for the rationale around the ndim == 0 branch. */
+    /* Already on the CPU: no allocation, no copy. Return $this regardless
+       of ndim — see ndarray_install_object() for why 0-D arrays must stay
+       NDArray objects rather than collapsing to a primitive. */
     if (NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
-        if (NDArray_NDIM(array) > 0) {
-            ZVAL_COPY(return_value, obj_zval);
-        } else {
-            NDArray_ScalarToZval(array, return_value);
-        }
+        ZVAL_COPY(return_value, obj_zval);
         return;
     }
     rtn = NDArray_ToCPU(array);
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_install_object(rtn, return_value);
 }
 
 ZEND_BEGIN_ARG_INFO(arginfo_is_gpu, 0)
@@ -1080,6 +1146,14 @@ PHP_METHOD(NDArray, dump) {
 
 ZEND_BEGIN_ARG_INFO(arginfo_dump_devices, 0)
 ZEND_END_ARG_INFO();
+/**
+ * @brief NumPower::dumpDevices() — list available CUDA devices.
+ *
+ * Print information about every available CUDA device to PHP's stdout
+ * stream. When the extension is built without CUDA, prints a single line
+ * stating that no GPU devices are available. Output is routed through
+ * php_printf so that PHP output buffering and SAPIs other than CLI work.
+ */
 PHP_METHOD(NumPower, dumpDevices) {
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
@@ -1118,25 +1192,58 @@ PHP_METHOD(NumPower, save) {
 ZEND_BEGIN_ARG_INFO(arginfo_setdevice, 0)
 ZEND_ARG_INFO(0, deviceId)
 ZEND_END_ARG_INFO();
+/**
+ * @brief NumPower::setDevice($deviceId) — switch the active CUDA device.
+ *
+ * Thin wrapper around `cudaSetDevice()` that adds range checking and
+ * CUDA-runtime error reporting. The device id must be in
+ * `[0, deviceCount)`; negative or out-of-range ids are rejected before
+ * touching the runtime. When CUDA is not compiled in, the call throws
+ * so that the stub's `@throws \Error` contract is honored.
+ *
+ * In ZTS builds the selection is per-thread (CUDA semantics), so it
+ * only applies to the current PHP request's worker thread.
+ *
+ * @param[in] deviceId Zero-based CUDA device id (PHP `int`).
+ *
+ * @throws \Error If CUDA is not compiled in, the runtime is unavailable,
+ *                no devices are visible, the id is out of range, or
+ *                `cudaSetDevice` fails.
+ */
 PHP_METHOD(NumPower, setDevice) {
-    int numDevices;
-    long deviceId;
+    zend_long deviceId;
     ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_LONG(deviceId)
+        Z_PARAM_LONG(deviceId)
     ZEND_PARSE_PARAMETERS_END();
 #ifdef HAVE_CUBLAS
-    // Get the number of available CUDA devices
-    cudaError_t cudaError = cudaGetDeviceCount(&numDevices);
-
-    if (cudaError != cudaSuccess) {
-        zend_throw_error(NULL, "Error getting the number of CUDA devices.\n");
+    int numDevices = 0;
+    cudaError_t err = cudaGetDeviceCount(&numDevices);
+    if (err != cudaSuccess) {
+        zend_throw_error(NULL, "Error getting the number of CUDA devices: %s",
+                         cudaGetErrorString(err));
         return;
     }
-    if (deviceId >= 0 && deviceId > (numDevices - 1)) {
-        zend_throw_error(NULL, "Device %d does not exist.\n", (int)deviceId);
+    if (numDevices <= 0) {
+        zend_throw_error(NULL, "No CUDA devices are visible to the runtime");
         return;
     }
-    cudaSetDevice(deviceId);
+    if (deviceId < 0 || deviceId >= (zend_long)numDevices) {
+        zend_throw_error(NULL,
+                         "Device " ZEND_LONG_FMT " does not exist "
+                         "(valid range: 0.." ZEND_LONG_FMT ")",
+                         deviceId, (zend_long)(numDevices - 1));
+        return;
+    }
+    err = cudaSetDevice((int)deviceId);
+    if (err != cudaSuccess) {
+        zend_throw_error(NULL, "cudaSetDevice failed for device " ZEND_LONG_FMT ": %s",
+                         deviceId, cudaGetErrorString(err));
+        return;
+    }
+#else
+    (void)deviceId;
+    zend_throw_error(NULL, "No GPU device available or CUDA not enabled");
+    return;
 #endif
 }
 
@@ -3228,7 +3335,9 @@ PHP_METHOD(NumPower, mean) {
 
     if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
         if (ZEND_NUM_ARGS() == 1) {
-            RETURN_DOUBLE((NDArray_Sum_Float(nda) / NDArray_NUMELEMENTS(nda)));
+            double v = NDArray_Reduce_Mean(nda);
+            CHECK_INPUT_AND_FREE(array, nda);
+            RETURN_DOUBLE(v);
         } else {
             NDArray *sum = reduce(nda, &i_axis, NDArray_Add_Float);
             if (sum == NULL) {
@@ -3243,7 +3352,9 @@ PHP_METHOD(NumPower, mean) {
     } else {
 #ifdef HAVE_CUBLAS
         if (ZEND_NUM_ARGS() == 1) {
-            RETURN_DOUBLE((NDArray_Sum_Float(nda) / NDArray_NUMELEMENTS(nda)));
+            double v = NDArray_Reduce_Mean(nda);
+            CHECK_INPUT_AND_FREE(array, nda);
+            RETURN_DOUBLE(v);
         } else {
             rtn = single_reduce(nda, &i_axis, NDArray_Mean_Float);
         }
@@ -4571,15 +4682,35 @@ ZEND_END_ARG_INFO()
     ndarray_init_new_object(rtn, return_value);
 }
 
-/**
- * NumPower::syncDevice
- */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_devicesync, 0)
 ZEND_END_ARG_INFO()
+/**
+ * @brief NumPower::syncDevice() — block until queued GPU work finishes.
+ *
+ * Block until every CUDA kernel and asynchronous copy queued on the
+ * current device has finished. This is the PHP-level entry point that
+ * userland code can call before reading GPU results in a tight loop or
+ * before taking a wall-clock benchmark; it mirrors PyTorch's
+ * `torch.cuda.synchronize()`.
+ *
+ * When the extension is built without CUDA the call is a no-op so that
+ * portable scripts can invoke it unconditionally. CUDA runtime errors
+ * (sticky errors from earlier asynchronous launches included) surface
+ * here as a PHP `\Error`.
+ *
+ * @throws \Error If `cudaDeviceSynchronize` reports a runtime error.
+ */
 PHP_METHOD(NumPower, syncDevice) {
+    ZEND_PARSE_PARAMETERS_START(0, 0)
+    ZEND_PARSE_PARAMETERS_END();
 #ifdef HAVE_CUBLAS
-    cudaDeviceSynchronize();
-#endif    
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        zend_throw_error(NULL, "cudaDeviceSynchronize failed: %s",
+                         cudaGetErrorString(err));
+        return;
+    }
+#endif
 }
 
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_rc, 0)
@@ -5295,7 +5426,7 @@ PHP_METHOD(NumPower, sum) {
     if (ZEND_NUM_ARGS() == 2) {
         rtn = reduce(nda, &axis_i, NDArray_Add_Float);
     } else {
-        double value = NDArray_Sum_Float(nda);
+        double value = NDArray_Reduce_Sum(nda);
         CHECK_INPUT_AND_FREE(a, nda);
         RETURN_DOUBLE(value);
         return;
@@ -5330,7 +5461,7 @@ PHP_METHOD(NumPower, min) {
         axis_i = (int)axis;
         rtn = single_reduce(nda, &axis_i, NDArray_Min);
     } else {
-        value = NDArray_Min(nda);
+        value = NDArray_Reduce_Min(nda);
         CHECK_INPUT_AND_FREE(a, nda);
         RETURN_DOUBLE(value);
         return;
@@ -5369,7 +5500,7 @@ PHP_METHOD(NumPower, max) {
         axis_i = (int)axis;
         rtn = NDArray_MaxAxis(nda, axis_i);
     } else {
-        value = NDArray_Max(nda);
+        value = NDArray_Reduce_Max(nda);
         CHECK_INPUT_AND_FREE(a, nda);
         RETURN_DOUBLE(value);
         return;
@@ -5401,9 +5532,9 @@ PHP_METHOD(NumPower, prod) {
     if (ZEND_NUM_ARGS() == 2) {
         rtn = reduce(nda, &axis_i, NDArray_Multiply_Float);
     } else {
-        value = NDArray_Float_Prod(nda);
+        double pvalue = NDArray_Reduce_Prod(nda);
         CHECK_INPUT_AND_FREE(a, nda);
-        RETURN_DOUBLE(value);
+        RETURN_DOUBLE(pvalue);
         return;
     }
     CHECK_INPUT_AND_FREE(a, nda);

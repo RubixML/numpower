@@ -172,7 +172,6 @@ NDArray_SVD(NDArray *target) {
         vmalloc((void**)&Vf, sizeof(float) * NDArray_SHAPE(target)[1] * NDArray_SHAPE(target)[1]);
         vmalloc((void**)&output_data, sizeof(float) * NDArray_NUMELEMENTS(target));
         cudaMemcpy(output_data, NDArray_F32DATA(target_ptr), sizeof(float) * NDArray_NUMELEMENTS(target), cudaMemcpyDeviceToDevice);
-        cudaDeviceSynchronize();
 #else
         return NULL;
 #endif

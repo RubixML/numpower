@@ -1,31 +1,46 @@
 --TEST--
-NDArray::gpu()/cpu() on a 0-dim array still returns a scalar correctly
+NDArray::gpu()/cpu() on a 0-D array returns an NDArray on the target device
 --SKIPIF--
 <?php
 try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
 ?>
 --FILE--
 <?php
-/* 0-dim NDArrays are a corner case: the legacy API collapses them into a
-   PHP scalar at the gpu()/cpu() boundary. This test guards that contract
-   so the same-device no-op refactor doesn't regress it. */
+/* Earlier behavior collapsed 0-D arrays into a PHP scalar on the
+   gpu()/cpu() boundary — that broke `clone $a` after
+   `$a = (new NDArray(1, 'float128'))->gpu()` because `$a` ended up as
+   a string, not an object, and also violated the rule that GPU-resident
+   data must stay on GPU. Both methods now always return an NDArray
+   object on the requested device, even for 0-D inputs. */
 
-/* CPU 0-dim → cpu(): scalar comes back, no exception. */
+/* CPU 0-D → cpu(): same object, still 0-D, still on CPU. */
 $a   = new NDArray(3.14, 'float64');
 $out = $a->cpu();
-$ok1 = is_float($out) && abs($out - 3.14) < 1e-9;
+$ok1 = $out instanceof NDArray
+    && $out->isGPU() === 0
+    && count($out->shape()) === 0;
 
-/* CPU 0-dim → gpu(): real CPU→GPU transfer; the value materialises back
-   into a PHP scalar via ndarray_init_new_object. */
+/* CPU 0-D → gpu(): new NDArray on GPU, still 0-D. */
 $b   = new NDArray(2.5, 'float32');
 $g   = $b->gpu();
-$ok2 = is_float($g) && abs($g - 2.5) < 1e-6;
+$ok2 = $g instanceof NDArray
+    && $g->isGPU() === 1
+    && count($g->shape()) === 0;
 
-/* Float32 path. */
+/* Chained: (new NDArray(...))->gpu() — used to return a primitive,
+   which broke `clone`. Verify both that it returns an NDArray and
+   that clone works on the result. */
 $c   = (new NDArray(7.0, 'float32'))->gpu();
-$ok3 = is_float($c) && abs($c - 7.0) < 1e-6;
+$ok3 = $c instanceof NDArray && $c->isGPU() === 1;
+$cc  = clone $c;
+$ok4 = $cc instanceof NDArray && $cc->isGPU() === 1;
 
-echo ($ok1 && $ok2 && $ok3) ? "OK\n" : "FAIL\n";
+/* Round-trip CPU→GPU→CPU: value preserved. */
+$d = new NDArray(42.5, 'float32');
+$rt = $d->gpu()->cpu();
+$ok5 = $rt instanceof NDArray && $rt->isGPU() === 0;
+
+echo ($ok1 && $ok2 && $ok3 && $ok4 && $ok5) ? "OK\n" : "FAIL\n";
 ?>
 --EXPECT--
 OK
