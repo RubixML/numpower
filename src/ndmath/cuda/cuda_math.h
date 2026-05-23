@@ -268,6 +268,57 @@ int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
                       const int       *host_shape,
                       const long long *host_strides_b);
 
+/* ── Typed reductions ───────────────────────────────────────────────────────
+ * Each function consumes a GPU-resident source buffer of @p n elements and
+ * an already-seeded one-double accumulator on GPU. The caller must:
+ *   1. vmalloc a double slot on GPU.
+ *   2. cudaMemcpy the identity value into that slot
+ *      (0 for sum, 1 for prod, +DBL_MAX for min, -DBL_MAX for max).
+ *   3. Launch the kernel via the wrapper below.
+ *   4. cudaMemcpy the result back to host and vfree the slot.
+ *
+ * The kernels are single-pass atomic-only — no shared memory, no warp
+ * shuffles — so they work for any block / grid configuration without UB.
+ * Performance trade-off: atomic contention for very large n is bounded
+ * by the device's L2 / atomic throughput, which is more than sufficient
+ * for typical PHP-driven workloads.
+ *
+ * Dtype tags map 1:1 to the NDARRAY_TYPE_* strings:
+ *   i8..i64, u8..u64 = native integers (atomicAdd-castable to double)
+ *   f16   = __half  (widened via __half2float in the kernel)
+ *   f32   = float
+ *   f64   = double
+ *   fp4   = 4-bit float in lower nibble of uint8 (decoded via dev_fp4_to_float)
+ *   fp8   = E4M3 in uint8 (decoded via dev_fp8_to_float)
+ *   dd    = double-double interleaved (hi, lo) — GPU representation of fp128
+ */
+#define DECL_REDUCE_TYPED(OP, T, TAG)                                                \
+    void cuda_reduce_##OP##_##TAG(const T *a, double *result, int n);
+
+#define DECL_REDUCE_BUNDLE(OP)                                                       \
+    DECL_REDUCE_TYPED(OP, int8_t,   i8)                                              \
+    DECL_REDUCE_TYPED(OP, uint8_t,  u8)                                              \
+    DECL_REDUCE_TYPED(OP, int16_t,  i16)                                             \
+    DECL_REDUCE_TYPED(OP, uint16_t, u16)                                             \
+    DECL_REDUCE_TYPED(OP, int32_t,  i32)                                             \
+    DECL_REDUCE_TYPED(OP, uint32_t, u32)                                             \
+    DECL_REDUCE_TYPED(OP, int64_t,  i64)                                             \
+    DECL_REDUCE_TYPED(OP, uint64_t, u64)                                             \
+    DECL_REDUCE_TYPED(OP, float,    f32)                                             \
+    DECL_REDUCE_TYPED(OP, double,   f64)                                             \
+    DECL_REDUCE_TYPED(OP, uint16_t, f16)                                             \
+    DECL_REDUCE_TYPED(OP, uint8_t,  fp4)                                             \
+    DECL_REDUCE_TYPED(OP, uint8_t,  fp8)                                             \
+    DECL_REDUCE_TYPED(OP, double,   dd)
+
+DECL_REDUCE_BUNDLE(sum)
+DECL_REDUCE_BUNDLE(prod)
+DECL_REDUCE_BUNDLE(min)
+DECL_REDUCE_BUNDLE(max)
+
+#undef DECL_REDUCE_BUNDLE
+#undef DECL_REDUCE_TYPED
+
 #ifdef __cplusplus
 }
 #endif

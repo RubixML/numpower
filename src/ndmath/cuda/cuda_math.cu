@@ -51,7 +51,6 @@ void cuda_truncated_normal(float* h_data, int size, double loc, double scale) {
 
     // Вызов ядра CUDA
     truncatedNormalKernel<<<blocksPerGrid, threadsPerBlock>>>(h_data, size, loc, scale, 1234ULL);
-    cudaDeviceSynchronize();
 }
 
 // CUDA kernel to calculate the median of a float* array
@@ -663,13 +662,6 @@ pow_float_kernel(float *a, float *b, float *result, int size) {
     }
 }
 
-__device__ float warpReduceMax(float val) {
-    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
-    }
-    return val;
-}
-
 __device__ float atomicMaxFloat(float* address, float val) {
     int* address_as_int = (int*)address;
     int old_val_as_int = *address_as_int;
@@ -682,55 +674,39 @@ __device__ float atomicMaxFloat(float* address, float val) {
     return __int_as_float(old_val_as_int);
 }
 
-__global__ void
-max_reduce_naive(float * result, float * data, int size) {
-    extern __shared__ float sharedData[];
-    int tid = threadIdx.x;
-    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
-
-    // Load data into shared memory
-    if (i < size) {
-        sharedData[tid] = data[i];
-        if (i + blockDim.x < size) {
-            sharedData[tid + blockDim.x] = data[i + blockDim.x];
-        } else {
-            // If the last block has an odd number of elements, duplicate the last element
-            sharedData[tid + blockDim.x] = data[size - 1];
-        }
-    } else {
-        // If the last block has an odd number of elements, duplicate the last element
-        sharedData[tid] = data[size - 1];
-        sharedData[tid + blockDim.x] = data[size - 1];
-    }
-
-    __syncthreads();
-
-    // Parallel reduction within the warp to find the maximum value
-    float maxVal = sharedData[tid];
-    maxVal = warpReduceMax(maxVal);
-
-    // The maximum value within the warp is in maxVal
-    if ((tid & (warpSize - 1)) == 0) {
-        sharedData[tid / warpSize] = maxVal;
-    }
-
-    __syncthreads();
-
-    // Further reduction using one thread per warp
-    if (tid < blockDim.x / warpSize) {
-        maxVal = sharedData[tid];
-        maxVal = warpReduceMax(maxVal);
-        if (tid == 0) {
-            atomicMaxFloat(result, maxVal);
-        }
-    }
+/* Atomic float multiplication via CAS. CUDA has no built-in atomicMul for
+   float, so we re-implement the standard pattern from the CUDA Programming
+   Guide. Used by array_prod_float to merge per-block products into the
+   global accumulator. */
+__device__ float atomicMulFloat(float* address, float val) {
+    int* address_as_int = (int*)address;
+    int old_val_as_int = *address_as_int;
+    int assumed;
+    do {
+        assumed = old_val_as_int;
+        int prod_val_as_int = __float_as_int(val * __int_as_float(old_val_as_int));
+        old_val_as_int = atomicCAS(address_as_int, assumed, prod_val_as_int);
+    } while (assumed != old_val_as_int);
+    return __int_as_float(old_val_as_int);
 }
 
-__device__ float warpReduceMin(float val) {
-    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
-        val = fminf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+/* Single-pass atomic-only max reduction.
+ *
+ * The previous `max_reduce_naive` did a two-stage shared-memory + warp
+ * shuffle reduction. The final stage shuffled with mask 0xFFFFFFFF from
+ * inside the divergent `if (tid < blockDim.x / warpSize)` block, which is
+ * undefined on Volta+ — the inactive 24 lanes return garbage, and on
+ * NVIDIA Ampere the garbage happened to be the seed slot's 0 bit pattern,
+ * causing every positive-input max to come back as 0. The atomic-only
+ * approach below is simpler and trades shared-memory bandwidth for a
+ * tiny amount of atomic contention; for the typical reduction sizes
+ * (n ≤ a few million) the difference is negligible. */
+__global__ void
+max_reduce_naive(float * result, float * data, int size) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < size) {
+        atomicMaxFloat(result, data[i]);
     }
-    return val;
 }
 
 __device__ float atomicMinFloat(float* address, float val) {
@@ -745,48 +721,89 @@ __device__ float atomicMinFloat(float* address, float val) {
     return __int_as_float(old_val_as_int);
 }
 
+/* Single-pass atomic-only min reduction. See max_reduce_naive above for
+ * the rationale — the original two-stage shuffle reduction was UB on
+ * Volta+ and silently returned 0 for any positive-min input. */
 __global__ void
 min_reduce_naive(float * result, float * data, int size) {
-    extern __shared__ float sharedData[];
-    int tid = threadIdx.x;
-    int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
-
-    // Load data into shared memory
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < size) {
-        sharedData[tid] = data[i];
-        if (i + blockDim.x < size) {
-            sharedData[tid + blockDim.x] = data[i + blockDim.x];
-        } else {
-            // If the last block has an odd number of elements, duplicate the last element
-            sharedData[tid + blockDim.x] = data[size - 1];
-        }
-    } else {
-        // If the last block has an odd number of elements, duplicate the last element
-        sharedData[tid] = data[size - 1];
-        sharedData[tid + blockDim.x] = data[size - 1];
+        atomicMinFloat(result, data[i]);
     }
+}
 
-    __syncthreads();
+/* ── Double-precision atomics ───────────────────────────────────────────────
+   CUDA's built-in atomicAdd(double*) requires CC 6.0+ (Pascal). For
+   portability across older devices we implement all four ops via the
+   same 64-bit CAS pattern. They are used by the per-dtype reduction
+   kernels that always accumulate into a single `double` slot regardless
+   of source dtype (so the C side can return a PHP `double` without
+   dispatching on every reducer × dtype pair). */
+__device__ double atomicAddDouble(double *address, double val) {
+    unsigned long long *as_ull = (unsigned long long *) address;
+    unsigned long long old = *as_ull, assumed;
+    do {
+        assumed = old;
+        unsigned long long new_bits =
+            (unsigned long long) __double_as_longlong(val + __longlong_as_double((long long) assumed));
+        old = atomicCAS(as_ull, assumed, new_bits);
+    } while (assumed != old);
+    return __longlong_as_double((long long) old);
+}
 
-    // Parallel reduction within the warp to find the minimum value
-    float minVal = sharedData[tid];
-    minVal = warpReduceMin(minVal);
+/* NaN-propagating min/max. Plain `fmin` / `fmax` follow IEEE 754-2008
+   minNum/maxNum semantics — NaN is treated as "missing data" and the
+   other operand wins. The CPU reducer in arithmetics.c propagates NaN
+   (a single NaN element forces a NaN result), so the GPU path matches
+   that convention via these helpers. */
+__device__ inline double prop_fmin(double a, double b) {
+    if (a != a) return a;   /* a is NaN */
+    if (b != b) return b;   /* b is NaN */
+    return fmin(a, b);
+}
+__device__ inline double prop_fmax(double a, double b) {
+    if (a != a) return a;
+    if (b != b) return b;
+    return fmax(a, b);
+}
 
-    // The minimum value within the warp is in minVal
-    if ((tid & (warpSize - 1)) == 0) {
-        sharedData[tid / warpSize] = minVal;
-    }
+__device__ double atomicMaxDouble(double *address, double val) {
+    unsigned long long *as_ull = (unsigned long long *) address;
+    unsigned long long old = *as_ull, assumed;
+    do {
+        assumed = old;
+        double cur = __longlong_as_double((long long) assumed);
+        unsigned long long new_bits =
+            (unsigned long long) __double_as_longlong(prop_fmax(val, cur));
+        old = atomicCAS(as_ull, assumed, new_bits);
+    } while (assumed != old);
+    return __longlong_as_double((long long) old);
+}
 
-    __syncthreads();
+__device__ double atomicMinDouble(double *address, double val) {
+    unsigned long long *as_ull = (unsigned long long *) address;
+    unsigned long long old = *as_ull, assumed;
+    do {
+        assumed = old;
+        double cur = __longlong_as_double((long long) assumed);
+        unsigned long long new_bits =
+            (unsigned long long) __double_as_longlong(prop_fmin(val, cur));
+        old = atomicCAS(as_ull, assumed, new_bits);
+    } while (assumed != old);
+    return __longlong_as_double((long long) old);
+}
 
-    // Further reduction using one thread per warp
-    if (tid < blockDim.x / warpSize) {
-        minVal = sharedData[tid];
-        minVal = warpReduceMin(minVal);
-        if (tid == 0) {
-            atomicMinFloat(result, minVal);
-        }
-    }
+__device__ double atomicMulDouble(double *address, double val) {
+    unsigned long long *as_ull = (unsigned long long *) address;
+    unsigned long long old = *as_ull, assumed;
+    do {
+        assumed = old;
+        double cur = __longlong_as_double((long long) assumed);
+        unsigned long long new_bits =
+            (unsigned long long) __double_as_longlong(val * cur);
+        old = atomicCAS(as_ull, assumed, new_bits);
+    } while (assumed != old);
+    return __longlong_as_double((long long) old);
 }
 
 __global__
@@ -821,8 +838,11 @@ void array_prod_float(float *a, float *result, int n) {
         __syncthreads();
     }
 
-    // write result for this block to global mem
-    if (tid == 0) atomicAdd(result, sdata[0]);
+    /* Merge this block's product into the global accumulator. Must use
+       atomicMulFloat (a CAS loop) — atomicAdd here would sum block
+       products instead of multiplying them, and would also miss
+       zero-containing inputs because the seed is 1 (1 + 0 = 1). */
+    if (tid == 0) atomicMulFloat(result, sdata[0]);
 }
 
 __global__
@@ -1274,6 +1294,116 @@ __global__ void tcuda_cast_f16_to_fp8_kernel(const __half *src, uint8_t *dst, in
     if (i < n) dst[i] = dev_float_to_fp8(__half2float(src[i]));
 }
 
+/* ── Typed reduction kernels (two-pass shared-memory tree) ─────────────────
+ *
+ * Layout:
+ *   Pass 1 (per-block tree reduce on shared memory):
+ *     - Phase 1a: each thread accumulates its slice of input into a private
+ *       `double` via a grid-stride loop. With a capped grid of
+ *       REDUCE_MAX_BLOCKS we keep the cross-block atomic count bounded
+ *       regardless of n.
+ *     - Phase 1b: per-thread partials land in shared memory and the block
+ *       collapses them via a power-of-two tree reduction. Every step calls
+ *       __syncthreads(), so all threads in the block participate at the
+ *       same control-flow point — no warp shuffles, no divergent shuffle
+ *       UB on Volta+.
+ *   Pass 2 (cross-block merge):
+ *     - Thread 0 of each block atomically merges the block's partial into
+ *       the global accumulator slot via the per-op atomic CAS helper.
+ *
+ * Total atomic ops = min(num_blocks, REDUCE_MAX_BLOCKS), independent of n.
+ * The single-pass (one-atomic-per-element) version this replaced was
+ * correct on any architecture but did O(n) atomicCAS spins, which on
+ * Ampere with n in the millions could be 100× slower than this tree.
+ *
+ * Caller contract (in cuda_math.h):
+ *   - vmalloc a single `double` slot on GPU
+ *   - cudaMemcpy the operation's identity into it (0/1/+DBL_MAX/-DBL_MAX)
+ *   - call the typed wrapper
+ *   - cudaMemcpy the slot back to host, vfree it.
+ */
+#define REDUCE_BLOCK       256
+#define REDUCE_MAX_BLOCKS  1024
+
+/* ── Reduction kernel body macros ──────────────────────────────────────────
+ * The four operations differ only in identity value, the binary combine
+ * applied to two doubles, and the cross-block atomic. READ_EXPR is the
+ * dtype-specific load (e.g. `(double)a[i]` for native dtypes,
+ * `(double)__half2float(a[i])` for fp16, `a[2*i] + a[2*i+1]` for the dd
+ * fp128 layout). Each `REDUCE_*_BODY` macro emits the full kernel body
+ * for one operation; emitting them as one block ensures every kernel has
+ * identical sync placement and tree-reduction structure, eliminating
+ * copy-paste drift across 20 specialised kernels. */
+#define REDUCE_SUM_COMBINE(a, b)   ((a) + (b))
+#define REDUCE_PROD_COMBINE(a, b)  ((a) * (b))
+#define REDUCE_MIN_COMBINE(a, b)   prop_fmin((a), (b))
+#define REDUCE_MAX_COMBINE(a, b)   prop_fmax((a), (b))
+
+#define REDUCE_KERNEL_BODY(IDENTITY, COMBINE, FINAL_ATOMIC, READ_EXPR)               \
+    __shared__ double sdata[REDUCE_BLOCK];                                           \
+    int tid = threadIdx.x;                                                           \
+    int stride = blockDim.x * gridDim.x;                                             \
+    double val = (IDENTITY);                                                         \
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {                \
+        val = COMBINE(val, (READ_EXPR));                                             \
+    }                                                                                \
+    sdata[tid] = val;                                                                \
+    __syncthreads();                                                                 \
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {                                   \
+        if (tid < s) sdata[tid] = COMBINE(sdata[tid], sdata[tid + s]);               \
+        __syncthreads();                                                             \
+    }                                                                                \
+    if (tid == 0) FINAL_ATOMIC(result, sdata[0]);
+
+/* Convenience wrappers around REDUCE_KERNEL_BODY for each operation —
+   the caller picks dtype and READ_EXPR; identity / combine / atomic
+   are wired in automatically. */
+#define REDUCE_SUM_BODY(READ_EXPR)                                                   \
+    REDUCE_KERNEL_BODY(0.0,      REDUCE_SUM_COMBINE,  atomicAddDouble, READ_EXPR)
+#define REDUCE_PROD_BODY(READ_EXPR)                                                  \
+    REDUCE_KERNEL_BODY(1.0,      REDUCE_PROD_COMBINE, atomicMulDouble, READ_EXPR)
+#define REDUCE_MIN_BODY(READ_EXPR)                                                   \
+    REDUCE_KERNEL_BODY( DBL_MAX, REDUCE_MIN_COMBINE,  atomicMinDouble, READ_EXPR)
+#define REDUCE_MAX_BODY(READ_EXPR)                                                   \
+    REDUCE_KERNEL_BODY(-DBL_MAX, REDUCE_MAX_COMBINE,  atomicMaxDouble, READ_EXPR)
+
+/* Native-dtype templates: any T that implicitly converts to double works
+   (all eight integer sizes plus float / double). The READ_EXPR is a
+   plain index, which template instantiation specialises per T. */
+template <typename T> __global__ void
+tcuda_reduce_sum_kernel(const T *a, double *result, int n)  { REDUCE_SUM_BODY ((double)a[i]) }
+template <typename T> __global__ void
+tcuda_reduce_prod_kernel(const T *a, double *result, int n) { REDUCE_PROD_BODY((double)a[i]) }
+template <typename T> __global__ void
+tcuda_reduce_min_kernel(const T *a, double *result, int n)  { REDUCE_MIN_BODY ((double)a[i]) }
+template <typename T> __global__ void
+tcuda_reduce_max_kernel(const T *a, double *result, int n)  { REDUCE_MAX_BODY ((double)a[i]) }
+
+/* float16: read via __half2float so the (double) widening goes through
+   the defined IEEE half→single→double chain. */
+__global__ void tcuda_reduce_sum_half_kernel (const __half *a, double *result, int n) { REDUCE_SUM_BODY ((double)__half2float(a[i])) }
+__global__ void tcuda_reduce_prod_half_kernel(const __half *a, double *result, int n) { REDUCE_PROD_BODY((double)__half2float(a[i])) }
+__global__ void tcuda_reduce_min_half_kernel (const __half *a, double *result, int n) { REDUCE_MIN_BODY ((double)__half2float(a[i])) }
+__global__ void tcuda_reduce_max_half_kernel (const __half *a, double *result, int n) { REDUCE_MAX_BODY ((double)__half2float(a[i])) }
+
+/* float4 / float8: one byte per element, decoded via dev_fp{4,8}_to_float. */
+__global__ void tcuda_reduce_sum_fp4_kernel (const uint8_t *a, double *result, int n) { REDUCE_SUM_BODY ((double)dev_fp4_to_float(a[i])) }
+__global__ void tcuda_reduce_prod_fp4_kernel(const uint8_t *a, double *result, int n) { REDUCE_PROD_BODY((double)dev_fp4_to_float(a[i])) }
+__global__ void tcuda_reduce_min_fp4_kernel (const uint8_t *a, double *result, int n) { REDUCE_MIN_BODY ((double)dev_fp4_to_float(a[i])) }
+__global__ void tcuda_reduce_max_fp4_kernel (const uint8_t *a, double *result, int n) { REDUCE_MAX_BODY ((double)dev_fp4_to_float(a[i])) }
+__global__ void tcuda_reduce_sum_fp8_kernel (const uint8_t *a, double *result, int n) { REDUCE_SUM_BODY ((double)dev_fp8_to_float(a[i])) }
+__global__ void tcuda_reduce_prod_fp8_kernel(const uint8_t *a, double *result, int n) { REDUCE_PROD_BODY((double)dev_fp8_to_float(a[i])) }
+__global__ void tcuda_reduce_min_fp8_kernel (const uint8_t *a, double *result, int n) { REDUCE_MIN_BODY ((double)dev_fp8_to_float(a[i])) }
+__global__ void tcuda_reduce_max_fp8_kernel (const uint8_t *a, double *result, int n) { REDUCE_MAX_BODY ((double)dev_fp8_to_float(a[i])) }
+
+/* float128 stored on GPU as interleaved double-double pairs (hi, lo).
+   Each element is read as (a[2i] + a[2i+1]) — same precision-flattening
+   conversion the CPU side uses in ndarray_fp128_to_double. */
+__global__ void tcuda_reduce_sum_dd_kernel (const double *a, double *result, int n) { REDUCE_SUM_BODY (a[2*i] + a[2*i + 1]) }
+__global__ void tcuda_reduce_prod_dd_kernel(const double *a, double *result, int n) { REDUCE_PROD_BODY(a[2*i] + a[2*i + 1]) }
+__global__ void tcuda_reduce_min_dd_kernel (const double *a, double *result, int n) { REDUCE_MIN_BODY (a[2*i] + a[2*i + 1]) }
+__global__ void tcuda_reduce_max_dd_kernel (const double *a, double *result, int n) { REDUCE_MAX_BODY (a[2*i] + a[2*i + 1]) }
+
 /* Byte-wise gather kernel: dst[i] = src[src_offsets[i]] (each element is
    elsize bytes). The host computes src_offsets per broadcast rules and ships
    them via a small int buffer. Keeps GPU code dtype-agnostic. */
@@ -1367,70 +1497,95 @@ extern "C" {
         cusolverDnHandle_t cusolverH = NULL;
         cudaStream_t stream = NULL;
         cublasHandle_t cublasH = NULL;
+        int *d_Ipiv = NULL;
+        int *d_info = NULL;
+        float *d_U = NULL;
+        float *d_work = NULL;
+        int *h_Ipiv = NULL;
+        int lwork = 0;
+        int rc = 1;
         cusolverStatus_t cusolver_status = CUSOLVER_STATUS_SUCCESS;
 
-        CHECK_CUSOLVER(cusolverDnCreate(&cusolverH));
-        CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CHECK_CUSOLVER(cusolverDnSetStream(cusolverH, stream));
+        cusolverDnCreate(&cusolverH);
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        cusolverDnSetStream(cusolverH, stream);
         cublasCreate(&cublasH);
         cublasSetStream(cublasH, stream);
 
-        int* d_Ipiv; // pivot array
-        int* d_info;  // info on success or failure
-        float* d_U; // U matrix of LU decomposition
-
-        CHECK_CUDA(cudaMalloc(&d_Ipiv, N*sizeof(int)));
-        CHECK_CUDA(cudaMalloc(&d_info, sizeof(int)));
-        CHECK_CUDA(cudaMalloc(&d_U, N*N*sizeof(float)));
+        vmalloc((void**)&d_Ipiv, N*sizeof(int));
+        vmalloc((void**)&d_info, sizeof(int));
+        vmalloc((void**)&d_U, N*N*sizeof(float));
 
         // copy A to U as cusolverDnSgetrf works in place
-        CHECK_CUDA(cudaMemcpy(d_U, d_A, N*N*sizeof(float), cudaMemcpyDeviceToDevice));
+        cudaMemcpy(d_U, d_A, N*N*sizeof(float), cudaMemcpyDeviceToDevice);
+
+        /* cusolverDnSgetrf REQUIRES a workspace buffer — the original code
+           passed NULL here, which made the LU decomposition produce garbage
+           and corrupt subsequent device state (illegal memory access on the
+           next vmalloc). Compute the needed size first, then allocate. */
+        cusolver_status = cusolverDnSgetrf_bufferSize(cusolverH, N, N, d_U, N, &lwork);
+        if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_det_float: cusolverDnSgetrf_bufferSize failed (status=%d)\n",
+                    (int)cusolver_status);
+            rc = -1;
+            goto cleanup;
+        }
+        if (lwork > 0) {
+            vmalloc((void**)&d_work, (size_t)lwork * sizeof(float));
+        }
 
         // LU decompose
-        cusolver_status = cusolverDnSgetrf(cusolverH, N, N, d_U, N, NULL, d_Ipiv, d_info);
+        cusolver_status = cusolverDnSgetrf(cusolverH, N, N, d_U, N, d_work, d_Ipiv, d_info);
         if (cusolver_status != CUSOLVER_STATUS_SUCCESS) {
-            // handle error
-            printf("LU decomposition failed\n");
-            exit(1);
+            fprintf(stderr, "cuda_det_float: LU decomposition failed (status=%d)\n",
+                    (int)cusolver_status);
+            rc = -1;
+            goto cleanup;
         }
 
         // Find determinant by product of diagonal elements
-        float det = 1.0f;
-        for (int i = 0; i < N; i++) {
-            float elem;
-            CHECK_CUDA(cudaMemcpy(&elem, d_U + i * N + i, sizeof(float), cudaMemcpyDeviceToHost));
-            // Check for potential overflow
-            if (fabsf(elem) > FLT_MAX / fabsf(det)) {
-                // Handle overflow here, e.g., return a special value or throw an error
-                printf("Overflow detected in det\n");
-                exit(1);
+        {
+            float det = 1.0f;
+            int overflow = 0;
+            for (int i = 0; i < N; i++) {
+                float elem;
+                cudaMemcpy(&elem, d_U + i * N + i, sizeof(float), cudaMemcpyDeviceToHost);
+                if (fabsf(elem) > FLT_MAX / fabsf(det)) {
+                    fprintf(stderr, "cuda_det_float: overflow detected\n");
+                    rc = -1;
+                    overflow = 1;
+                    break;
+                }
+                if (!isnan(elem) && !isinf(elem)) {
+                    det *= elem;
+                }
             }
-            if (!isnan(elem) && !isinf(elem)) {
-                det *= elem;
+            if (overflow) goto cleanup;
+
+            // Analyze pivot array to calculate number of permutations
+            h_Ipiv = new int[N];
+            cudaMemcpy(h_Ipiv, d_Ipiv, N*sizeof(int), cudaMemcpyDeviceToHost);
+
+            int numPermutations = 0;
+            for(int i = 0; i < N; i++) {
+                if(i+1 != h_Ipiv[i]) numPermutations++;
             }
+
+            if(numPermutations % 2 != 0) det = -det;
+
+            cudaMemcpy(result, &det, sizeof(float), cudaMemcpyHostToDevice);
         }
 
-        // Analyze pivot array to calculate number of permutations
-        int* h_Ipiv = new int[N];
-        CHECK_CUDA(cudaMemcpy(h_Ipiv, d_Ipiv, N*sizeof(int), cudaMemcpyDeviceToHost));
-
-        int numPermutations = 0;
-        for(int i = 0; i < N; i++) {
-            if(i+1 != h_Ipiv[i]) numPermutations++;
-        }
-
-        if(numPermutations % 2 != 0) det = -det;
-
-        // Cleanup
-        if (d_U) cudaFree(d_U);
-        if (d_Ipiv) cudaFree(d_Ipiv);
-        if (d_info) cudaFree(d_info);
+    cleanup:
+        if (h_Ipiv) delete[] h_Ipiv;
+        if (d_work)  vfree(d_work);
+        if (d_U)     vfree(d_U);
+        if (d_Ipiv)  vfree(d_Ipiv);
+        if (d_info)  vfree(d_info);
         if (cublasH) cublasDestroy(cublasH);
         if (cusolverH) cusolverDnDestroy(cusolverH);
-        if (stream) cudaStreamDestroy(stream);
-
-        CHECK_CUDA(cudaMemcpy(result, &det, sizeof(float), cudaMemcpyHostToDevice));
-        return 1;
+        if (stream)  cudaStreamDestroy(stream);
+        return rc;
     }
 
     void cuda_fill_float(float *a, float value, int n) {
@@ -1438,7 +1593,6 @@ extern "C" {
         int gridSize = (n + blockSize - 1) / blockSize;
 
         fill_float_kernel<<<gridSize, blockSize>>>(a, n, value);
-        cudaDeviceSynchronize();
     }
 
     void cuda_fill_double(double *a, double value, int n) {
@@ -1446,117 +1600,138 @@ extern "C" {
         int gridSize = (n + blockSize - 1) / blockSize;
 
         fill_float_kernel_double<<<gridSize, blockSize>>>(a, n, value);
-        cudaDeviceSynchronize();
     }
 
     void
     cuda_sum_float(int nblocks, float *a, float *rtn, int nelements) {
         float *d_sum;
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);  // Number of blocks in the grid.
-        cudaMalloc((void **) &d_sum, sizeof(float));
+        int blockSize = 256;
+        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);
+        vmalloc((void **) &d_sum, sizeof(float));
 
         cudaMemcpy(d_sum, rtn, sizeof(float), cudaMemcpyHostToDevice);
         array_sum_float<<<numBlocks, blockSize, blockSize * sizeof(float)>>>(a, d_sum, nelements);
         cudaMemcpy(rtn, d_sum, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        vfree(d_sum);
     }
 
     void
     cuda_prod_float(int nblocks, float *a, float *rtn, int nelements) {
         float *d_prod;
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);  // Number of blocks in the grid.
-        cudaMalloc((void **) &d_prod, sizeof(float));
+        int blockSize = 256;
+        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);
+        vmalloc((void **) &d_prod, sizeof(float));
 
         cudaMemcpy(d_prod, rtn, sizeof(float), cudaMemcpyHostToDevice);
         array_prod_float<<<numBlocks, blockSize, blockSize * sizeof(float)>>>(a, d_prod, nelements);
         cudaMemcpy(rtn, d_prod, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        vfree(d_prod);
     }
 
+    /* Local-only error helpers for cuda_svd_float — the surrounding
+       CHECK_CUSOLVER / CHECK_CUDA macros return EXIT_FAILURE without
+       releasing handles that were allocated before the failing call,
+       which would leak cusolverH / stream / gesvdj_params / devInfo /
+       d_work on the early-exit paths. Use FAIL_* instead so every
+       failure routes through the single cleanup block at the bottom. */
+#define SVD_FAIL_CUSOLVER(call) do {                                                \
+        cusolverStatus_t _st = (call);                                              \
+        if (_st != CUSOLVER_STATUS_SUCCESS) {                                       \
+            fprintf(stderr,                                                         \
+                "cuda_svd_float: cuSOLVER call failed at %s:%d (status=%d)\n",      \
+                __FILE__, __LINE__, (int) _st);                                     \
+            rc = -1; goto cleanup;                                                  \
+        }                                                                           \
+    } while (0)
+#define SVD_FAIL_CUDA(call) do {                                                    \
+        cudaError_t _st = (call);                                                   \
+        if (_st != cudaSuccess) {                                                   \
+            fprintf(stderr,                                                         \
+                "cuda_svd_float: CUDA call failed at %s:%d: %s\n",                  \
+                __FILE__, __LINE__, cudaGetErrorString(_st));                       \
+            rc = -1; goto cleanup;                                                  \
+        }                                                                           \
+    } while (0)
+#define SVD_FAIL_VMALLOC(ptr) do {                                                  \
+        if ((ptr) == NULL) {                                                        \
+            fprintf(stderr,                                                         \
+                "cuda_svd_float: vmalloc failed at %s:%d\n",                        \
+                __FILE__, __LINE__);                                                \
+            rc = -1; goto cleanup;                                                  \
+        }                                                                           \
+    } while (0)
     int
     cuda_svd_float(float *d_A, float *d_U, float *d_V, float *d_S, int m, int n) {
-        cusolverDnHandle_t cusolverH = NULL;  // cuSOLVER handle
-        cudaStream_t stream = NULL;  // CUDA stream
-        gesvdjInfo_t gesvdj_params = NULL;  // configuration of gesvdj
-        CHECK_CUSOLVER(cusolverDnCreate(&cusolverH));
-        CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        CHECK_CUSOLVER(cusolverDnSetStream(cusolverH, stream));
-        CHECK_CUSOLVER(cusolverDnCreateGesvdjInfo(&gesvdj_params));
-
-        // Set desired configuration of gesvdj
-        CHECK_CUSOLVER(cusolverDnXgesvdjSetTolerance(
-                gesvdj_params,
-                1.e-7));
-        CHECK_CUSOLVER(cusolverDnXgesvdjSetMaxSweeps(
-                gesvdj_params,
-                15));
-
-        // Perform SVD
-        // Note: This is just a skeleton code. Please handle CUDA errors appropriately
-        int* devInfo = NULL;  // info on gesvdj convergence
-        CHECK_CUDA(cudaMalloc((void**)&devInfo, sizeof(int)));
-        int lwork = 0;
+        cusolverDnHandle_t cusolverH = NULL;
+        cudaStream_t stream = NULL;
+        gesvdjInfo_t gesvdj_params = NULL;
+        int *devInfo = NULL;
         float *d_work = NULL;
-        CHECK_CUSOLVER(cusolverDnSgesvdj_bufferSize(
-                cusolverH,
-                CUSOLVER_EIG_MODE_VECTOR,  // compute eigenvectors
-                0,  // number of singular values to compute, 0 for all
-                m,
-                n,
-                d_A,
-                m,  // leading dimension of A
-                d_S,
-                d_U,
-                m,  // leading dimension of U
-                d_V,
-                n,  // leading dimension of V
-                &lwork,
-                gesvdj_params));
+        int lwork = 0;
+        int rc = 1;
 
-        CHECK_CUDA(cudaMalloc((void**)&d_work , sizeof(float) * lwork));
-        CHECK_CUSOLVER(cusolverDnSgesvdj(
-                cusolverH,
-                CUSOLVER_EIG_MODE_VECTOR,  // compute eigenvectors
-                0,  // number of singular values to compute, 0 for all
-                m,
-                n,
-                d_A,
-                m,  // leading dimension of A
-                d_S,
-                d_U,
-                m,  // leading dimension of U
-                d_V,
-                n,  // leading dimension of V
-                d_work,
-                lwork,
-                devInfo,
-                gesvdj_params));
+        SVD_FAIL_CUSOLVER(cusolverDnCreate(&cusolverH));
+        SVD_FAIL_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        SVD_FAIL_CUSOLVER(cusolverDnSetStream(cusolverH, stream));
+        SVD_FAIL_CUSOLVER(cusolverDnCreateGesvdjInfo(&gesvdj_params));
 
-        // Synchronize to ensure computation is finished
-        CHECK_CUDA(cudaDeviceSynchronize());
-        if (devInfo) CHECK_CUDA(cudaFree(devInfo));
-        if (cusolverH) CHECK_CUSOLVER(cusolverDnDestroy(cusolverH));
-        if (stream) CHECK_CUDA(cudaStreamDestroy(stream));
-        if (gesvdj_params) CHECK_CUSOLVER(cusolverDnDestroyGesvdjInfo(gesvdj_params));
+        SVD_FAIL_CUSOLVER(cusolverDnXgesvdjSetTolerance(gesvdj_params, 1.e-7));
+        SVD_FAIL_CUSOLVER(cusolverDnXgesvdjSetMaxSweeps(gesvdj_params, 15));
 
-        return 1;
+        /* Route both device scratch buffers through vmalloc so NDARRAY_VCHECK=1
+           accounts for them — raw cudaMalloc was invisible to the counter. */
+        vmalloc((void **) &devInfo, sizeof(int));
+        SVD_FAIL_VMALLOC(devInfo);
+        SVD_FAIL_CUSOLVER(cusolverDnSgesvdj_bufferSize(
+                cusolverH, CUSOLVER_EIG_MODE_VECTOR, 0,
+                m, n, d_A, m, d_S, d_U, m, d_V, n, &lwork, gesvdj_params));
+
+        vmalloc((void **) &d_work, sizeof(float) * (size_t) lwork);
+        SVD_FAIL_VMALLOC(d_work);
+        SVD_FAIL_CUSOLVER(cusolverDnSgesvdj(
+                cusolverH, CUSOLVER_EIG_MODE_VECTOR, 0,
+                m, n, d_A, m, d_S, d_U, m, d_V, n,
+                d_work, lwork, devInfo, gesvdj_params));
+
+        /* cusolverDnSgesvdj runs on `stream` (cudaStreamNonBlocking), which
+           is unordered with the caller's default stream. The output buffers
+           d_U / d_V / d_S are read on the default stream after we return,
+           so we need a barrier here. cudaStreamSynchronize is the targeted
+           form (avoids syncing every other stream the user may have spun
+           up); kept instead of the broader cudaDeviceSynchronize that was
+           dropped elsewhere in the cuda-sync-cleanup pass. */
+        SVD_FAIL_CUDA(cudaStreamSynchronize(stream));
+
+    cleanup:
+        if (d_work)        vfree(d_work);
+        if (devInfo)       vfree(devInfo);
+        if (gesvdj_params) cusolverDnDestroyGesvdjInfo(gesvdj_params);
+        if (cusolverH)     cusolverDnDestroy(cusolverH);
+        if (stream)        cudaStreamDestroy(stream);
+        return rc;
     }
+#undef SVD_FAIL_VMALLOC
+#undef SVD_FAIL_CUDA
+#undef SVD_FAIL_CUSOLVER
 
     float
     cuda_max_float(float *a, int nelements) {
         int size = nelements;
         float *d_out;
-        int current_size = size;
-        float *d_current_in = a;
-        // Launch the CUDA kernel
         int threadsPerBlock = 256;
-        int blocksPerGrid = (size + (2 * threadsPerBlock) - 1) / (2 * threadsPerBlock);
-        cudaMalloc((void**)&d_out, sizeof(float));
-        max_reduce_naive<<<blocksPerGrid, threadsPerBlock, 2 * threadsPerBlock * sizeof(float)>>>(d_out, d_current_in, current_size);
+        int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+        vmalloc((void**)&d_out, sizeof(float));
+        /* atomicMaxFloat merges per-thread values into *d_out — the slot
+           must start at -FLT_MAX so any real element wins on the first
+           CAS. Without this seed, vmalloc slab reuse hands us a stale
+           value (often 0 or the last sum/prod result) and atomicMax
+           never overwrites a value that's larger than the input max. */
+        float neg_inf = -FLT_MAX;
+        cudaMemcpy(d_out, &neg_inf, sizeof(float), cudaMemcpyHostToDevice);
+        max_reduce_naive<<<blocksPerGrid, threadsPerBlock>>>(d_out, a, size);
         float max_value;
         cudaMemcpy(&max_value, d_out, sizeof(float), cudaMemcpyDeviceToHost);
+        vfree(d_out);
         return max_value;
     }
 
@@ -1564,31 +1739,35 @@ extern "C" {
     cuda_min_float(float *a, int nelements) {
         int size = nelements;
         float *d_out;
-        int current_size = size;
-        float *d_current_in = a;
-        // Launch the CUDA kernel
         int threadsPerBlock = 256;
-        int blocksPerGrid = (size + (2 * threadsPerBlock) - 1) / (2 * threadsPerBlock);
-        cudaMalloc((void**)&d_out, sizeof(float));
-        min_reduce_naive<<<blocksPerGrid, threadsPerBlock, 2 * threadsPerBlock * sizeof(float)>>>(d_out, d_current_in, current_size);
+        int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
+        vmalloc((void**)&d_out, sizeof(float));
+        /* See cuda_max_float — atomicMinFloat requires a +FLT_MAX seed. */
+        float pos_inf = FLT_MAX;
+        cudaMemcpy(d_out, &pos_inf, sizeof(float), cudaMemcpyHostToDevice);
+        min_reduce_naive<<<blocksPerGrid, threadsPerBlock>>>(d_out, a, size);
         float min_value;
         cudaMemcpy(&min_value, d_out, sizeof(float), cudaMemcpyDeviceToHost);
+        vfree(d_out);
         return min_value;
     }
 
     int
     cuda_equal_float(int nblocks, float *a, float *b, int nelements) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
+        int blockSize = 256;  /* threads per block — typical choice */
         int result = 1;
-        int *d_equal;
-        // Allocate GPU memory for the result
-        cudaMalloc(&d_equal, sizeof(int));
+        int *d_equal = NULL;
+        /* Allocate the GPU scratch slot through vmalloc so NDARRAY_VCHECK=1
+           sees it; the previous raw cudaMalloc was invisible to the counter. */
+        vmalloc((void **) &d_equal, sizeof(int));
+        if (d_equal == NULL) {
+            return 0;
+        }
         cudaMemcpy(d_equal, &result, sizeof(int), cudaMemcpyHostToDevice);
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
+        int numBlocks = (nblocks + blockSize - 1) / blockSize;
         array_equals_float<<<numBlocks, blockSize>>>(a, b, d_equal, nelements);
-        cudaDeviceSynchronize();
         cudaMemcpy(&result, d_equal, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaFree(d_equal);
+        vfree(d_equal);
         return result;
     }
 
@@ -1597,7 +1776,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         pow_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1605,7 +1783,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         fmodf_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1613,7 +1790,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         multiply_vectors_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1621,7 +1797,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         divide_vectors_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1629,7 +1804,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         subtract_vectors_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1637,7 +1811,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         add_vectors_float_kernel<<<numBlocks, blockSize>>>(a, b, rtn, nelements);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1645,7 +1818,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         logFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1653,7 +1825,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         logbFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1661,7 +1832,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         log2FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1669,7 +1839,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         log1pFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1677,7 +1846,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         log10FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1685,7 +1853,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         sqrtFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1693,7 +1860,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         expFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1701,7 +1867,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         absFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1709,7 +1874,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         expm1FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1717,7 +1881,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         sinFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1725,7 +1888,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         cosFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1733,7 +1895,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         tanFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1741,7 +1902,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arcsinFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1749,7 +1909,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arctanFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1757,7 +1916,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arctan2FloatKernel<<<numBlocks, blockSize>>>(d_array, y_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1765,7 +1923,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arccosFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1773,7 +1930,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         radiansFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1781,7 +1937,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         degreesFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1789,7 +1944,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         sinhFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1797,7 +1951,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         coshFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1805,7 +1958,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         tanhFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1813,7 +1965,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arcsinhFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1822,7 +1973,6 @@ extern "C" {
         dim3 grid(16, 16);
         dim3 block(16, 16);
         transposeCoalesced<<<grid, block>>>(d_in, height, width, d_out);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1830,7 +1980,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arccoshFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1838,7 +1987,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         arctanhFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1846,7 +1994,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         rintFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1854,7 +2001,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         fixFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1862,7 +2008,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         ceilFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1870,7 +2015,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         roundToDecimalsFloatKernel<<<numBlocks, blockSize>>>(d_array, (int)decimals, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1878,7 +2022,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         floorFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1886,7 +2029,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         truncFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1894,7 +2036,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         sincFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1902,7 +2043,6 @@ extern "C" {
         dim3 blockSize(16, 16);  // Number of threads per block. This is a typical choice.
         dim3 gridSize((n + blockSize.x - 1) / blockSize.x, (m + blockSize.y - 1) / blockSize.y);
         calculateOuterProductFloat<<<gridSize, blockSize>>>(a_array, b_array, m, n, r_array);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1910,7 +2050,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         negateFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1918,7 +2057,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         positiveFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1926,7 +2064,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         reciprocalFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1934,7 +2071,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         signFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1942,7 +2078,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         clipFloatKernel<<<numBlocks, blockSize>>>(d_array, minVal, maxVal, nblocks);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1950,7 +2085,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         matrixVectorMultiplyFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, rows, cols);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1958,7 +2092,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1966,7 +2099,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysNotEqualFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1974,7 +2106,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysGreaterFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -1982,7 +2113,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysGreaterEqualFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     float
@@ -1990,12 +2120,16 @@ extern "C" {
         const int threadsPerBlock = 256;
         int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
 
-        float* d_medians;
-        cudaMalloc((void**)&d_medians, blocksPerGrid * sizeof(float));
+        /* vmalloc — tracked by NDARRAY_VCHECK=1; matched vfree at exit. */
+        float *d_medians = NULL;
+        vmalloc((void **) &d_medians, (size_t) blocksPerGrid * sizeof(float));
+        if (d_medians == NULL) {
+            return 0.0f;
+        }
 
         findMedianKernelFloat<<<blocksPerGrid, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(a_array, n, d_medians);
 
-        // Perform a final reduction to find the overall median
+        /* Perform a final reduction to find the overall median. */
         while (blocksPerGrid > 1)
         {
             int newBlocks = (blocksPerGrid + threadsPerBlock - 1) / threadsPerBlock;
@@ -2005,9 +2139,7 @@ extern "C" {
 
         float median;
         cudaMemcpy(&median, d_medians, sizeof(float), cudaMemcpyDeviceToHost);
-
-        cudaFree(d_medians);
-
+        vfree(d_medians);
         return median;
     }
 
@@ -2016,7 +2148,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysLessFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -2024,7 +2155,6 @@ extern "C" {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         compareArraysLessEqualFloatKernel<<<numBlocks, blockSize>>>(a_array, b_array, result, n);
-        cudaDeviceSynchronize();
     }
 
     void
@@ -2106,121 +2236,179 @@ extern "C" {
         matrixL1NormFloatKernel<<<blocksPerGrid, threadsPerBlock>>>(target, rtn, rows, cols);
     }
 
+    /* Compute the matrix 2-norm (largest singular value) via cuSOLVER's
+       SVD. Returns 0 on success, -1 on error; on error a message is
+       written to stderr. The original implementation used CHECK_CUSOLVER /
+       CHECK_CUDA which `return EXIT_FAILURE` without cleanup, leaking
+       `handle` / `d_work` / `d_singular_values` on any partial failure.
+       Rewritten with a cleanup label so every exit releases the same
+       resources. */
     int
     cuda_matrix_float_l2norm(float *target, float *rtn, int rows, int cols) {
-        cusolverDnHandle_t handle;
-        CHECK_CUSOLVER(cusolverDnCreate(&handle));
+        cusolverDnHandle_t handle = NULL;
+        float *d_work = NULL;
+        float *d_singular_values = NULL;
+        int work_size = 0;
+        int rc = 0;
+        cusolverStatus_t cstat;
+        cudaError_t cerr;
 
-        // Calculate workspace size for SVD
-        int work_size;
-        CHECK_CUSOLVER(cusolverDnSgesvd_bufferSize(handle, rows, cols, &work_size));
+        cstat = cusolverDnCreate(&handle);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_l2norm: cusolverDnCreate failed (status=%d)\n", (int)cstat);
+            rc = -1; goto cleanup;
+        }
+        cstat = cusolverDnSgesvd_bufferSize(handle, rows, cols, &work_size);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_l2norm: bufferSize failed (status=%d)\n", (int)cstat);
+            rc = -1; goto cleanup;
+        }
+        vmalloc((void **) &d_work, (size_t) work_size * sizeof(float));
+        vmalloc((void **) &d_singular_values, (size_t) cols * sizeof(float));
 
-        // Allocate workspace
-        float* d_work;
-        CHECK_CUDA(cudaMalloc((void**)&d_work, work_size));
+        cstat = cusolverDnSgesvd(handle, 'N', 'N', rows, cols, target, rows,
+                                 d_singular_values, NULL, rows, NULL, cols,
+                                 d_work, work_size, NULL, NULL);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_l2norm: SVD failed (status=%d)\n", (int)cstat);
+            rc = -1; goto cleanup;
+        }
+        cerr = cudaMemcpy(rtn, d_singular_values, sizeof(float), cudaMemcpyDeviceToDevice);
+        if (cerr != cudaSuccess) {
+            fprintf(stderr, "cuda_matrix_float_l2norm: cudaMemcpy failed: %s\n",
+                    cudaGetErrorString(cerr));
+            rc = -1;
+        }
 
-        // Allocate singular values
-        float* d_singular_values;
-        CHECK_CUDA(cudaMalloc((void**)&d_singular_values, cols * sizeof(float)));
-
-        // Perform SVD
-        CHECK_CUSOLVER(cusolverDnSgesvd(handle, 'N', 'N', rows, cols, target, rows, d_singular_values, NULL, rows, NULL, cols, d_work, work_size, NULL, NULL));
-
-        CHECK_CUDA(cudaMemcpy(rtn, d_singular_values, sizeof(float), cudaMemcpyDeviceToDevice));
-
-        // Cleanup
-        CHECK_CUDA(cudaFree(d_work));
-        CHECK_CUDA(cudaFree(d_singular_values));
-        CHECK_CUSOLVER(cusolverDnDestroy(handle));
-        return 0;
+    cleanup:
+        if (d_work)            vfree(d_work);
+        if (d_singular_values) vfree(d_singular_values);
+        if (handle)            cusolverDnDestroy(handle);
+        return rc;
     }
 
+    /* Compute an in-place matrix inverse via cuSOLVER's LU decomposition
+       and triangular solve. The original implementation ignored every
+       cusolverDn return code and would silently produce garbage when LU
+       diverged. Now all cusolver calls are checked; on any failure we
+       still walk the cleanup path so VCHECK stays balanced. */
     void cuda_matrix_float_inverse(float* matrix, int n) {
-        cusolverDnHandle_t cusolverH;
-        cusolverDnCreate(&cusolverH);
+        cusolverDnHandle_t cusolverH = NULL;
+        int *d_info = NULL;
+        int *d_pivot = NULL;
+        float *d_work = NULL;
+        float *d_identity = NULL;
+        int lwork = 0;
+        cusolverStatus_t cstat;
 
-        float* d_matrix = matrix;
+        cstat = cusolverDnCreate(&cusolverH);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_inverse: cusolverDnCreate failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        vmalloc((void**) &d_info, sizeof(int));
 
-        int* d_info;
-        vmalloc((void**)&d_info, sizeof(int));
+        cstat = cusolverDnSgetrf_bufferSize(cusolverH, n, n, matrix, n, &lwork);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_inverse: getrf_bufferSize failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        if (lwork > 0) {
+            vmalloc((void**) &d_work, (size_t) lwork * sizeof(float));
+        }
+        vmalloc((void**) &d_pivot, (size_t) n * sizeof(int));
 
-        int lwork;
-        cusolverDnSgetrf_bufferSize(cusolverH, n, n, d_matrix, n, &lwork);
+        cstat = cusolverDnSgetrf(cusolverH, n, n, matrix, n, d_work, d_pivot, d_info);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_inverse: LU decomposition failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
 
-        float* d_work;
-        vmalloc((void**)&d_work, lwork * sizeof(float));
+        vmalloc((void**) &d_identity, (size_t) n * (size_t) n * sizeof(float));
+        cudaMemset(d_identity, 0, (size_t) n * (size_t) n * sizeof(float));
+        {
+            float onef = 1.0f;
+            for (int i = 0; i < n; ++i) {
+                cudaMemcpy(d_identity + i * n + i, &onef, sizeof(float),
+                           cudaMemcpyHostToDevice);
+            }
+        }
 
-        int* d_pivot;
-        vmalloc((void**)&d_pivot, n * sizeof(int));
+        cstat = cusolverDnSgetrs(cusolverH, CUBLAS_OP_N, n, n, matrix, n,
+                                 d_pivot, d_identity, n, d_info);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_float_inverse: triangular solve failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        cudaMemcpy(matrix, d_identity, (size_t) n * (size_t) n * sizeof(float),
+                   cudaMemcpyDeviceToHost);
 
-        cusolverDnSgetrf(cusolverH, n, n, d_matrix, n, d_work, d_pivot, d_info);
-
-        float* d_identity;
-        vmalloc((void**)&d_identity, n * n * sizeof(float));
-        cudaMemset(d_identity, 0, n * n * sizeof(float));
-        float onef = 1.0f;
-        for (int i = 0; i < n; ++i)
-            cudaMemcpy(d_identity + i * n + i, &onef, sizeof(float), cudaMemcpyHostToDevice);
-
-        cusolverDnSgetrs(cusolverH, CUBLAS_OP_N, n, n, d_matrix, n, d_pivot, d_identity, n, d_info);
-
-        cudaMemcpy(matrix, d_identity, n * n * sizeof(float), cudaMemcpyDeviceToHost);
-
-        vfree(d_info);
-        vfree(d_work);
-        vfree(d_pivot);
-        vfree(d_identity);
-
-        cusolverDnDestroy(cusolverH);
+    cleanup:
+        if (d_identity) vfree(d_identity);
+        if (d_pivot)    vfree(d_pivot);
+        if (d_work)     vfree(d_work);
+        if (d_info)     vfree(d_info);
+        if (cusolverH)  cusolverDnDestroy(cusolverH);
     }
 
     void cuda_matrix_eig_float(float* d_matrix, int n, float* d_eigvalues) {
-        cusolverDnHandle_t handle;
+        cusolverDnHandle_t handle = NULL;
         cusolverStatus_t status;
+        int* d_info = NULL;
+        float* d_work = NULL;
 
-        int* d_info;  // info on success or failure
+        /* Allocate d_info via vmalloc so VCHECK tracks it; cusolverDnCreate
+           may fail before any work is queued, but the d_info slot must still
+           be released on every exit path. */
+        vmalloc((void**)&d_info, sizeof(int));
 
-        cudaMalloc(&d_info, sizeof(int));
-        // Create cuSOLVER handle
         status = cusolverDnCreate(&handle);
         if (status != CUSOLVER_STATUS_SUCCESS) {
             printf("CUSOLVER initialization failed.\n");
+            vfree(d_info);
             return;
         }
 
-        // Compute workspace size
-        int lwork;
-        status = cusolverDnSsyevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, n, d_matrix, n, d_eigvalues, &lwork);
+        int lwork = 0;
+        status = cusolverDnSsyevd_bufferSize(handle, CUSOLVER_EIG_MODE_VECTOR,
+                                             CUBLAS_FILL_MODE_UPPER, n, d_matrix,
+                                             n, d_eigvalues, &lwork);
         if (status != CUSOLVER_STATUS_SUCCESS) {
             printf("CUSOLVER workspace size computation failed.\n");
+            cusolverDnDestroy(handle);
+            vfree(d_info);
             return;
         }
 
-        // Allocate workspace on the device
-        float* d_work;
-        cudaMalloc((void**)&d_work, lwork * sizeof(float));
+        vmalloc((void**)&d_work, lwork * sizeof(float));
 
-        // Compute eigenvalues and right eigenvectors
-        status = cusolverDnSsyevd(handle, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_UPPER, n, d_matrix, n, d_eigvalues, d_work, lwork, d_info);
+        status = cusolverDnSsyevd(handle, CUSOLVER_EIG_MODE_VECTOR,
+                                  CUBLAS_FILL_MODE_UPPER, n, d_matrix, n,
+                                  d_eigvalues, d_work, lwork, d_info);
         if (status != CUSOLVER_STATUS_SUCCESS) {
             printf("CUSOLVER eigenvectors computation failed.\n");
+            vfree(d_work);
+            cusolverDnDestroy(handle);
+            vfree(d_info);
             return;
         }
-        cudaFree(d_work);
-        cudaFree(d_info);
+
+        vfree(d_work);
+        cusolverDnDestroy(handle);
+        vfree(d_info);
     }
 
     void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements) {
         double *d_sum;
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);  // Number of blocks in the grid.
-        cudaMalloc((void **) &d_sum, sizeof(double));
+        int blockSize = 256;
+        int numBlocks = (nblocks + blockSize * 2 - 1) / (blockSize * 2);
+        vmalloc((void **) &d_sum, sizeof(double));
 
         cudaMemcpy(d_sum, rtn, sizeof(double), cudaMemcpyHostToDevice);
         array_sum_reduce_blocks<<<numBlocks, blockSize, blockSize * sizeof(double)>>>(a, d_sum, nelements);
         finalize_sum<<<1, 1>>>(d_sum, rtn, numBlocks);
         cudaMemcpy(rtn, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
-        cudaDeviceSynchronize();
+        vfree(d_sum);
     }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -2234,11 +2422,13 @@ extern "C" {
 
 #define GRID_FOR(n)  int blockSize = 256; int numBlocks = ((n) + blockSize - 1) / blockSize
 
+/* Wrappers stay async on the default stream — the next cudaMemcpy or kernel
+   launched in the same stream implicitly orders behind this kernel. The
+   user-facing NumPower::syncDevice() is the explicit barrier. */
 #define DEF_BINOP_WRAPPER(NAME, KERNEL, T)                                          \
 void NAME(T *a, T *b, T *rtn, int n) {                                              \
     GRID_FOR(n);                                                                    \
     KERNEL<T><<<numBlocks, blockSize>>>(a, b, rtn, n);                              \
-    cudaDeviceSynchronize();                                                        \
 }
 
 DEF_BINOP_WRAPPER(cuda_add_i8,  tcuda_add_kernel, int8_t)
@@ -2282,7 +2472,6 @@ DEF_BINOP_WRAPPER(cuda_div_f64, tcuda_div_kernel, double)
 void NAME(T *a, T *b, T *rtn, int n) {                                              \
     GRID_FOR(n);                                                                    \
     tcuda_mod_int_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);                \
-    cudaDeviceSynchronize();                                                        \
 }
 DEF_MOD_INT_WRAPPER(cuda_mod_i8,  int8_t)
 DEF_MOD_INT_WRAPPER(cuda_mod_u8,  uint8_t)
@@ -2295,20 +2484,17 @@ DEF_MOD_INT_WRAPPER(cuda_mod_u64, uint64_t)
 void cuda_mod_f64(double *a, double *b, double *rtn, int n) {
     GRID_FOR(n);
     tcuda_mod_f64_kernel<<<numBlocks, blockSize>>>(a, b, rtn, n);
-    cudaDeviceSynchronize();
 }
 
 #define DEF_POW_SIGNED_WRAPPER(NAME, T)                                             \
 void NAME(T *a, T *b, T *rtn, int n) {                                              \
     GRID_FOR(n);                                                                    \
     tcuda_pow_signed_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);             \
-    cudaDeviceSynchronize();                                                        \
 }
 #define DEF_POW_UNSIGNED_WRAPPER(NAME, T)                                           \
 void NAME(T *a, T *b, T *rtn, int n) {                                              \
     GRID_FOR(n);                                                                    \
     tcuda_pow_unsigned_kernel<T><<<numBlocks, blockSize>>>(a, b, rtn, n);           \
-    cudaDeviceSynchronize();                                                        \
 }
 DEF_POW_SIGNED_WRAPPER(cuda_pow_i8,  int8_t)
 DEF_POW_SIGNED_WRAPPER(cuda_pow_i16, int16_t)
@@ -2321,39 +2507,32 @@ DEF_POW_UNSIGNED_WRAPPER(cuda_pow_u64, uint64_t)
 void cuda_pow_f64(double *a, double *b, double *rtn, int n) {
     GRID_FOR(n);
     tcuda_pow_f64_kernel<<<numBlocks, blockSize>>>(a, b, rtn, n);
-    cudaDeviceSynchronize();
 }
 
 /* float16 (__half) wrappers */
 void cuda_add_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_add_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 void cuda_sub_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_sub_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 void cuda_mul_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_mul_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 void cuda_div_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_div_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 void cuda_mod_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_mod_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 void cuda_pow_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
     GRID_FOR(n);
     tcuda_pow_half_kernel<<<numBlocks, blockSize>>>((__half *)a, (__half *)b, (__half *)rtn, n);
-    cudaDeviceSynchronize();
 }
 
 /* Typed fills */
@@ -2361,7 +2540,6 @@ void cuda_pow_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
 void NAME(T *a, T value, int n) {                                                   \
     GRID_FOR(n);                                                                    \
     tcuda_fill_kernel<T><<<numBlocks, blockSize>>>(a, value, n);                    \
-    cudaDeviceSynchronize();                                                        \
 }
 DEF_FILL_WRAPPER(cuda_fill_i8,  int8_t)
 DEF_FILL_WRAPPER(cuda_fill_u8,  uint8_t)
@@ -2375,12 +2553,10 @@ DEF_FILL_WRAPPER(cuda_fill_f64, double)
 void cuda_fill_f16(uint16_t *a, float value, int n) {
     GRID_FOR(n);
     tcuda_fill_half_kernel<<<numBlocks, blockSize>>>((__half *)a, value, n);
-    cudaDeviceSynchronize();
 }
 void cuda_fill_dd(double *out, double hi, double lo, int n) {
     GRID_FOR(n);
     tcuda_fill_dd_kernel<<<numBlocks, blockSize>>>(out, hi, lo, n);
-    cudaDeviceSynchronize();
 }
 
 /* GPU AsType — explicit Src→Dst cast kernels covering every pair we may need.
@@ -2393,7 +2569,6 @@ void cuda_fill_dd(double *out, double hi, double lo, int n) {
 void cuda_cast_##SRC##_to_##DST(ST *src, DT *dst, int n) {                          \
     GRID_FOR(n);                                                                    \
     tcuda_cast_kernel<ST, DT><<<numBlocks, blockSize>>>(src, dst, n);               \
-    cudaDeviceSynchronize();                                                        \
 }
 
 #define DECL_CAST_TARGETS(SRC, ST)                                                  \
@@ -2424,7 +2599,6 @@ DECL_CAST_TARGETS(f64, double)
 void cuda_cast_f16_to_##DST(uint16_t *src, DT *dst, int n) {                        \
     GRID_FOR(n);                                                                    \
     tcuda_cast_from_half_kernel<DT><<<numBlocks, blockSize>>>((__half *)src, dst, n); \
-    cudaDeviceSynchronize();                                                        \
 }
 CAST_FROM_HALF(i8,  int8_t)
 CAST_FROM_HALF(u8,  uint8_t)
@@ -2441,7 +2615,6 @@ CAST_FROM_HALF(f64, double)
 void cuda_cast_##SRC##_to_f16(ST *src, uint16_t *dst, int n) {                      \
     GRID_FOR(n);                                                                    \
     tcuda_cast_to_half_kernel<ST><<<numBlocks, blockSize>>>(src, (__half *)dst, n); \
-    cudaDeviceSynchronize();                                                        \
 }
 CAST_TO_HALF(i8,  int8_t)
 CAST_TO_HALF(u8,  uint8_t)
@@ -2456,7 +2629,6 @@ CAST_TO_HALF(f64, double)
 void cuda_cast_f16_to_f16(uint16_t *src, uint16_t *dst, int n) {
     GRID_FOR(n);
     tcuda_cast_half_to_half_kernel<<<numBlocks, blockSize>>>((__half *)src, (__half *)dst, n);
-    cudaDeviceSynchronize();
 }
 
 /* dd128 wrappers — note the buffer holds 2n doubles (hi, lo interleaved). */
@@ -2464,7 +2636,6 @@ void cuda_cast_f16_to_f16(uint16_t *src, uint16_t *dst, int n) {
 void NAME(double *a, double *b, double *rtn, int n) {                               \
     GRID_FOR(n);                                                                    \
     KERNEL<<<numBlocks, blockSize>>>(a, b, rtn, n);                                 \
-    cudaDeviceSynchronize();                                                        \
 }
 DEF_DD_WRAPPER(cuda_add_dd, tcuda_add_dd_kernel)
 DEF_DD_WRAPPER(cuda_sub_dd, tcuda_sub_dd_kernel)
@@ -2479,44 +2650,35 @@ DEF_DD_WRAPPER(cuda_mod_dd, tcuda_mod_dd_kernel)
 void NAME(ST *src, DT *dst, int n) {                                                \
     GRID_FOR(n);                                                                    \
     KERNEL<<<numBlocks, blockSize>>>(src, dst, n);                                  \
-    cudaDeviceSynchronize();                                                        \
 }
 
 void cuda_cast_fp4_to_f32(uint8_t *src, float *dst, int n) {
     GRID_FOR(n); tcuda_cast_fp4_to_f32_kernel<<<numBlocks, blockSize>>>(src, dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_f32_to_fp4(float *src, uint8_t *dst, int n) {
     GRID_FOR(n); tcuda_cast_f32_to_fp4_kernel<<<numBlocks, blockSize>>>(src, dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_fp4_to_f16(uint8_t *src, uint16_t *dst, int n) {
     GRID_FOR(n);
     tcuda_cast_fp4_to_f16_kernel<<<numBlocks, blockSize>>>(src, (__half *)dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_f16_to_fp4(uint16_t *src, uint8_t *dst, int n) {
     GRID_FOR(n);
     tcuda_cast_f16_to_fp4_kernel<<<numBlocks, blockSize>>>((__half *)src, dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_fp8_to_f32(uint8_t *src, float *dst, int n) {
     GRID_FOR(n); tcuda_cast_fp8_to_f32_kernel<<<numBlocks, blockSize>>>(src, dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_f32_to_fp8(float *src, uint8_t *dst, int n) {
     GRID_FOR(n); tcuda_cast_f32_to_fp8_kernel<<<numBlocks, blockSize>>>(src, dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_fp8_to_f16(uint8_t *src, uint16_t *dst, int n) {
     GRID_FOR(n);
     tcuda_cast_fp8_to_f16_kernel<<<numBlocks, blockSize>>>(src, (__half *)dst, n);
-    cudaDeviceSynchronize();
 }
 void cuda_cast_f16_to_fp8(uint16_t *src, uint8_t *dst, int n) {
     GRID_FOR(n);
     tcuda_cast_f16_to_fp8_kernel<<<numBlocks, blockSize>>>((__half *)src, dst, n);
-    cudaDeviceSynchronize();
 }
 
 /* Broadcast wrapper. Caller must have:
@@ -2530,7 +2692,97 @@ void cuda_broadcast(const char *src_gpu, char *dst_gpu,
     int numBlocks = (n_out + blockSize - 1) / blockSize;
     tcuda_broadcast_by_offsets<<<numBlocks, blockSize>>>(
         src_gpu, dst_gpu, src_offsets_gpu, n_out, elsize);
-    cudaDeviceSynchronize();
+}
+
+/* ── Typed reduction wrappers ──────────────────────────────────────────────
+   The C-side reducer (NDArray_Reduce_*) calls one of these per dtype with
+   a GPU-resident double slot pre-seeded with the operation's identity.
+   The kernels do per-block tree reduction on shared memory (no warp
+   shuffles, no UB across compute capabilities), then thread 0 of each
+   block atomically merges the partial into the global slot. Grid is
+   capped at REDUCE_MAX_BLOCKS so atomic contention stays bounded even
+   for n in the billions; the grid-stride loop inside each thread covers
+   the remaining elements. Identity seeding is the caller's responsibility
+   (sum: 0, prod: 1, min: +DBL_MAX, max: -DBL_MAX). */
+#define REDUCE_GRID(n_)                                                             \
+    int blockSize = REDUCE_BLOCK;                                                   \
+    int numBlocks = ((n_) + blockSize - 1) / blockSize;                             \
+    if (numBlocks > REDUCE_MAX_BLOCKS) numBlocks = REDUCE_MAX_BLOCKS
+
+#define DEF_REDUCE_WRAPPER_TYPED(NAME, KERNEL, T)                                   \
+void NAME(const T *a, double *result, int n) {                                      \
+    REDUCE_GRID(n);                                                                 \
+    KERNEL<T><<<numBlocks, blockSize>>>(a, result, n);                              \
+}
+#define DEF_REDUCE_WRAPPER_T_BUNDLE(OP, KERNEL)                                     \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_i8,  KERNEL, int8_t)                \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_u8,  KERNEL, uint8_t)               \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_i16, KERNEL, int16_t)               \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_u16, KERNEL, uint16_t)              \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_i32, KERNEL, int32_t)               \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_u32, KERNEL, uint32_t)              \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_i64, KERNEL, int64_t)               \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_u64, KERNEL, uint64_t)              \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_f32, KERNEL, float)                 \
+    DEF_REDUCE_WRAPPER_TYPED(cuda_reduce_##OP##_f64, KERNEL, double)
+
+DEF_REDUCE_WRAPPER_T_BUNDLE(sum,  tcuda_reduce_sum_kernel)
+DEF_REDUCE_WRAPPER_T_BUNDLE(prod, tcuda_reduce_prod_kernel)
+DEF_REDUCE_WRAPPER_T_BUNDLE(min,  tcuda_reduce_min_kernel)
+DEF_REDUCE_WRAPPER_T_BUNDLE(max,  tcuda_reduce_max_kernel)
+
+/* Emulated-dtype wrappers. The C-facing prototypes in cuda_math.h take
+   the raw storage type (uint16_t for float16, uint8_t for fp4/fp8,
+   double for dd128 — interleaved hi/lo) so callers can pass
+   NDArray_DATA() without dtype-specific casts; we cast to the kernel's
+   native pointer type inside. */
+void cuda_reduce_sum_f16(const uint16_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_sum_half_kernel<<<numBlocks, blockSize>>>((const __half *)a, result, n);
+}
+void cuda_reduce_prod_f16(const uint16_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_prod_half_kernel<<<numBlocks, blockSize>>>((const __half *)a, result, n);
+}
+void cuda_reduce_min_f16(const uint16_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_min_half_kernel<<<numBlocks, blockSize>>>((const __half *)a, result, n);
+}
+void cuda_reduce_max_f16(const uint16_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_max_half_kernel<<<numBlocks, blockSize>>>((const __half *)a, result, n);
+}
+void cuda_reduce_sum_fp4(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_sum_fp4_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_prod_fp4(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_prod_fp4_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_min_fp4(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_min_fp4_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_max_fp4(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_max_fp4_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_sum_fp8(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_sum_fp8_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_prod_fp8(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_prod_fp8_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_min_fp8(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_min_fp8_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_max_fp8(const uint8_t *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_max_fp8_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_sum_dd(const double *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_sum_dd_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_prod_dd(const double *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_prod_dd_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_min_dd(const double *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_min_dd_kernel<<<numBlocks, blockSize>>>(a, result, n);
+}
+void cuda_reduce_max_dd(const double *a, double *result, int n) {
+    REDUCE_GRID(n); tcuda_reduce_max_dd_kernel<<<numBlocks, blockSize>>>(a, result, n);
 }
 
 /* Strided device-to-device copy wrapper. Single kernel launch covers any
@@ -2577,7 +2829,6 @@ int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
         dst_gpu, src_gpu, n_elems, dims);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
-    cudaDeviceSynchronize();
     return 0;
 }
 

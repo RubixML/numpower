@@ -675,7 +675,13 @@ NDArray_FREE(NDArray *array) {
             efree(array->dimensions);
         }
 
-        if (array->data != NULL && array->base == NULL && array->descriptor->numElements > 0) {
+        if (array->data != NULL && array->base == NULL) {
+            /* Free unconditionally when this NDArray owns its buffer.
+               numElements == 0 still allocates a sentinel pointer
+               (emalloc(0) on CPU; cudaMalloc(0) on GPU, which also
+               increments the vmalloc counter even when it returns NULL),
+               so skipping the free here would imbalance the VCHECK
+               counter and silently leak the CPU sentinel. */
             if (NDArray_DEVICE(array) == NDARRAY_DEVICE_CPU) {
                 efree(array->data);
             } else {

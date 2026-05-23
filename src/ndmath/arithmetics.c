@@ -3,6 +3,7 @@
 #include "Zend/zend_API.h"
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include "arithmetics.h"
 #ifndef _MSC_VER
 #include "../../config.h"
@@ -106,6 +107,286 @@ NDArray_Mean_Float(NDArray* a) {
 #endif
     }
     return value;
+}
+
+/**
+ * @brief Identity-value enumeration for the four reduction operations.
+ *
+ * Shared by the CPU walk in `ndarray_reduce_cpu` and (on CUDA builds) the
+ * GPU dispatcher; declared at file scope so it remains visible whether or
+ * not `HAVE_CUBLAS` is defined. macOS clang errors on the forward-only
+ * declaration that ifdef-guarding produces.
+ */
+enum ndarray_reduce_op { ND_RED_SUM, ND_RED_PROD, ND_RED_MIN, ND_RED_MAX };
+
+#ifdef HAVE_CUBLAS
+/**
+ * @brief Return the identity value for reduction @p op as a double.
+ *
+ * sum = 0, prod = 1, min = +DBL_MAX, max = -DBL_MAX. Used to seed the
+ * GPU accumulator so the first atomic merge produces the correct result.
+ */
+static inline double ndarray_reduce_identity(enum ndarray_reduce_op op) {
+    switch (op) {
+        case ND_RED_SUM:  return 0.0;
+        case ND_RED_PROD: return 1.0;
+        case ND_RED_MIN:  return DBL_MAX;
+        case ND_RED_MAX:  return -DBL_MAX;
+    }
+    return 0.0;
+}
+
+/**
+ * @brief Dispatch a single-axis-free reduction to the per-dtype GPU
+ *        kernel and return the result as a double.
+ *
+ * Every dtype maps to a dedicated `cuda_reduce_<op>_<tag>` launch (see
+ * `src/ndmath/cuda/cuda_math.h`). The accumulator is a single
+ * GPU-resident double slot seeded with the operation's identity before
+ * launch; the kernel atomically merges per-element values into that
+ * slot, then we cudaMemcpy the final value back to host and free the
+ * slot. No D2H of the input data ever happens — the entire reduction
+ * runs on the device.
+ *
+ * @param[in] a   GPU-resident input NDArray.
+ * @param[in] op  Which reduction to perform.
+ * @return Reduction result as `double`; on dispatch failure (e.g.
+ *         allocation), throws a PHP error and returns 0.0.
+ */
+static double
+ndarray_reduce_dispatch_gpu(NDArray *a, enum ndarray_reduce_op op) {
+    long n = NDArray_NUMELEMENTS(a);
+    const char *t = NDArray_TYPE(a);
+    const void *src = (const void *) NDArray_DATA(a);
+    double *d_acc = NULL;
+    vmalloc((void **) &d_acc, sizeof(double));
+    if (d_acc == NULL) {
+        zend_throw_error(NULL, "Failed to allocate GPU reduction accumulator");
+        return 0.0;
+    }
+    double seed = ndarray_reduce_identity(op);
+    cudaError_t cerr = cudaMemcpy(d_acc, &seed, sizeof(double), cudaMemcpyHostToDevice);
+    if (cerr != cudaSuccess) {
+        vfree(d_acc);
+        zend_throw_error(NULL, "GPU reduction seed copy failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
+
+    int dispatched = 0;
+#define DISPATCH_PAIR(DT_STR, TAG, T)                                              \
+    if (!dispatched && is_type(t, DT_STR)) {                                        \
+        switch (op) {                                                               \
+            case ND_RED_SUM:  cuda_reduce_sum_##TAG ((const T *) src, d_acc, (int) n); break; \
+            case ND_RED_PROD: cuda_reduce_prod_##TAG((const T *) src, d_acc, (int) n); break; \
+            case ND_RED_MIN:  cuda_reduce_min_##TAG ((const T *) src, d_acc, (int) n); break; \
+            case ND_RED_MAX:  cuda_reduce_max_##TAG ((const T *) src, d_acc, (int) n); break; \
+        }                                                                           \
+        dispatched = 1;                                                             \
+    }
+    DISPATCH_PAIR("int8",     i8,  int8_t)
+    DISPATCH_PAIR("uint8",    u8,  uint8_t)
+    DISPATCH_PAIR("int16",    i16, int16_t)
+    DISPATCH_PAIR("uint16",   u16, uint16_t)
+    DISPATCH_PAIR("int32",    i32, int32_t)
+    DISPATCH_PAIR("uint32",   u32, uint32_t)
+    DISPATCH_PAIR("int64",    i64, int64_t)
+    DISPATCH_PAIR("uint64",   u64, uint64_t)
+    DISPATCH_PAIR("float32",  f32, float)
+    DISPATCH_PAIR("float64",  f64, double)
+    DISPATCH_PAIR("float16",  f16, uint16_t)
+    DISPATCH_PAIR("float4",   fp4, uint8_t)
+    DISPATCH_PAIR("float8",   fp8, uint8_t)
+    DISPATCH_PAIR("float128", dd,  double)
+#undef DISPATCH_PAIR
+
+    if (!dispatched) {
+        /* No kernel ran — the result would silently be the identity value.
+           Surface this as a hard error so the caller knows the dtype is
+           unsupported on the GPU path. The accumulator is still vfree'd
+           below to keep VCHECK happy. */
+        vfree(d_acc);
+        zend_throw_error(NULL,
+                         "GPU reduction is not implemented for dtype \"%s\"", t);
+        return 0.0;
+    }
+    /* After the kernel launch, surface any configuration / launch error so
+       it doesn't silently appear inside an unrelated call later. The result
+       D2H below is a blocking cudaMemcpy on the same default stream, which
+       also synchronises and flushes any pending async error. */
+    cerr = cudaPeekAtLastError();
+    if (cerr != cudaSuccess) {
+        vfree(d_acc);
+        zend_throw_error(NULL, "GPU reduction kernel launch failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
+    double result = seed;
+    cerr = cudaMemcpy(&result, d_acc, sizeof(double), cudaMemcpyDeviceToHost);
+    vfree(d_acc);
+    if (cerr != cudaSuccess) {
+        zend_throw_error(NULL, "GPU reduction result copy failed: %s",
+                         cudaGetErrorString(cerr));
+        return 0.0;
+    }
+    return result;
+}
+#endif /* HAVE_CUBLAS */
+
+/**
+ * @brief CPU-side generic reduction over every supported dtype.
+ *
+ * Walks @p a's host buffer element by element via
+ * `ndarray_element_to_double` and accumulates in a `double`. Used only
+ * when @p a is CPU-resident; GPU inputs route through
+ * `ndarray_reduce_dispatch_gpu` so the entire reduction stays on device.
+ *
+ * @param[in] a Source NDArray, must be CPU-resident.
+ * @param[in] op Which reduction to perform.
+ * @return Reduction result; throws on empty min / max.
+ */
+static double
+ndarray_reduce_cpu(NDArray *a, enum ndarray_reduce_op op) {
+    long n = NDArray_NUMELEMENTS(a);
+    const char *t = NDArray_TYPE(a);
+    const char *src = (const char *) NDArray_DATA(a);
+    switch (op) {
+        case ND_RED_SUM: {
+            double s = 0.0;
+            for (long i = 0; i < n; i++) {
+                s += ndarray_element_to_double(t, src, (size_t) i);
+            }
+            return s;
+        }
+        case ND_RED_PROD: {
+            double p = 1.0;
+            for (long i = 0; i < n; i++) {
+                p *= ndarray_element_to_double(t, src, (size_t) i);
+            }
+            return p;
+        }
+        case ND_RED_MIN:
+        case ND_RED_MAX: {
+            double cur = ndarray_element_to_double(t, src, 0);
+            for (long i = 1; i < n; i++) {
+                double v = ndarray_element_to_double(t, src, (size_t) i);
+                if (isnan(v)) return v;
+                if (op == ND_RED_MIN ? (v < cur) : (v > cur)) cur = v;
+            }
+            return cur;
+        }
+    }
+    return 0.0;
+}
+
+/**
+ * @brief Sum of all elements as a double, dispatched by dtype and device.
+ *
+ * GPU inputs are reduced entirely on the device via the per-dtype
+ * `cuda_reduce_sum_<tag>` kernels; no host staging. CPU inputs walk
+ * the buffer with `ndarray_element_to_double`. Accumulator is `double`
+ * regardless of source dtype.
+ *
+ * Empty input (n == 0) returns `0.0`, matching NumPy's sum.identity.
+ *
+ * @param[in] a Input NDArray (any dtype, any device).
+ * @return Sum as `double`.
+ */
+double
+NDArray_Reduce_Sum(NDArray *a) {
+    long n = NDArray_NUMELEMENTS(a);
+    if (n <= 0) return 0.0;
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
+        return ndarray_reduce_dispatch_gpu(a, ND_RED_SUM);
+    }
+#endif
+    return ndarray_reduce_cpu(a, ND_RED_SUM);
+}
+
+/**
+ * @brief Product of all elements as a double, dispatched by dtype and device.
+ *
+ * GPU inputs use `cuda_reduce_prod_<tag>`; CPU inputs walk the host
+ * buffer. Empty input returns `1.0` (prod.identity).
+ *
+ * @param[in] a Input NDArray (any dtype, any device).
+ * @return Product as `double`.
+ */
+double
+NDArray_Reduce_Prod(NDArray *a) {
+    long n = NDArray_NUMELEMENTS(a);
+    if (n <= 0) return 1.0;
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
+        return ndarray_reduce_dispatch_gpu(a, ND_RED_PROD);
+    }
+#endif
+    return ndarray_reduce_cpu(a, ND_RED_PROD);
+}
+
+/**
+ * @brief Minimum element as a double, dispatched by dtype and device.
+ *
+ * GPU inputs use `cuda_reduce_min_<tag>`; CPU inputs walk the host
+ * buffer. NaN propagates: a single NaN element forces a NaN result.
+ *
+ * @param[in] a Input NDArray (any dtype, any device).
+ * @return Minimum value; throws on empty input.
+ */
+double
+NDArray_Reduce_Min(NDArray *a) {
+    long n = NDArray_NUMELEMENTS(a);
+    if (n <= 0) {
+        zend_throw_error(NULL, "zero-size array to reduction operation min");
+        return 0.0;
+    }
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
+        return ndarray_reduce_dispatch_gpu(a, ND_RED_MIN);
+    }
+#endif
+    return ndarray_reduce_cpu(a, ND_RED_MIN);
+}
+
+/**
+ * @brief Maximum element as a double, dispatched by dtype and device.
+ *
+ * GPU inputs use `cuda_reduce_max_<tag>`; CPU inputs walk the host
+ * buffer. NaN propagates as in `NDArray_Reduce_Min`.
+ *
+ * @param[in] a Input NDArray (any dtype, any device).
+ * @return Maximum value; throws on empty input.
+ */
+double
+NDArray_Reduce_Max(NDArray *a) {
+    long n = NDArray_NUMELEMENTS(a);
+    if (n <= 0) {
+        zend_throw_error(NULL, "zero-size array to reduction operation max");
+        return 0.0;
+    }
+#ifdef HAVE_CUBLAS
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
+        return ndarray_reduce_dispatch_gpu(a, ND_RED_MAX);
+    }
+#endif
+    return ndarray_reduce_cpu(a, ND_RED_MAX);
+}
+
+/**
+ * @brief Arithmetic mean of all elements as a double, dispatched by dtype.
+ *
+ * Computed as `NDArray_Reduce_Sum(a) / n`. Empty input returns `NaN`,
+ * matching NumPy's mean on a zero-size array.
+ *
+ * @param[in] a Input NDArray (any dtype, any device).
+ * @return Mean as `double`.
+ */
+double
+NDArray_Reduce_Mean(NDArray *a) {
+    long n = NDArray_NUMELEMENTS(a);
+    if (n <= 0) return NAN;
+    return NDArray_Reduce_Sum(a) / (double) n;
 }
 
 // Comparison function for sorting
@@ -219,7 +500,6 @@ NDArray_Add_Float(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -340,7 +620,6 @@ NDArray* NDArray_Add_Double(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(double));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -618,7 +897,6 @@ NDArray_Subtract_Float(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -743,7 +1021,6 @@ NDArray* NDArray_Subtract_Double(NDArray* a, NDArray* b) {
         } else {
             vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(double));
         }
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -901,7 +1178,6 @@ NDArray_Divide_Float(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -1032,7 +1308,6 @@ NDArray_Mod_Float(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -1163,7 +1438,6 @@ NDArray_Pow_Float(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(float));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {
@@ -1267,7 +1541,6 @@ NDArray* NDArray_Pow_Double(NDArray* a, NDArray* b) {
     if (NDArray_DEVICE(a_broad) == NDARRAY_DEVICE_GPU) {
 #if HAVE_CUBLAS
         vmalloc((void **) &result->data, NDArray_NUMELEMENTS(a_broad) * sizeof(double));
-        cudaDeviceSynchronize();
         result->device = NDARRAY_DEVICE_GPU;
 #endif
     } else {

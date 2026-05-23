@@ -13,6 +13,18 @@ NDArray* NDArray_Mod_Float(NDArray* a, NDArray* b);
 float NDArray_Sum_Float(NDArray* a);
 float NDArray_Float_Prod(NDArray* a);
 float NDArray_Mean_Float(NDArray* a);
+
+/* ── dtype-aware reductions ─────────────────────────────────────────────────
+   Read the source buffer with the correct stride for every supported dtype
+   and accumulate in double. The legacy NDArray_Sum_Float / NDArray_Float_Prod
+   / NDArray_Mean_Float / NDArray_Min / NDArray_Max helpers cast the buffer
+   to (float*) regardless of dtype, which returns garbage for any non-float32
+   input. These helpers fix that for the no-axis PHP entry points. */
+double NDArray_Reduce_Sum(NDArray *a);
+double NDArray_Reduce_Prod(NDArray *a);
+double NDArray_Reduce_Min(NDArray *a);
+double NDArray_Reduce_Max(NDArray *a);
+double NDArray_Reduce_Mean(NDArray *a);
 float NDArray_Mean_Float_Axis(NDArray* a, NDArray *b);
 NDArray* NDArray_Abs(NDArray *nda);
 float NDArray_Median_Float(NDArray* a);

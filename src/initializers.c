@@ -3,6 +3,8 @@
 #include "Zend/zend_API.h"
 #include "initializers.h"
 #include "ndarray.h"
+#include "ndarray/frontend/ndarray_factory.h"
+#include "buffer.h"
 #include "types.h"
 #ifndef _MSC_VER
 #include "../config.h"
@@ -22,89 +24,13 @@
 #include "gpu_alloc.h"
 #endif
 
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "misc-no-recursion"
-#pragma ide diagnostic ignored "NullDereference"
-
 /**
- * Get number of dimensions from php_array
+ * @brief Create a new NDArray descriptor.
  *
- * @param arr
- * @return
- */
-int get_num_dims_from_zval(zval *arr) {
-    int num_dims = 0;
-
-    if (zend_array_count(Z_ARRVAL_P(arr)) == 0) {
-        return 1;
-    }
-
-    zval *val = zend_hash_index_find(Z_ARRVAL_P(arr), 0);
-    while (val && Z_TYPE_P(val) == IS_ARRAY) {
-        num_dims++;
-        val = zend_hash_index_find(Z_ARRVAL_P(val), 0);
-    }
-    return num_dims+1;
-}
-
-/**
- *
- * @param arr
- * @param shape
- * @param ndim
- */
-void get_zend_array_shape(zend_array* arr, int* shape, int ndim) {
-    int i;
-
-    if (shape == NULL && ndim != 0) {
-        return;
-    }
-
-    if (zend_array_count(arr) == 0) {
-        return;
-    }
-
-    // Initialize shape array to zeros
-    for (i = 0; i < ndim; i++) {
-        shape[i] = 0;
-    }
-
-    // Traverse the array to get the shape
-    zval* val;
-    ZEND_HASH_FOREACH_VAL(arr, val) {
-        if (Z_TYPE_P(val) == IS_ARRAY) {
-            get_zend_array_shape(Z_ARRVAL_P(val), shape + 1, ndim - 1);
-            shape[0]++;
-        } else {
-            shape[0]++;
-        }
-    }
-    ZEND_HASH_FOREACH_END();
-}
-#pragma clang diagnostic pop
-
-/**
- *
- * @param arr
- * @return
- */
-int is_packed_zend_array(zend_array *arr) {
-    if (arr->nNumUsed == arr->nNumOfElements) {
-        return 1;  // the array is packed
-    } else {
-        return 0;  // the array is sparse
-    }
-}
-
-
-
-/**
- * Create a new NDArray Descriptor
- *
- * @param numElements
- * @param elSize
- * @param type
- * @return
+ * @param numElements element count this buffer will hold
+ * @param elsize      per-element size in bytes
+ * @param type        dtype tag (one of NDARRAY_TYPE_*)
+ * @return            newly allocated NDArrayDescriptor (caller owns)
  */
 NDArrayDescriptor* Create_Descriptor(long numElements, int elsize, const char* type) {
     NDArrayDescriptor* ndArrayDescriptor = emalloc(sizeof(NDArrayDescriptor));
@@ -142,236 +68,36 @@ int* Generate_Strides(const int* dimensions, int dimensions_size, int elsize) {
 }
 
 /**
+ * @brief Build a float32 NDArray from a PHP array zval (legacy entry).
  *
- * @param buffer
- * @param numElements
- * @param elsize
- */
-void
-NDArray_CreateBuffer(NDArray* array, int numElements, int elsize) {
-    array->data = emalloc(numElements * elsize);
-}
-
-int iteration = 0;
-
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "misc-no-recursion"
-
-void
-NDArrayFillFromZendArray(NDArray* target, zend_array* target_zval, int* first_index) {
-    zval * element;
-
-    ZEND_HASH_FOREACH_VAL(target_zval, element) {
-        ZVAL_DEREF(element);
-        switch (Z_TYPE_P(element)) {
-            case IS_ARRAY:
-                NDArrayFillFromZendArray(target, Z_ARRVAL_P(element), first_index);
-                break;
-            case IS_LONG:
-                if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT32) {
-                    float* data_float;
-                    data_float = NDArray_F32DATA(target);
-                    data_float[*first_index] = (float) zval_get_long(element);
-                } else if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT64) {
-                    double* data_double;
-                    data_double = NDArray_F64DATA(target);
-                    data_double[*first_index] = zval_get_long(element);
-                }
-            case IS_DOUBLE:
-                if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT32) {
-                    float* data_float;
-                    data_float = NDArray_F32DATA(target);
-                    data_float[*first_index] = (float) zval_get_double(element);
-                } else if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT64) {
-                    double* data_double;
-                    data_double = NDArray_F64DATA(target);
-                    data_double[*first_index] = zval_get_double(element);
-                }
-                *first_index = *first_index + 1;
-                break;
-            case IS_TRUE:
-                if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT32) {
-                    float* data_float;
-                    data_float = NDArray_F32DATA(target);
-                    data_float[*first_index] = (float) 1.0;
-                } else if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT64) {
-                    double* data_double;
-                    data_double = NDArray_F64DATA(target);
-                    data_double[*first_index] = (double) 1.0;
-                }
-                *first_index = *first_index + 1;
-                break;
-            case IS_FALSE:
-                if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT32) {
-                    float* data_float;
-                    data_float = NDArray_F32DATA(target);
-                    data_float[*first_index] = (float) 0.0;
-                } else if (NDArray_TYPE(target) == NDARRAY_TYPE_FLOAT64) {
-                    double* data_double;
-                    data_double = NDArray_F64DATA(target);
-                    data_double[*first_index] = (double) 0.0;
-                }
-                *first_index = *first_index + 1;
-                break;
-            default:
-                zend_throw_error(NULL, "an element with an invalid type was used at initialization");
-                return;
-        }
-    }
-    ZEND_HASH_FOREACH_END();
-}
-
-/**
- * @param target_carray
- */
-void
-NDArray_CopyFromZendArray(NDArray* target, zend_array* target_zval, int * first_index) {
-    zval * element;
-    float * data_double;
-
-    ZEND_HASH_FOREACH_VAL(target_zval, element) {
-        ZVAL_DEREF(element);
-        switch (Z_TYPE_P(element)) {
-            case IS_ARRAY:
-                NDArray_CopyFromZendArray(target, Z_ARRVAL_P(element), first_index);
-                break;
-            case IS_LONG:
-                convert_to_long(element);
-                data_double = NDArray_F32DATA(target);
-                data_double[*first_index] = (float) zval_get_long(element);
-                *first_index = *first_index + 1;
-                break;
-            case IS_TRUE:
-                convert_to_long(element);
-                data_double = NDArray_F32DATA(target);
-                data_double[*first_index] = (float) 1.0;
-                *first_index = *first_index + 1;
-                break;
-            case IS_FALSE:
-                convert_to_long(element);
-                data_double = NDArray_F32DATA(target);
-                data_double[*first_index] = (float) 0.0;
-                *first_index = *first_index + 1;
-                break;
-            case IS_DOUBLE:
-                convert_to_double(element);
-                data_double = NDArray_F32DATA(target);
-                data_double[*first_index] = (float) zval_get_double(element);
-                *first_index = *first_index + 1;
-                break;
-            default:
-                zend_throw_error(NULL, "an element with an invalid type was used at initialization");
-                return;
-        }
-    }
-    ZEND_HASH_FOREACH_END();
-}
-#pragma clang diagnostic pop
-
-/**
- * Create NDArray from zend_array
+ * Used by `ZVAL_TO_NDARRAY` when an arithmetic op receives a raw PHP
+ * array as one operand. Delegates to the modern factory so it benefits
+ * from sparse-key handling and rectangular-shape validation; ragged
+ * inputs now raise a catchable `Error` (was a fatal `E_ERROR` before).
  *
- * @param ht
- * @param ndim
- * @return
- */
-NDArray* Create_NDArray_FromZendArray(zend_array* ht, int ndim) {
-    int last_index = 0;
-    int *shape;
-    if (ndim != 0) {
-        shape = ecalloc(ndim, sizeof(int));
-    } else {
-        shape = ecalloc(1, sizeof(int));
-    }
-    if (!is_packed_zend_array(ht)) {
-        return NULL;
-    }
-    get_zend_array_shape(ht, shape, ndim);
-    int total_num_elements = shape[0];
-
-    // Calculate number of elements
-    for (int i = 1; i < ndim; i++) {
-        total_num_elements *= shape[i];
-    }
-    NDArray* array = Create_NDArray(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-    if (ndim != 0) {
-        NDArray_CreateBuffer(array, total_num_elements, get_type_size(NDARRAY_TYPE_FLOAT32));
-        NDArray_CopyFromZendArray(array, ht, &last_index);
-    } else {
-        array->data = NULL;
-        array->descriptor->numElements = 0;
-    }
-
-    array->uuid = -1;
-
-    return array;
-}
-
-zend_bool validate_array(zval *arr) {
-    if (Z_TYPE_P(arr) != IS_ARRAY) {
-        return 0;
-    }
-
-    HashTable *ht = Z_ARRVAL_P(arr);
-    if (ht->nNumOfElements == 0) {
-        return 1;
-    }
-
-    zval *first_elem = NULL;
-    zend_ulong idx;
-    zend_string *key;
-
-    ZEND_HASH_FOREACH_KEY_VAL(ht, idx, key, first_elem) {
-        break;
-    } ZEND_HASH_FOREACH_END();
-
-    if (!first_elem) return 1;
-
-    int first_type = Z_TYPE_P(first_elem);
-    uint32_t expected_count = 0;
-
-    if (first_type == IS_ARRAY) {
-        expected_count = zend_hash_num_elements(Z_ARRVAL_P(first_elem));
-    }
-
-    ZEND_HASH_FOREACH_VAL(ht, first_elem) {
-        if (Z_TYPE_P(first_elem) != first_type &&
-            !((Z_TYPE_P(first_elem) == IS_LONG || Z_TYPE_P(first_elem) == IS_DOUBLE) &&
-            (first_type == IS_LONG || first_type == IS_DOUBLE))) {
-                return 0;
-        }
-
-        if (first_type == IS_ARRAY) {
-            HashTable *nested_ht = Z_ARRVAL_P(first_elem);
-            if (zend_hash_num_elements(nested_ht) != expected_count) {
-                return 0;
-            }
-
-            if (!validate_array(first_elem)) {
-                return 0;
-            }
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    return 1;
-}
-
-/**
- * Create NDArray from PHP Object (zval)
+ * The modern factory registers every created NDArray in the global
+ * buffer. The legacy `ZVAL_TO_NDARRAY` contract, however, is that the
+ * temporary is owned by the immediate caller and released with a plain
+ * `NDArray_FREE`; the caller never touches `buffer_ndarray_free`. To
+ * keep that contract we detach the new NDArray from the buffer here so
+ * `NDArray_FREE` is balanced and no stale slot survives past the call.
  *
- * @param php_object
- * @return
+ * Non-array zvals are not handled here — `ZVAL_TO_NDARRAY` routes
+ * scalars and NDArray objects through dedicated factories.
+ *
+ * @param[in] php_object zval; must be IS_ARRAY for a non-NULL return
+ * @return    new NDArray on success, NULL otherwise (caller frees with NDArray_FREE)
  */
 NDArray* Create_NDArray_FromZval(zval* php_object) {
-    NDArray* new_array = NULL;
-    if (Z_TYPE_P(php_object) == IS_ARRAY) {
-        int res = validate_array(php_object);
-        if (!res) {
-            zend_error(E_ERROR, "ARRAY VALIDATION ERROR!");
-        }
-        new_array = Create_NDArray_FromZendArray(Z_ARRVAL_P(php_object), get_num_dims_from_zval(php_object));
+    if (Z_TYPE_P(php_object) != IS_ARRAY) {
+        return NULL;
     }
-    return new_array;
+    NDArray *rtn = NDArrayFactory_createFromZval(php_object, NDARRAY_TYPE_FLOAT32);
+    if (rtn != NULL && rtn->uuid != -1) {
+        buffer_replace(rtn->uuid, NULL);
+        rtn->uuid = -1;
+    }
+    return rtn;
 }
 
 /**
