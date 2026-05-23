@@ -63,6 +63,33 @@ vfree(void* target) {
     cudaFree(target);
 }
 
+/**
+ * @brief Broadcast @p value_host across @p n elements of @p dst on the device.
+ *
+ * Doubling-prefix implementation: seed dst[0] from the host, then repeatedly
+ * cudaMemcpy the populated prefix onto the unwritten tail. The work is
+ * D2D except for the single H2D seed of @p elsize bytes, so host RAM
+ * usage stays at whatever the caller passes — independent of @p n.
+ *
+ * @see gpu_alloc.h::cuda_fill_bytes for the public contract.
+ */
+void
+cuda_fill_bytes(char *dst, const char *value_host, size_t elsize, long n) {
+    if (n <= 0 || dst == NULL || value_host == NULL || elsize == 0) {
+        return;
+    }
+    cudaMemcpy(dst, value_host, elsize, cudaMemcpyHostToDevice);
+    long filled = 1;
+    while (filled < n) {
+        long copy_count = (filled * 2 <= n) ? filled : (n - filled);
+        cudaMemcpy(dst + (size_t)filled * elsize,
+                   dst,
+                   (size_t)copy_count * elsize,
+                   cudaMemcpyDeviceToDevice);
+        filled += copy_count;
+    }
+}
+
 void
 vmemcheck() {
     if (MAIN_MEM_STACK.totalGPUAllocated != 0) {

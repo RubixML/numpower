@@ -329,24 +329,88 @@ NDArray_Zeros(int *shape, int ndim, const char *type, const int device) {
 }
 
 /**
- * Initialize NDArray with zeros
+ * @brief Allocate an NDArray of the requested shape / dtype / device and
+ *        fill every element with the dtype-appropriate representation of 1.
  *
- * @param shape
- * @param ndim
- * @return
+ * The previous implementation always allocated `numElements * sizeof(float)`
+ * bytes and broadcast a float32 1.0 into them regardless of @p type — a
+ * dormant buffer-size + wrong-value bug that this rewrite fixes by routing
+ * through `NDArray_Empty` (dtype-aware allocator on both devices) and
+ * encoding the scalar via `ndarray_set_from_double` once. The 1-element
+ * encoded scratch buffer is then broadcast across the destination:
+ *  - CPU: `memset` for elsize == 1, otherwise a `memcpy` loop.
+ *  - GPU: `cuda_fill_bytes` doubling D2D broadcast — no host buffer is
+ *         created for the destination; only the @p elsize source seed
+ *         (and, for fp128, the 16-byte DD-encoded pair) crosses the bus.
+ *
+ * @param[in] shape  Newly-allocated int[ndim]; ownership transfers to the
+ *                   returned NDArray (it lives in `rtn->dimensions`).
+ * @param[in] ndim   Number of dimensions; 0 yields a 0-D scalar of value 1.
+ * @param[in] type   Canonical dtype string (one of the 14 supported aliases).
+ * @param[in] device Target device — NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray on success, NULL on validation / allocation failure.
  */
 NDArray*
-NDArray_Ones(int *shape, int ndim, const char *type) {
-    NDArray* rtn = Create_NDArray(shape, ndim, type, NDARRAY_DEVICE_CPU);
+NDArray_Ones(int *shape, int ndim, const char *type, int device) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) {
+            efree(shape);
+        }
+        return NULL;
+    }
+
+    NDArray *rtn = NDArray_Empty(shape, ndim, type, device);
     if (rtn == NULL) {
         return NULL;
     }
 
-    long i;
-    rtn->data = emalloc(sizeof(float) * NDArray_NUMELEMENTS(rtn));
-    for (i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
-        NDArray_F32DATA(rtn)[i] = (float)1.0;
+    long n = NDArray_NUMELEMENTS(rtn);
+    if (n <= 0) {
+        return rtn;
     }
+
+    /* Encode the dtype's representation of 1.0 once into a 16-byte stack
+       scratch (16 = NDARRAY_FP128_SIZE, the widest dtype). All narrower
+       dtypes use only the leading `elsize` bytes; the unused tail stays
+       zero from the memset. */
+    char encoded[NDARRAY_FP128_SIZE];
+    memset(encoded, 0, sizeof(encoded));
+    ndarray_set_from_double(type, encoded, 0, 1.0);
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        char *data = (char *)rtn->data;
+        if (elsize == 1) {
+            memset(data, encoded[0], (size_t)n);
+        } else {
+            for (long i = 0; i < n; i++) {
+                memcpy(data + (size_t)i * (size_t)elsize, encoded, (size_t)elsize);
+            }
+        }
+    }
+#ifdef HAVE_CUBLAS
+    else if (device == NDARRAY_DEVICE_GPU) {
+        if (!strcmp(type, "float128")) {
+            /* fp128 on GPU lives as a (hi, lo) double-double pair. Encode
+               (1.0, 0.0) directly — bypasses the host fp128 representation
+               which is layout-incompatible with the on-device DD. */
+            double dd[2] = { 1.0, 0.0 };
+            cuda_fill_bytes((char *)rtn->data, (const char *)dd,
+                            sizeof(dd), n);
+        } else {
+            cuda_fill_bytes((char *)rtn->data, encoded, (size_t)elsize, n);
+        }
+    }
+#else
+    else if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS before requesting GPU.
+           If they didn't, fail loudly instead of returning an NDArray with
+           uninitialised on-device storage. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
     return rtn;
 }
 
@@ -604,16 +668,27 @@ NDArray_FillFloat(NDArray *a, float fill_value) {
     return a;
 }
 
+/**
+ * @brief Broadcast @p fill_value across every element of a float64 NDArray @p a.
+ *
+ * Pre-existing bug fixed: the GPU branch used to dispatch to
+ * `cuda_fill_float`, writing 4-byte float32 values into the 8-byte float64
+ * buffer and silently corrupting the on-device data of every other element
+ * (and trampling N/2 elements past the end of the requested range). The
+ * GPU path now dispatches to `cuda_fill_double` to match the buffer dtype.
+ *
+ * @param[in,out] a          float64 NDArray to fill in place (CPU or GPU).
+ * @param[in]     fill_value Scalar value broadcast across every element.
+ * @return @p a (unchanged pointer, mutated in place).
+ */
 NDArray* NDArray_FillDouble(NDArray *a, double fill_value) {
-    int i;
-
     if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
-        cuda_fill_float(NDArray_F32DATA(a), fill_value, NDArray_NUMELEMENTS(a));
-        return a;
+        cuda_fill_double(NDArray_F64DATA(a), fill_value,
+                         NDArray_NUMELEMENTS(a));
 #endif
     } else {
-        for (i = 0; i < NDArray_NUMELEMENTS(a); i++) {
+        for (int i = 0; i < NDArray_NUMELEMENTS(a); i++) {
             NDArray_F64DATA(a)[i] = fill_value;
         }
     }

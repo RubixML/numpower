@@ -1258,24 +1258,36 @@ NDArray_ScalarToZval(NDArray *array, zval *return_value) {
 }
 
 /**
- * @param nda
- * @return
+ * @brief Read every element of a float32 NDArray as an integer vector.
+ *
+ * Reads each element as float32 (the storage dtype assumed by every caller)
+ * and casts to int — used by the shape-extraction path of initializers.
+ *
+ * Pre-existing bug fixed: the scratch buffer used to dereference a GPU
+ * element was declared `double*` while allocated with `sizeof(float)`. The
+ * post-cudaMemcpy `(int)*tmp_val` then read 8 bytes from a 4-byte
+ * allocation as a double — undefined behaviour that happened to read the
+ * correct low bits on most hosts only because Zend's `emalloc` over-aligns.
+ * The scratch is now a single stack-resident `float`.
+ *
+ * @param[in] nda Source NDArray; must be float32. CPU or GPU resident.
+ * @return Newly-allocated int[NDArray_NUMELEMENTS(nda)]; caller frees with efree.
  */
 int *
 NDArray_ToIntVector(NDArray *nda) {
-    double *tmp_val = emalloc(sizeof(float));
     int *vector = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
     for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
         if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
-            cudaMemcpy(tmp_val, &NDArray_F32DATA(nda)[i], sizeof(float), cudaMemcpyDeviceToHost);
-            vector[i] = (int) *tmp_val;
+            float tmp_val;
+            cudaMemcpy(&tmp_val, &NDArray_F32DATA(nda)[i],
+                       sizeof(float), cudaMemcpyDeviceToHost);
+            vector[i] = (int) tmp_val;
             continue;
 #endif
         }
         vector[i] = (int) NDArray_F32DATA(nda)[i];
     }
-    efree(tmp_val);
     return vector;
 }
 
