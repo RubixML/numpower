@@ -1278,15 +1278,19 @@ PHP_METHOD(NumPower, setDevice) {
         Z_PARAM_LONG(deviceId)
     ZEND_PARSE_PARAMETERS_END();
 #ifdef HAVE_CUBLAS
+    /* Three runtime states are possible on a CUDA-linked build:
+       (a) the toolkit is present AND at least one GPU is visible → take
+           the normal validation + cudaSetDevice path;
+       (b) the toolkit is linked but cudaGetDeviceCount fails or reports
+           0 devices (driver missing, GPU not present, container without
+           the device passed in) → behave like a CPU-only build so the
+           "No GPU device available or CUDA not enabled" contract holds
+           regardless of build flavor;
+       (c) cudaSetDevice itself errors → surface the runtime message. */
     int numDevices = 0;
     cudaError_t err = cudaGetDeviceCount(&numDevices);
-    if (err != cudaSuccess) {
-        zend_throw_error(NULL, "Error getting the number of CUDA devices: %s",
-                         cudaGetErrorString(err));
-        return;
-    }
-    if (numDevices <= 0) {
-        zend_throw_error(NULL, "No CUDA devices are visible to the runtime");
+    if (err != cudaSuccess || numDevices <= 0) {
+        zend_throw_error(NULL, "No GPU device available or CUDA not enabled");
         return;
     }
     if (deviceId < 0 || deviceId >= (zend_long)numDevices) {
@@ -4766,6 +4770,15 @@ PHP_METHOD(NumPower, syncDevice) {
     ZEND_PARSE_PARAMETERS_START(0, 0)
     ZEND_PARSE_PARAMETERS_END();
 #ifdef HAVE_CUBLAS
+    /* If the toolkit is linked but no GPU is visible (CI container, dev
+       machine without driver, etc.) treat the call as a no-op so that
+       portable scripts can sprinkle syncDevice() unconditionally,
+       matching the documented contract for the CPU-only build. */
+    int numDevices = 0;
+    cudaError_t probe = cudaGetDeviceCount(&numDevices);
+    if (probe != cudaSuccess || numDevices <= 0) {
+        return;
+    }
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         zend_throw_error(NULL, "cudaDeviceSynchronize failed: %s",

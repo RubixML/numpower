@@ -531,12 +531,16 @@ NDArray_DumpDevices(void) {
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
 
-    php_printf("\n==============================================================================\n");
-    if (err != cudaSuccess) {
-        php_printf("Failed to retrieve device count: %s\n", cudaGetErrorString(err));
-        php_printf("==============================================================================\n");
+    /* CUDA toolkit linked but no GPU visible (CI container, no driver,
+       …): fall through to the same notice the no-CUBLAS build prints so
+       userland scripts can probe device availability with a single
+       substring check. */
+    if (err != cudaSuccess || deviceCount <= 0) {
+        php_printf("\nNo GPU devices available. CUDA not enabled.\n");
         return;
     }
+
+    php_printf("\n==============================================================================\n");
     php_printf("Number of CUDA devices: %d\n", deviceCount);
     for (int i = 0; i < deviceCount; ++i) {
         struct cudaDeviceProp deviceProp;
