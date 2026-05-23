@@ -109,16 +109,17 @@ NDArray_Mean_Float(NDArray* a) {
     return value;
 }
 
-#ifdef HAVE_CUBLAS
 /**
  * @brief Identity-value enumeration for the four reduction operations.
  *
- * Used as both the host-side accumulator seed and the GPU pre-seed value
- * (cudaMemcpy'd into the device-side double slot before launching the
- * corresponding `cuda_reduce_*` kernel).
+ * Shared by the CPU walk in `ndarray_reduce_cpu` and (on CUDA builds) the
+ * GPU dispatcher; declared at file scope so it remains visible whether or
+ * not `HAVE_CUBLAS` is defined. macOS clang errors on the forward-only
+ * declaration that ifdef-guarding produces.
  */
 enum ndarray_reduce_op { ND_RED_SUM, ND_RED_PROD, ND_RED_MIN, ND_RED_MAX };
 
+#ifdef HAVE_CUBLAS
 /**
  * @brief Return the identity value for reduction @p op as a double.
  *
