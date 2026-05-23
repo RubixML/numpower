@@ -506,40 +506,131 @@ NDArray_Full(int *shape, int ndim, const char *type, int device,
 }
 
 /**
- * Identity Matrix
+ * @brief Allocate a `size × size` identity matrix on the requested device.
  *
- * @param size
- * @return
+ * Always returns a 2-D NDArray of shape `[size, size]`, including the
+ * `size == 0` edge case (numpy's `np.identity(0)` is also a `(0, 0)` 2-D
+ * array; the previous PHP implementation collapsed this to a 1-D
+ * `shape=[0]` array, diverging from numpy).
+ *
+ * Implementation:
+ *  1. Allocate a zero-filled buffer on the target device via
+ *     `NDArray_Zeros` — on GPU this is `cudaMalloc` + `cudaMemset(0)`,
+ *     so the matrix backing storage exists only in VRAM.
+ *  2. Encode the dtype-appropriate `1.0` once into a 16-byte host scratch
+ *     (16 = NDARRAY_FP128_SIZE, the widest dtype).
+ *  3. Write the diagonal:
+ *      - CPU: a `memcpy` loop into the already-zeroed buffer.
+ *      - GPU: a single `cudaMemcpy2D` H2D with `dpitch == (size + 1) *
+ *        elsize` so each row of the source feeds one diagonal element.
+ *        The source is a transient host buffer of `size * elsize` bytes
+ *        (≤ 16 × size — trivial for any practical matrix); the result
+ *        matrix itself never crosses the bus. For fp128 the host source
+ *        carries the (1.0, 0.0) DD pair that the device stores natively.
+ *
+ * Pre-existing bugs fixed:
+ *  - The old implementation hardcoded float32 / CPU storage. Calling it
+ *    with any other dtype would have silently written `float` 1.0 into
+ *    the (possibly differently-sized) buffer.
+ *  - `size == 0` returned a 1-D `[0]` array instead of the canonical
+ *    2-D `[0, 0]` matrix.
+ *  - The diagonal-index calculation used a redundant
+ *    `(i * size * sizeof(float) + i * sizeof(float)) / sizeof(float)`
+ *    pattern; now expressed as `i * (size + 1)` element strides
+ *    (or `(size + 1) * elsize` bytes for the cudaMemcpy2D pitch).
+ *
+ * @param[in] size   Side length of the square matrix; must be ≥ 0.
+ * @param[in] type   Canonical dtype string (one of the 14 supported aliases).
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New identity NDArray on success, NULL on failure (Error in flight).
  */
 NDArray*
-NDArray_Identity(int size) {
-    NDArray *rtn;
-    unsigned long index;
-    int *shape;
-    float *buffer_ptr;
-
+NDArray_Identity(int size, const char *type, int device) {
     if (size < 0) {
         zend_throw_error(NULL, "negative dimensions are not allowed");
         return NULL;
     }
 
-    if (size == 0) {
-        shape = emalloc(sizeof(int) * 1);
-        shape[0] = 0;
-        return NDArray_Empty(shape, 1, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        return NULL;
     }
 
-    shape = emalloc(sizeof(int) * 2);
+    int *shape = emalloc(sizeof(int) * 2);
     shape[0] = size;
     shape[1] = size;
-    rtn = NDArray_Zeros(shape, 2, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
 
-    buffer_ptr = NDArray_F32DATA(rtn);
-    // Set the diagonal elements to one with the specified stride
-    for (int i = 0; i < size; i++) {
-        index = ((i * size * sizeof(float)) + (i * sizeof(float))) / sizeof(float);
-        buffer_ptr[(int)index] = 1.0f;
+    NDArray *rtn = NDArray_Zeros(shape, 2, type, device);
+    if (rtn == NULL) {
+        return NULL;
     }
+    if (size == 0) {
+        return rtn;
+    }
+
+    char encoded[NDARRAY_FP128_SIZE];
+    memset(encoded, 0, sizeof(encoded));
+    ndarray_set_from_double(type, encoded, 0, 1.0);
+
+    long   n           = (long) size;
+    size_t diag_stride = ((size_t)n + 1) * (size_t)elsize;
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        char *data = (char *)rtn->data;
+        for (long i = 0; i < n; i++) {
+            memcpy(data + (size_t)i * diag_stride,
+                   encoded, (size_t)elsize);
+        }
+        return rtn;
+    }
+
+#ifdef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* fp128 on GPU is DD (hi, lo) — encode (1.0, 0.0) directly so the
+           bytes we ship match the on-device layout. Every other dtype
+           uses the same byte representation on host and device, so the
+           original `encoded` scratch is reused. */
+        char one_bytes[NDARRAY_FP128_SIZE];
+        if (!strcmp(type, "float128")) {
+            double dd[2] = { 1.0, 0.0 };
+            memcpy(one_bytes, dd, sizeof(dd));
+        } else {
+            memcpy(one_bytes, encoded, (size_t)elsize);
+        }
+
+        char *src = emalloc((size_t)n * (size_t)elsize);
+        if (elsize == 1) {
+            memset(src, one_bytes[0], (size_t)n);
+        } else {
+            for (long i = 0; i < n; i++) {
+                memcpy(src + (size_t)i * (size_t)elsize,
+                       one_bytes, (size_t)elsize);
+            }
+        }
+
+        cudaError_t err = cudaMemcpy2D(
+            (char *)rtn->data, diag_stride,     /* dst, dpitch */
+            src, (size_t)elsize,                /* src, spitch */
+            (size_t)elsize, (size_t)n,          /* width, height */
+            cudaMemcpyHostToDevice);
+        efree(src);
+        if (err != cudaSuccess) {
+            NDArray_FREE(rtn);
+            zend_throw_error(NULL, "cudaMemcpy2D failed: %s",
+                             cudaGetErrorString(err));
+            return NULL;
+        }
+        return rtn;
+    }
+#else
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS. If they didn't,
+           fail loudly rather than returning a half-initialised result. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
     return rtn;
 }
 

@@ -12,7 +12,7 @@ NDArray* Create_NDArray_FromZval(zval* php_object);
 NDArray* NDArray_FromNDArray(NDArray *target, int buffer_offset, int* shape, int* strides, const int* ndim);
 NDArray* NDArray_Zeros(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Ones(int *shape, int ndim, const char *type, int device);
-NDArray* NDArray_Identity(int size);
+NDArray* NDArray_Identity(int size, const char *type, int device);
 NDArray* NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator);
 NDArray* NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator);
 NDArray* NDArray_StandardNormal(int* shape, int ndim);

@@ -1382,35 +1382,25 @@ PHP_FUNCTION(print_r_) {
 }
 
 /**
- * @brief Parse the (shape, dtype, device) parameter triplet shared by the
- *        typed-and-deviced initializers (`zeros`, `ones`, ...).
+ * @brief Validate the (dtype, device) parameter pair shared by every
+ *        typed-and-deviced initializer.
  *
- * Validates @p data_type against the 14 supported dtype aliases (NULL or
- * empty selects float32), @p device against
- * `{NDARRAY_DEVICE_CPU, NDARRAY_DEVICE_GPU}`, and every shape entry against
- * negativity. Throws a catchable `\Error` and returns 0 on any failure.
+ * Resolves @p data_type to its canonical static pointer (NULL or empty
+ * selects float32) and checks @p device against
+ * `{NDARRAY_DEVICE_CPU, NDARRAY_DEVICE_GPU}`. On a non-CUDA build the
+ * GPU device is rejected loudly here so callers never receive an
+ * NDArray with uninitialised on-device storage. Throws a catchable
+ * `\Error` and returns 0 on any failure.
  *
- * On success the caller owns @p out_shape: it is freshly `emalloc`'d and
- * gets transferred into `rtn->dimensions` by the NDArray builder. At least
- * one int slot is allocated even for ndim == 0 so callers can pass the
- * pointer down without nullability special-casing.
- *
- * @param[in]  shape_zval   PHP shape value; routed through `ZVAL_TO_NDARRAY`
- *                          so PHP arrays, ints, doubles, and existing
- *                          NDArrays are all accepted as input.
- * @param[in]  data_type    Optional dtype alias from `Z_PARAM_STRING`; pass
- *                          NULL when the user omitted the argument.
- * @param[in]  device       Validated against the legal device set below.
- * @param[out] out_dtype    Receives the canonical static dtype pointer.
- * @param[out] out_device   Receives the validated device id (int).
- * @param[out] out_shape    Receives a freshly-allocated `int[*out_ndim]`.
- * @param[out] out_ndim     Receives the number of dimensions.
- * @return 1 on success, 0 on validation failure (an Error is in flight).
+ * @param[in]  data_type  Optional dtype alias; NULL/empty → float32.
+ * @param[in]  device     Long device id from `Z_PARAM_LONG`.
+ * @param[out] out_dtype  Canonical static dtype pointer.
+ * @param[out] out_device Validated device id (int).
+ * @return 1 on success, 0 on validation failure (Error in flight).
  */
 static int
-ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
-                          zend_long device, const char **out_dtype,
-                          int *out_device, int **out_shape, int *out_ndim) {
+ndarray_parse_dtype_device(const char *data_type, zend_long device,
+                           const char **out_dtype, int *out_device) {
     const char *ndarray_dtype = NDARRAY_TYPE_FLOAT32;
     if (data_type != NULL && *data_type != '\0') {
         ndarray_dtype = type_canonicalize(data_type);
@@ -1437,6 +1427,37 @@ ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
     }
 #endif
 
+    *out_dtype  = ndarray_dtype;
+    *out_device = (int) device;
+    return 1;
+}
+
+/**
+ * @brief Parse the (shape, dtype, device) parameter triplet shared by the
+ *        typed-and-deviced shape initializers (`zeros`, `ones`, `full`).
+ *
+ * Wraps `ndarray_parse_dtype_device` with the shape-extraction half:
+ * the shape zval is routed through `ZVAL_TO_NDARRAY` and every entry is
+ * checked against negativity. On success the caller owns @p out_shape
+ * (freshly emalloc'd, transferred into the NDArray builder).
+ *
+ * @param[in]  shape_zval   PHP shape value (array / scalar / NDArray).
+ * @param[in]  data_type    Optional dtype alias.
+ * @param[in]  device       Long device id.
+ * @param[out] out_dtype    Canonical static dtype pointer.
+ * @param[out] out_device   Validated device id.
+ * @param[out] out_shape    Newly-allocated `int[*out_ndim]`.
+ * @param[out] out_ndim     Number of dimensions.
+ * @return 1 on success, 0 on validation failure (Error in flight).
+ */
+static int
+ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
+                          zend_long device, const char **out_dtype,
+                          int *out_device, int **out_shape, int *out_ndim) {
+    if (!ndarray_parse_dtype_device(data_type, device, out_dtype, out_device)) {
+        return 0;
+    }
+
     NDArray *nda = ZVAL_TO_NDARRAY(shape_zval);
     if (nda == NULL) {
         return 0;
@@ -1459,10 +1480,8 @@ ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
     }
     NDArray_FREE(nda);
 
-    *out_dtype  = ndarray_dtype;
-    *out_device = (int) device;
-    *out_shape  = shape;
-    *out_ndim   = ndim;
+    *out_shape = shape;
+    *out_ndim  = ndim;
     return 1;
 }
 
@@ -1712,23 +1731,61 @@ PHP_METHOD(NumPower, notEqual) {
 }
 
 /**
- * NumPower::identity
+ * @brief `NumPower::identity(size, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Builds a `size × size` identity matrix on the requested device with
+ * the dtype-appropriate representation of 1 on the main diagonal and
+ * zeros elsewhere. For `device == 1` (GPU) the backing buffer is
+ * allocated directly in VRAM (`cudaMalloc` + `cudaMemset(0)`) and the
+ * diagonal is written by a single `cudaMemcpy2D` H2D with a stride of
+ * `(size + 1) * elsize` — the destination matrix itself never traverses
+ * host memory; only the small (`≤ 16 * size`-byte) host source seed
+ * carrying the dtype's "1" representation does.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_identity, 1)
-ZEND_ARG_INFO(0, size)
+ZEND_BEGIN_ARG_INFO(arginfo_ndarray_identity, 0)
+ZEND_ARG_TYPE_INFO(0, size, IS_LONG, 0)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, identity) {
-    NDArray *rtn = NULL;
-    int *shape;
-    long size;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_LONG(size)
+    zend_long size;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_LONG(size)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    rtn = NDArray_Identity((int)size);
-    ndarray_init_new_object(rtn, return_value);
+
+    /* Range-check `size` against `int` *before* truncating: a value that
+       overflows `int` would otherwise wrap to a small / negative number
+       and silently produce the wrong matrix or trip the negative-dim
+       guard with a misleading error. */
+    if (size < 0 || size > INT_MAX) {
+        zend_throw_error(NULL,
+            "identity: size %lld is out of range (must be 0..%d)",
+            (long long) size, INT_MAX);
+        return;
+    }
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_Identity((int) size, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
