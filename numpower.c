@@ -5757,68 +5757,171 @@ PHP_METHOD(NDArray, rewind) {
     NDArrayIteratorPHP_REWIND(ndarray);
 }
 
+/**
+ * @brief Coerce a PHP offset zval into a non-negative axis-0 index.
+ *
+ * Accepts IS_LONG and finite IS_DOUBLE offsets (the only forms PHP's array-
+ * access machinery passes through with a usable numeric value); booleans,
+ * strings, arrays, objects, null, and non-finite doubles (NaN, +/-Inf) are
+ * all rejected. The coerced long is written back to @p out_index on success.
+ *
+ * Rejecting NaN / Inf explicitly avoids the undefined behavior of casting
+ * them to a C signed integer — without this guard the resulting "negative"
+ * value would trigger the wrong error path in the caller's bounds check.
+ *
+ * @param[in]  offset    PHP zval representing the requested axis-0 index.
+ * @param[out] out_index Receives the long-coerced index on success.
+ * @return 1 on success; 0 if @p offset is not an integer-coercible value.
+ */
+static int ndarray_offset_to_long(const zval *offset, zend_long *out_index) {
+    if (Z_TYPE_P(offset) == IS_LONG) {
+        *out_index = Z_LVAL_P(offset);
+        return 1;
+    }
+    if (Z_TYPE_P(offset) == IS_DOUBLE) {
+        double d = Z_DVAL_P(offset);
+        /* (zend_long) NaN / Inf is undefined behavior — bail out before the
+           cast. ZEND_DOUBLE_FITS_LONG additionally rejects values whose
+           magnitude would overflow a signed long, in a platform-correct way
+           (the macro definition flips at the ZEND_LONG_MAX boundary). */
+        if (!zend_finite(d) || !ZEND_DOUBLE_FITS_LONG(d)) {
+            return 0;
+        }
+        *out_index = (zend_long) d;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Borrow the axis-0 sub-view of @p ndarray at @p offset, with bounds.
+ *
+ * Validates the source is at least 1-D, normalises @p offset through
+ * ndarray_offset_to_long(), bounds-checks against shape[0], and produces the
+ * borrowed view via NDArrayIterator_GET. The iterator cursor is restored to 0
+ * before returning so subsequent foreach passes start cleanly. On any failure
+ * a Zend Error is thrown and NULL is returned — callers must check first and
+ * fall through without producing a return value.
+ *
+ * Lifecycle of the returned view:
+ *   - rtn->base aliases @p ndarray and rtn ADDREFs it
+ *   - rtn->data points into @p ndarray's buffer (no copy)
+ *   - the caller owns rtn and must release it with NDArray_FREE() — that DECREFs
+ *     the source and tears down the view metadata without touching the buffer
+ *
+ * @param[in,out] ndarray Source NDArray (must be non-NULL and ndim > 0).
+ * @param[in]     offset  PHP zval representing the requested axis-0 index.
+ * @return Borrowed view NDArray (caller frees), or NULL after throwing.
+ */
+static NDArray *ndarray_axis0_view_or_throw(NDArray *ndarray, zval *offset) {
+    /* 0-D scalars have no axis 0 to index, and their iterator was never
+       installed (scalar factories skip NDArrayIterator_INIT) — without this
+       guard, accessing `$scalar[0]` would dereference NULL. */
+    if (NDArray_NDIM(ndarray) == 0) {
+        zend_throw_error(NULL, "Cannot index a 0-D NDArray (no axis 0)");
+        return NULL;
+    }
+    zend_long index;
+    if (!ndarray_offset_to_long(offset, &index)) {
+        zend_throw_error(NULL, "Invalid offset");
+        return NULL;
+    }
+    if (index < 0) {
+        zend_throw_error(NULL, "Negative indexes are not implemented.");
+        return NULL;
+    }
+    if (index > NDArray_SHAPE(ndarray)[0] - 1) {
+        zend_throw_error(NULL, "Index out of bounds");
+        return NULL;
+    }
+    ndarray->iterator->currentIndex = (int) index;
+    NDArray *rtn = NDArrayIterator_GET(ndarray);
+    NDArrayIterator_REWIND(ndarray);
+    return rtn;
+}
+
+/**
+ * @brief NDArray::offsetExists() — implements `isset($a[$offset])`.
+ *
+ * Returns true when @p offset is an integer-coercible value within
+ * `[0, shape[0])`. All other inputs — non-numeric offsets, negative indices,
+ * out-of-range indices, and 0-D source arrays — silently yield false to match
+ * PHP's standard ArrayAccess convention (isset() must never throw).
+ *
+ * Device- and dtype-independent: reads only cached shape metadata, so no
+ * buffer or device transfer is ever issued.
+ *
+ * @return bool true if `$a[$offset]` would resolve to a valid element.
+ */
 PHP_METHOD(NDArray, offsetExists) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
-    long offset;
+    zval *offset;
     ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_LONG(offset)
+        Z_PARAM_ZVAL(offset)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
-    NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    NDArray *ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
     /* 0-D source has no axis 0 — every offset is out of range. Reading
        NDArray_SHAPE(ndarray)[0] on a 0-D array is undefined memory access. */
     if (NDArray_NDIM(ndarray) == 0) {
         RETURN_BOOL(0);
     }
-    if (offset < 0) {
+    zend_long index;
+    if (!ndarray_offset_to_long(offset, &index)) {
         RETURN_BOOL(0);
-        return;
     }
-    if (offset > NDArray_SHAPE(ndarray)[0] - 1) {
+    if (index < 0 || index > NDArray_SHAPE(ndarray)[0] - 1) {
         RETURN_BOOL(0);
-        return;
     }
     RETURN_BOOL(1);
 }
 
+/**
+ * @brief NDArray::offsetGet() — implements `$a[$offset]`.
+ *
+ * Returns the axis-0 element at @p offset. For N-D source (N >= 2) the result
+ * is a fresh NDArray view of rank (N-1) that aliases the source buffer (no
+ * copy, no device transfer). For 1-D source the result is a dtype-correct
+ * PHP scalar produced by NDArray_ScalarToZval:
+ *   - `string` for `float128` and `uint64`
+ *   - `int`    for `int8..int64` and `uint8..uint32`
+ *   - `float`  for `float4..float64`
+ *
+ * Works identically on CPU and GPU sources: the GPU read path is a single
+ * cudaMemcpy of one element, issued lazily by the scalar conversion. No
+ * buffer-slot leak occurs because ndarray_init_new_object routes 0-D results
+ * through NDArray_ScalarToZval + NDArray_FREE (which DECREFs the source and
+ * tears down view metadata without freeing the aliased buffer).
+ *
+ * @return NDArray|int|float|string Sub-view or dtype-correct scalar.
+ * @throws Error When @p offset is non-integer, negative, out of range, or the
+ *               source array is 0-D.
+ */
 PHP_METHOD(NDArray, offsetGet) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     zval *offset;
     ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(offset)
+        Z_PARAM_ZVAL(offset)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
-    NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
-    /* 0-D scalars have no axis 0 to index, and their iterator was never
-       installed (scalar factories skip NDArrayIterator_INIT) — without this
-       guard, `$scalar[0]` would dereference NULL when setting
-       iterator->currentIndex below. */
-    if (NDArray_NDIM(ndarray) == 0) {
-        zend_throw_error(NULL, "Cannot index a 0-D NDArray (no axis 0)");
+    NDArray *ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    NDArray *rtn = ndarray_axis0_view_or_throw(ndarray, offset);
+    if (rtn == NULL) {
         return;
     }
-    if (Z_TYPE_P(offset) == IS_LONG) {
-        if (Z_LVAL_P(offset) < 0) {
-            zend_throw_error(NULL, "Negative indexes are not implemented.");
-            return;
-        }
-
-        if (Z_LVAL_P(offset) > NDArray_SHAPE(ndarray)[0] - 1) {
-            zend_throw_error(NULL, "Index out of bounds");
-            return;
-        }
-        ndarray->iterator->currentIndex = (int) Z_LVAL_P(offset);
-        NDArray *rtn = NDArrayIterator_GET(ndarray);
-        NDArrayIterator_REWIND(ndarray);
-        ndarray_init_new_object(rtn, return_value);
-        return;
-    }
-    zend_throw_error(NULL, "Invalid offset");
-    return;
+    /* ndarray_init_new_object handles both wrappings: ndim > 0 registers the
+       view in the global buffer and exposes it as an NDArray PHP object;
+       ndim == 0 routes through NDArray_ScalarToZval (dtype-aware) and frees
+       the temporary view — DECREFing the source and tearing down the view's
+       metadata without freeing the aliased buffer. */
+    ndarray_init_new_object(rtn, return_value);
 }
 
-/* Scalar fast path for offsetSet: writes a single PHP scalar value into
- * every element of [slice] using the dtype-aware ndarray_set_from_* hooks.
+/**
+ * @brief Dtype-preserving scalar broadcast into every element of @p slice.
+ *
+ * Writes a single PHP scalar value (long / double / string / bool) into every
+ * element of @p slice using the dtype-aware ndarray_set_from_* hooks.
  *
  * Why this exists: ZVAL_TO_NDARRAY(IS_LONG) routes through
  * NDArray_CreateFromLongScalar which casts to float32 (≈ 7 decimal digits).
@@ -5826,6 +5929,15 @@ PHP_METHOD(NDArray, offsetGet) {
  * round-trip — PHP_INT_MAX (9.22e18) overflows the float32 mantissa and
  * comes back as PHP_INT_MIN. This path stays in the target dtype the whole
  * way.
+ *
+ * On GPU targets the bytes are staged in a host-side typed buffer and pushed
+ * with a single NDArray_TypedH2D() (which handles the fp128 → double-double
+ * conversion). The temp buffer is freed on every exit path.
+ *
+ * @param[in,out] slice Destination view (any device, any dtype).
+ * @param[in]     value PHP zval holding the source scalar.
+ * @return 1 on success; 0 if @p value's type is not a PHP scalar (caller
+ *         should fall through to the NDArray_Overwrite path).
  */
 static int ndarray_fill_from_php_scalar(NDArray *slice, zval *value) {
     const char *dtype = NDArray_TYPE(slice);
@@ -5891,60 +6003,67 @@ static int ndarray_fill_from_php_scalar(NDArray *slice, zval *value) {
     return 1;
 }
 
+/**
+ * @brief NDArray::offsetSet() — implements `$a[$offset] = $value`.
+ *
+ * Writes @p value into the axis-0 slice at @p offset, preserving the array's
+ * dtype, shape, and device. Two paths share the same borrowed view of axis 0:
+ *
+ *   1. PHP scalar (long / double / string / bool) → @ref ndarray_fill_from_php_scalar
+ *      broadcasts the value across every element of the slice while keeping
+ *      end-to-end byte fidelity for int64 / uint64 / float128. On GPU the
+ *      bytes are staged in a host-side typed buffer and pushed with a single
+ *      cudaMemcpy.
+ *   2. PHP array or NDArray → wrapped with ZVAL_TO_NDARRAY() and copied with
+ *      NDArray_Overwrite(), which fast-paths same-dtype same-device traffic
+ *      via memcpy / vmemcpyd2d and otherwise casts element-wise through
+ *      double on CPU.
+ *
+ * Memory: the borrowed view ADDREFs the source on creation and is released
+ * with NDArray_FREE on every exit path, so repeated assignments do not leak
+ * buffer slots or VRAM. Any temporary NDArray produced from a PHP array /
+ * scalar input is freed via CHECK_INPUT_AND_FREE.
+ *
+ * @throws Error On 0-D source, non-integer / negative / out-of-range offset,
+ *               or a value type that cannot be coerced to an NDArray.
+ */
 PHP_METHOD(NDArray, offsetSet) {
     zend_object *obj = Z_OBJ_P(ZEND_THIS);
     zval *offset;
     zval *value;
     ZEND_PARSE_PARAMETERS_START(2, 2)
-    Z_PARAM_ZVAL(offset)
-    Z_PARAM_ZVAL(value)
+        Z_PARAM_ZVAL(offset)
+        Z_PARAM_ZVAL(value)
     ZEND_PARSE_PARAMETERS_END();
     zval *obj_uuid = OBJ_PROP_NUM(obj, 0);
-    NDArray* ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
-    /* 0-D scalars cannot be indexed (same reasoning as offsetGet). Guard
-       prevents reading shape[0] from a 0-D array and dereferencing the NULL
-       iterator the scalar factories leave behind. */
-    if (NDArray_NDIM(ndarray) == 0) {
-        zend_throw_error(NULL, "Cannot index a 0-D NDArray (no axis 0)");
+    NDArray *ndarray = ZVALUUID_TO_NDARRAY(obj_uuid);
+    NDArray *rtn = ndarray_axis0_view_or_throw(ndarray, offset);
+    if (rtn == NULL) {
         return;
     }
-    if (Z_TYPE_P(offset) == IS_LONG || Z_TYPE_P(offset) == IS_DOUBLE) {
-        if (zval_get_long(offset) < 0) {
-            zend_throw_error(NULL, "Negative indexes are not implemented.");
-            return;
-        }
-        if (zval_get_long(offset) > NDArray_SHAPE(ndarray)[0] - 1) {
-            zend_throw_error(NULL, "Index out of bounds");
-            return;
-        }
-        ndarray->iterator->currentIndex = (int)zval_get_long(offset);
-        NDArray *rtn = NDArrayIterator_GET(ndarray);
-        NDArrayIterator_REWIND(ndarray);
 
-        /* Scalar/string fast path stays in the target's dtype end-to-end. */
-        if (Z_TYPE_P(value) == IS_LONG   || Z_TYPE_P(value) == IS_DOUBLE ||
-            Z_TYPE_P(value) == IS_STRING || Z_TYPE_P(value) == IS_TRUE   ||
-            Z_TYPE_P(value) == IS_FALSE) {
-            if (ndarray_fill_from_php_scalar(rtn, value)) {
-                NDArray_FREE(rtn);
-                return;
-            }
-        }
-
-        /* Fallback: array / NDArray source — wrap and let NDArray_Overwrite
-           handle byte-copy or cast through double. */
-        NDArray* nd_value = ZVAL_TO_NDARRAY(value);
-        if (nd_value == NULL) {
+    /* Scalar/string fast path stays in the target's dtype end-to-end. */
+    if (Z_TYPE_P(value) == IS_LONG   || Z_TYPE_P(value) == IS_DOUBLE ||
+        Z_TYPE_P(value) == IS_STRING || Z_TYPE_P(value) == IS_TRUE   ||
+        Z_TYPE_P(value) == IS_FALSE) {
+        if (ndarray_fill_from_php_scalar(rtn, value)) {
             NDArray_FREE(rtn);
             return;
         }
-        NDArray_Overwrite(rtn, nd_value);
-        NDArray_FREE(rtn);
-        CHECK_INPUT_AND_FREE(value, nd_value);
     }
-    if (Z_TYPE_P(offset) == IS_OBJECT && (Z_TYPE_P(value) == IS_LONG || Z_TYPE_P(value) == IS_OBJECT)) {
 
+    /* Fallback: array / NDArray source — wrap and let NDArray_Overwrite
+       handle byte-copy or cast through double. ZVAL_TO_NDARRAY throws on
+       unsupported value types and returns NULL, in which case we release
+       the borrowed view and propagate the pending exception. */
+    NDArray *nd_value = ZVAL_TO_NDARRAY(value);
+    if (nd_value == NULL) {
+        NDArray_FREE(rtn);
+        return;
     }
+    NDArray_Overwrite(rtn, nd_value);
+    NDArray_FREE(rtn);
+    CHECK_INPUT_AND_FREE(value, nd_value);
 }
 
 /* Wire format emitted by __serialize:
@@ -6042,12 +6161,25 @@ PHP_METHOD(NDArray, __unserialize) {
 }
 
 
+/**
+ * @brief NDArray::offsetUnset() — implements `unset($a[$offset])` (rejected).
+ *
+ * NDArray buffers are fixed-shape, fixed-dtype typed arrays — there is no
+ * tombstone state that would let an element be marked "absent" without
+ * disturbing the surrounding strides or shape. Per NumPy semantics, deleting
+ * an individual element is not a meaningful operation; callers wanting to
+ * zero a slice should assign `0` (or the dtype-appropriate string) instead.
+ * The @p offset is accepted as @c mixed only because the ArrayAccess
+ * contract requires the signature.
+ *
+ * @throws Error Unconditionally.
+ */
 PHP_METHOD(NDArray, offsetUnset) {
-    zend_object *obj = Z_OBJ_P(ZEND_THIS);
-    long offset;
+    zval *offset;
     ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_LONG(offset)
+        Z_PARAM_ZVAL(offset)
     ZEND_PARSE_PARAMETERS_END();
+    (void) offset;
     zend_throw_error(NULL, "Cannot unset values of NDArrays");
 }
 
