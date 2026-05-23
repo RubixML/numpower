@@ -282,24 +282,47 @@ NDArray* NDArray_EmptyLike(NDArray *a) {
  */
 NDArray*
 NDArray_Zeros(int *shape, int ndim, const char *type, const int device) {
-    NDArray* rtn = Create_NDArray(shape, ndim, type, device);
+    /* Validate the dtype before any allocation so a bogus string can't leak
+       the descriptor/dimensions stored inside Create_NDArray on the `elsize
+       == 0` early-return that used to follow. */
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) {
+            efree(shape);
+        }
+        return NULL;
+    }
 
+    NDArray* rtn = Create_NDArray(shape, ndim, type, device);
     if (rtn == NULL) {
         return rtn;
     }
 
-    int elsize = get_type_size(type);
-    if (elsize == 0) return NULL;
-
     size_t total = (size_t)rtn->descriptor->numElements * (size_t)elsize;
 
     if (device == NDARRAY_DEVICE_CPU) {
-        rtn->data = ecalloc(rtn->descriptor->numElements, (size_t)elsize);
+        /* ecalloc(0, n) is well-defined and returns a pointer that NDArray_FREE
+           can release, so the empty-shape path stays balanced under VCHECK. */
+        rtn->data = ecalloc((size_t)rtn->descriptor->numElements, (size_t)elsize);
     }
 #ifdef HAVE_CUBLAS
-    if (device == NDARRAY_DEVICE_GPU) {
-        vmalloc((void **)(&rtn->data), total);
-        cudaMemset(rtn->data, 0, total);
+    else if (device == NDARRAY_DEVICE_GPU) {
+        /* Allocate the buffer directly in VRAM and zero it on-device — no
+           host memory is touched, no H2D copy is needed. `vmalloc(0)` is a
+           safe no-op that leaves data == NULL; `cudaMemset` then skips. */
+        rtn->data = NULL;
+        vmalloc((void **)(&rtn->data), (unsigned int) total);
+        if (total > 0 && rtn->data != NULL) {
+            cudaMemset(rtn->data, 0, total);
+        }
+    }
+#else
+    else if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS before passing
+           NDARRAY_DEVICE_GPU. If they didn't, fail loudly rather than hand
+           back an NDArray with an uninitialised `data` pointer. */
+        NDArray_FREE(rtn);
+        return NULL;
     }
 #endif
     return rtn;

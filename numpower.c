@@ -1382,31 +1382,91 @@ PHP_FUNCTION(print_r_) {
 }
 
 /**
- * NumPower::zeros
+ * NumPower::zeros(shape, dtype = "float32", device = 0)
+ *
+ * Allocates a zero-initialised NDArray of the requested shape and dtype on
+ * the requested device. For `device == 1` (GPU) the buffer is allocated
+ * directly in VRAM via `cudaMalloc` and zeroed in place with `cudaMemset`,
+ * so no host buffer is ever materialised; the host->device copy that
+ * `->gpu()` would normally pay is skipped entirely.
  *
  * @param execute_data
  * @param return_value
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_zeros, 1)
-ZEND_ARG_INFO(0, shape_zval)
+ZEND_BEGIN_ARG_INFO(arginfo_ndarray_zeros, 0)
+ZEND_ARG_INFO(0, shape)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, zeros) {
     NDArray *rtn = NULL;
     int *shape;
     zval *shape_zval;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(shape_zval)
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+    const char *ndarrayDataType = NDARRAY_TYPE_FLOAT32;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_ZVAL(shape_zval)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
+
+    if (dataType != NULL) {
+        ndarrayDataType = type_canonicalize(dataType);
+        if (ndarrayDataType == NULL) {
+            zend_throw_error(NULL,
+                "Invalid data type '%s'. Supported: float4, float8, float16, "
+                "float32, float64, float128, int8, uint8, int16, uint16, "
+                "int32, uint32, int64, uint64", dataType);
+            return;
+        }
+    }
+
+    if (device != NDARRAY_DEVICE_CPU && device != NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL,
+            "Invalid device %lld. Use 0 (CPU) or 1 (GPU).",
+            (long long) device);
+        return;
+    }
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL,
+            "GPU device requested but the extension was built without CUDA support.");
+        return;
+    }
+#endif
+
     NDArray *nda = ZVAL_TO_NDARRAY(shape_zval);
     if (nda == NULL) {
         return;
     }
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        shape[i] = (int) NDArray_F32DATA(nda)[i];
+    int ndim = NDArray_NUMELEMENTS(nda);
+    /* emalloc(0) is well-defined (returns a freeable pointer), but allocate at
+       least one slot to keep ASAN / Valgrind happy and to give NDArray_Zeros
+       a non-NULL shape vector even for 0-D outputs. */
+    shape = emalloc(sizeof(int) * (ndim > 0 ? (size_t) ndim : 1));
+    for (int i = 0; i < ndim; i++) {
+        double raw = (double) NDArray_F32DATA(nda)[i];
+        if (raw < 0.0) {
+            efree(shape);
+            NDArray_FREE(nda);
+            zend_throw_error(NULL, "negative dimensions are not allowed");
+            return;
+        }
+        shape[i] = (int) raw;
     }
-    rtn = NDArray_Zeros(shape, NDArray_NUMELEMENTS(nda), NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
     NDArray_FREE(nda);
+
+    rtn = NDArray_Zeros(shape, ndim, ndarrayDataType, (int) device);
+    if (rtn == NULL) {
+        /* NDArray_Zeros already raised or returned NULL on an internal
+           failure; the shape was consumed by Create_NDArray on success but
+           is leaked on early failure — free it here defensively. */
+        return;
+    }
     ndarray_init_new_object(rtn, return_value);
 }
 
