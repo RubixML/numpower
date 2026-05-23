@@ -82,8 +82,10 @@ print_array_float32(float* buffer, int ndims, int* shape, int* strides, int cur_
     int reverse_run = 0;
 
     if (num_elements == 0) {
-        str = (char*)emalloc(3 * sizeof(char));
-        str = "[]";
+        /* Caller does efree(str); return a heap-owned "[]" so that path
+           doesn't blow up trying to free a string literal. */
+        str = (char*)emalloc(3);
+        strcpy(str, "[]");
         return str;
     }
 
@@ -217,7 +219,10 @@ print_array_float64(double* buffer, int ndims, int* shape, int* strides, int cur
     int reverse_run = 0;
 
     if (num_elements == 0) {
-        str = "[]";
+        /* Caller does efree(str); return a heap-owned "[]" so that path
+           doesn't blow up trying to free a string literal. */
+        str = (char*)emalloc(3);
+        strcpy(str, "[]");
         return str;
     }
 

@@ -21,75 +21,137 @@
 //PRIVATE
 
 /**
- * @brief Get number of dimensions from php array
+ * @brief Return the first stored value of a zend_array regardless of key.
  *
- * @param ht A pointer to the zval array value
- * 
- * @return The number of dimensions in the array
+ * PHP arrays may be sparse (gaps after unset) or use string keys, so the
+ * value at integer index 0 may be absent. Iterating once with the
+ * HashTable APIs always finds the first present element in insertion order.
+ *
+ * @param zendArray hashtable to scan
+ * @return pointer to the first element, or NULL if empty
+ */
+static zval *_firstZendArrayValue(zend_array *zendArray) {
+    zval *val;
+    ZEND_HASH_FOREACH_VAL(zendArray, val) {
+        return val;
+    } ZEND_HASH_FOREACH_END();
+    return NULL;
+}
+
+/**
+ * @brief Get number of dimensions from a zend array.
+ *
+ * Walks the first stored element at each level (not the value at index 0),
+ * so arrays with sparse / non-zero / string keys are handled correctly.
+ *
+ * @param zendArray hashtable to inspect
+ *
+ * @return The number of dimensions in the array (>= 1).
  */
 int _getNumDimsFromZval(zend_array *zendArray) {
-    int num_dims = 0;
-
-    if (zend_array_count(zendArray) == 0) {
-        return 1;
+    int num_dims = 1;
+    zval *val = _firstZendArrayValue(zendArray);
+    while (val) {
+        ZVAL_DEREF(val);
+        if (Z_TYPE_P(val) != IS_ARRAY) {
+            break;
+        }
+        ++num_dims;
+        val = _firstZendArrayValue(Z_ARRVAL_P(val));
     }
-
-    zval *val = zend_hash_index_find(zendArray, 0);
-
-    while (val && Z_TYPE_P(val) == IS_ARRAY) {
-        num_dims++;
-        val = zend_hash_index_find(Z_ARRVAL_P(val), 0);
-    }
-
-    return num_dims + 1;
+    return num_dims;
 }
 
 /**
- * @brief Check if the zend array is packed
+ * @brief Count the shape of a zend array from its first element at each level.
  *
- * @param arr A pointer to the zend array
- * 
- * @return 1 if the array is packed, 0 otherwise
- */
-bool _isPackedZendArray(zend_array *zendArray) {
-    return zendArray->nNumUsed == zendArray->nNumOfElements;
-}
-
-/**
- * @brief Count the shape of a zend array
+ * Shape is taken from the first stored element of each nesting level.
+ * Rectangularity is verified separately by _checkZendArrayShape().
  *
- * @param[in]    zendArray A pointer to the zend array
- * @param[inout] shape     A pointer to the shape array
- * @param[in]    ndim      The number of dimensions
+ * @param[in]  zendArray A pointer to the zend array
+ * @param[out] shape     A pointer to the shape array of length ndim
+ * @param[in]  ndim      The number of dimensions
  */
 void _countZendArrayShape(zend_array *zendArray, int *shape, int ndim) {
-    int i;
-
-    if (shape == NULL && ndim != 0) {
+    if (ndim <= 0 || shape == NULL) {
         return;
     }
 
-    if (zend_array_count(zendArray) == 0) {
+    shape[0] = (int)zend_array_count(zendArray);
+
+    if (ndim == 1) {
         return;
     }
 
-    // Initialize shape array to zeros
-    for (i = 0; i < ndim; i++) {
-        shape[i] = 0;
+    zval *first = _firstZendArrayValue(zendArray);
+    if (first == NULL) {
+        for (int i = 1; i < ndim; ++i) {
+            shape[i] = 0;
+        }
+        return;
+    }
+    ZVAL_DEREF(first);
+    if (Z_TYPE_P(first) != IS_ARRAY) {
+        for (int i = 1; i < ndim; ++i) {
+            shape[i] = 0;
+        }
+        return;
+    }
+    _countZendArrayShape(Z_ARRVAL_P(first), shape + 1, ndim - 1);
+}
+
+/**
+ * @brief Verify a zend array is rectangular at every level.
+ *
+ * Walks the array and confirms that every sibling at a given depth is the
+ * same kind (all scalar or all sub-array) and that sub-arrays all share the
+ * expected length. On the first violation a PHP error is thrown and false
+ * is returned, matching the rectangular-input contract used by NumPy and
+ * PyTorch for tensor construction.
+ *
+ * @param zendArray hashtable to inspect
+ * @param shape     expected shape (length ndim, from _countZendArrayShape)
+ * @param ndim      number of dimensions in shape
+ * @return true if `zendArray` matches `shape`, false otherwise
+ */
+static bool _checkZendArrayShape(zend_array *zendArray, const int *shape, int ndim) {
+    if (ndim <= 0) {
+        return true;
     }
 
-    // Traverse the zend array to get the shape
+    if ((int)zend_array_count(zendArray) != shape[0]) {
+        zend_throw_error(NULL,
+            "Cannot build NDArray from a non-rectangular (ragged) array: "
+            "expected %d elements, got %d.",
+            shape[0], (int)zend_array_count(zendArray));
+        return false;
+    }
+
     zval *val;
-    ZEND_HASH_FOREACH_VAL(zendArray, val)
-            {
-                if (Z_TYPE_P(val) == IS_ARRAY) {
-                    _countZendArrayShape(Z_ARRVAL_P(val), shape + 1, ndim - 1);
-                    shape[0]++;
-                } else {
-                    shape[0]++;
-                }
+    if (ndim == 1) {
+        ZEND_HASH_FOREACH_VAL(zendArray, val) {
+            ZVAL_DEREF(val);
+            if (Z_TYPE_P(val) == IS_ARRAY) {
+                zend_throw_error(NULL,
+                    "Cannot build NDArray: mixed scalar/array siblings at the same depth.");
+                return false;
             }
-    ZEND_HASH_FOREACH_END();
+        } ZEND_HASH_FOREACH_END();
+        return true;
+    }
+
+    ZEND_HASH_FOREACH_VAL(zendArray, val) {
+        ZVAL_DEREF(val);
+        if (Z_TYPE_P(val) != IS_ARRAY) {
+            zend_throw_error(NULL,
+                "Cannot build NDArray: mixed scalar/array siblings at the same depth.");
+            return false;
+        }
+        if (!_checkZendArrayShape(Z_ARRVAL_P(val), shape + 1, ndim - 1)) {
+            return false;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return true;
 }
 
 /**
@@ -231,11 +293,14 @@ NDArray *_createFromZendArray(zend_array *ht, const char *type) {
         shape = ecalloc(1, sizeof(int));
     }
 
-    if (!_isPackedZendArray(ht)) {
+    _countZendArrayShape(ht, shape, ndim);
+
+    if (!_checkZendArrayShape(ht, shape, ndim)) {
+        /* shape is owned here; NDArray_create has not been called yet. */
+        efree(shape);
         return NULL;
     }
 
-    _countZendArrayShape(ht, shape, ndim);
     int total_num_elements = shape[0];
 
     // Calculate number of elements

@@ -27,24 +27,38 @@
 #pragma ide diagnostic ignored "NullDereference"
 
 /**
- * Get number of dimensions from php_array
+ * Get number of dimensions from php_array.
  *
- * @param arr
- * @return
+ * Walks the first stored element at each level (not the value at index 0),
+ * so PHP arrays with sparse / non-zero / string keys are handled correctly.
+ *
+ * @param arr a PHP array zval
+ * @return the number of dimensions (>= 1)
  */
 int get_num_dims_from_zval(zval *arr) {
-    int num_dims = 0;
+    int num_dims = 1;
+    zval *val = NULL;
+    zval *cursor;
 
-    if (zend_array_count(Z_ARRVAL_P(arr)) == 0) {
-        return 1;
-    }
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(arr), cursor) {
+        val = cursor;
+        break;
+    } ZEND_HASH_FOREACH_END();
 
-    zval *val = zend_hash_index_find(Z_ARRVAL_P(arr), 0);
-    while (val && Z_TYPE_P(val) == IS_ARRAY) {
-        num_dims++;
-        val = zend_hash_index_find(Z_ARRVAL_P(val), 0);
+    while (val) {
+        ZVAL_DEREF(val);
+        if (Z_TYPE_P(val) != IS_ARRAY) {
+            break;
+        }
+        ++num_dims;
+        zval *next = NULL;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(val), cursor) {
+            next = cursor;
+            break;
+        } ZEND_HASH_FOREACH_END();
+        val = next;
     }
-    return num_dims+1;
+    return num_dims;
 }
 
 /**
@@ -283,9 +297,9 @@ NDArray* Create_NDArray_FromZendArray(zend_array* ht, int ndim) {
     } else {
         shape = ecalloc(1, sizeof(int));
     }
-    if (!is_packed_zend_array(ht)) {
-        return NULL;
-    }
+    /* Sparse PHP arrays (e.g. after unset / string keys) iterate fine via
+     * ZEND_HASH_FOREACH_VAL. Rectangularity is enforced by validate_array()
+     * in Create_NDArray_FromZval before we get here, so no packed-only guard. */
     get_zend_array_shape(ht, shape, ndim);
     int total_num_elements = shape[0];
 

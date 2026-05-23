@@ -428,6 +428,64 @@ typedef struct {
     int value;
 } NumPowerObject;
 
+/**
+ * Compute the broadcast result shape for two NDArrays following NumPy/PyTorch
+ * semantics: right-align dims, treat missing dims as 1, and when dims differ
+ * the non-1 dim wins (so size-0 dims propagate, e.g. (0,) ⊕ (1,) → (0,)).
+ *
+ * @param a         first operand
+ * @param b         second operand
+ * @param out_ndim  receives the rank of the broadcast result (>= 1)
+ * @return          newly emalloc'd shape array of length out_ndim, or NULL if
+ *                  the shapes are not broadcast-compatible
+ */
+static int *ndarray_compute_broadcast_shape(const NDArray *a, const NDArray *b, int *out_ndim)
+{
+    int nda = NDArray_NDIM(a), ndb = NDArray_NDIM(b);
+    int nd  = nda > ndb ? nda : ndb;
+    /* The arithmetic call sites assume out_ndim >= 1 (they emalloc strides
+       indexed by ndim) — when both operands are 0-D scalars the broadcast
+       result is conceptually shape () but the rest of the code path treats
+       the empty short-circuit only for arrays with a zero dim, which a 0-D
+       scalar does not have, so this branch is unreachable in practice. */
+    if (nd < 1) nd = 1;
+    int *shape = emalloc(sizeof(int) * (size_t)nd);
+    for (int k = 0; k < nd; k++) {
+        int da = (k < nda) ? NDArray_SHAPE(a)[nda - 1 - k] : 1;
+        int db = (k < ndb) ? NDArray_SHAPE(b)[ndb - 1 - k] : 1;
+        if (da != db && da != 1 && db != 1) {
+            efree(shape);
+            return NULL;
+        }
+        shape[nd - 1 - k] = (da == 1) ? db : da;
+    }
+    *out_ndim = nd;
+    return shape;
+}
+
+/**
+ * Apply ZEND_DIV's "true division" dtype rule: integer operands divide to
+ * float (float32 for narrow ints, float64 for 32/64-bit ints). Matches
+ * PyTorch and the same logic used in the non-empty arithmetic path.
+ *
+ * @param result_type promoted dtype before applying the division rule
+ * @return            adjusted dtype to use for the division result
+ */
+static const char *ndarray_div_promote(const char *result_type)
+{
+    int is_int_result =
+        (!strcmp(result_type, "int8")   || !strcmp(result_type, "uint8")  ||
+         !strcmp(result_type, "int16")  || !strcmp(result_type, "uint16") ||
+         !strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
+         !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64"));
+    if (!is_int_result) return result_type;
+    if (!strcmp(result_type, "int32") || !strcmp(result_type, "uint32") ||
+        !strcmp(result_type, "int64") || !strcmp(result_type, "uint64")) {
+        return "float64";
+    }
+    return "float32";
+}
+
 static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray *ndb,
                                         const char **result_type_out)
 {
@@ -467,6 +525,32 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
 
     int both_gpu = (dev_a == NDARRAY_DEVICE_GPU);
 
+    /* Empty broadcast short-circuit: when either operand has any zero dim,
+       the result is empty (NumPy/PyTorch semantics). The downstream kernels
+       and NDArray_Broadcast itself do not handle this correctly — Broadcast
+       allocates EmptyLike(non-empty) and the kernel reads uninitialized
+       memory, leaking garbage into the result. Bypass the kernel entirely
+       and return a typed empty NDArray with the broadcast shape. */
+    if (NDArray_NUMELEMENTS(nda) == 0 || NDArray_NUMELEMENTS(ndb) == 0) {
+        int rndim = 0;
+        int *rshape = ndarray_compute_broadcast_shape(nda, ndb, &rndim);
+        if (rshape == NULL) {
+            zend_throw_error(NULL, "Can't broadcast arrays with incompatible shapes.");
+            if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+            if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+            return NULL;
+        }
+        const char *empty_result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
+        if (opcode == ZEND_DIV) {
+            empty_result_type = ndarray_div_promote(empty_result_type);
+        }
+        if (result_type_out) *result_type_out = empty_result_type;
+        NDArray *empty_rtn = NDArray_Empty(rshape, rndim, empty_result_type, dev_a);
+        if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
+        if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
+        return empty_rtn;
+    }
+
     if (both_gpu) {
         /* GPU stays on GPU for every supported dtype. We promote types, cast
            on GPU via NDArray_AsType (now GPU-aware), call the typed GPU binop,
@@ -478,16 +562,7 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
         const char *gpu_result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
 
         if (opcode == ZEND_DIV) {
-            int is_int_result =
-                (!strcmp(gpu_result_type, "int8")   || !strcmp(gpu_result_type, "uint8")  ||
-                 !strcmp(gpu_result_type, "int16")  || !strcmp(gpu_result_type, "uint16") ||
-                 !strcmp(gpu_result_type, "int32")  || !strcmp(gpu_result_type, "uint32") ||
-                 !strcmp(gpu_result_type, "int64")  || !strcmp(gpu_result_type, "uint64"));
-            if (is_int_result) {
-                gpu_result_type = (!strcmp(gpu_result_type, "int32") || !strcmp(gpu_result_type, "uint32") ||
-                                   !strcmp(gpu_result_type, "int64") || !strcmp(gpu_result_type, "uint64"))
-                    ? "float64" : "float32";
-            }
+            gpu_result_type = ndarray_div_promote(gpu_result_type);
         }
         const char *gpu_comp_type = compute_dtype_for_arithmetic(gpu_result_type);
         if (result_type_out) *result_type_out = gpu_result_type;
@@ -572,20 +647,7 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
     /* PyTorch: true division ("/") always returns a float dtype, even for
        integer inputs. int32 / 2 → float32 (not int32 truncated). */
     if (opcode == ZEND_DIV) {
-        int is_int_result =
-            (!strcmp(result_type, "int8")   || !strcmp(result_type, "uint8")  ||
-             !strcmp(result_type, "int16")  || !strcmp(result_type, "uint16") ||
-             !strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
-             !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64"));
-        if (is_int_result) {
-            /* int8/uint8/int16/uint16 → float32 keeps fidelity; wider ints → float64. */
-            if (!strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
-                !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64")) {
-                result_type = "float64";
-            } else {
-                result_type = "float32";
-            }
-        }
+        result_type = ndarray_div_promote(result_type);
     }
 
     const char *comp_type   = compute_dtype_for_arithmetic(result_type);
