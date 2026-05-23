@@ -18,22 +18,77 @@
 
 #include "manipulations.h"
 
-/* Fill every element of [ndarray] with [value] in the target's dtype.
-   Supports the same PHP scalar types as offsetSet (string / int / double /
-   bool) and every NDArray dtype (float4..float128, int8..uint64). For dtypes
-   where the PHP scalar can't carry full precision (float128, int64, uint64),
-   IS_LONG values route through strtoll/strtoull/strtoflt128 instead of double
-   — same precision discipline as the offsetSet fast path.
+/**
+ * @brief Encode @p value into one element of @p dtype.
+ *
+ * See `manipulations.h` for the full contract. Shared by
+ * `NDArray_fillByZval()` (the in-place `fill()` path) and by every
+ * factory method that accepts a typed PHP scalar as the fill value
+ * (currently `NumPower::full`).
+ */
+int NDArray_EncodeZvalToDtype(zval *value, const char *dtype, char *out_buffer)
+{
+    /* Wider-than-double dtypes can't be expressed exactly in IS_LONG/IS_DOUBLE,
+       so for IS_LONG inputs we route the value through strtoll/strtoull/
+       strtoflt128 via a stringification step to preserve full bits. */
+    int wants_string_long_path = (!strcmp(dtype, "int64")    ||
+                                  !strcmp(dtype, "uint64")   ||
+                                  !strcmp(dtype, "float128"));
 
-   Implementation note: encode the value once into a 16-byte scratch buffer
-   (max elsize across dtypes is 16 for fp128) then broadcast it across the
-   target. Avoids the per-element strcmp dispatch chain inside
-   ndarray_set_from_*, which would be O(N*K) for an N-element fill.
+    if (Z_TYPE_P(value) == IS_STRING) {
+        ndarray_set_from_string(dtype, out_buffer, 0, Z_STRVAL_P(value));
+        return 1;
+    }
+    if (Z_TYPE_P(value) == IS_LONG) {
+        zend_long lv = Z_LVAL_P(value);
+        if (wants_string_long_path) {
+            /* PHP_INT_MAX (2^63 - 1) overflows the float64 mantissa; route
+               through the string path so int64/uint64/fp128 keep all 64
+               source bits. */
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)lv);
+            ndarray_set_from_string(dtype, out_buffer, 0, tmp);
+        } else {
+            ndarray_set_from_double(dtype, out_buffer, 0, (double)lv);
+        }
+        return 1;
+    }
+    if (Z_TYPE_P(value) == IS_DOUBLE) {
+        ndarray_set_from_double(dtype, out_buffer, 0, Z_DVAL_P(value));
+        return 1;
+    }
+    if (Z_TYPE_P(value) == IS_TRUE) {
+        ndarray_set_from_double(dtype, out_buffer, 0, 1.0);
+        return 1;
+    }
+    if (Z_TYPE_P(value) == IS_FALSE) {
+        ndarray_set_from_double(dtype, out_buffer, 0, 0.0);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "Invalid value type. Supported types are: float, int, bool, string");
+    return 0;
+}
 
-   On GPU the broadcast target is a host-side staging buffer of [n * elsize]
-   bytes which is then handed to NDArray_TypedH2D — that helper knows how to
-   convert __float128 / double-double host bytes to the on-device dd layout.
-   The staging buffer is freed on every exit path. */
+/**
+ * @brief Fill every element of @p ndarray with @p value in the target's dtype.
+ *
+ * Supports the same PHP scalar types as offsetSet (string / int / double /
+ * bool) and every NDArray dtype (float4..float128, int8..uint64). For dtypes
+ * where the PHP scalar can't carry full precision (float128, int64, uint64)
+ * IS_LONG values route through strtoll/strtoull/strtoflt128 — same precision
+ * discipline as the offsetSet fast path.
+ *
+ * Implementation: encode the value once via `NDArray_EncodeZvalToDtype`,
+ * then broadcast it across the target. On CPU the broadcast writes
+ * directly into `NDArray_DATA`; on GPU the host stages an N-element buffer
+ * and hands it to `NDArray_TypedH2D` (which converts __float128/DD host
+ * bytes into the on-device DD layout for fp128). The staging buffer is
+ * freed on every exit path.
+ *
+ * @param[in,out] ndarray Target NDArray (CPU or GPU resident).
+ * @param[in]     value   PHP scalar broadcast across @p ndarray.
+ */
 void NDArray_fillByZval(NDArray *ndarray, zval *value)
 {
     if (ndarray == NULL) {
@@ -47,42 +102,13 @@ void NDArray_fillByZval(NDArray *ndarray, zval *value)
 
     if (n <= 0) return;
 
-    /* Wider-than-double dtypes can't be expressed exactly in IS_LONG/IS_DOUBLE,
-       so for IS_LONG inputs we route the value through strtoll/strtoull/
-       strtoflt128 via a stringification step to preserve full bits. */
-    int wants_string_long_path = (!strcmp(dtype, "int64")    ||
-                                  !strcmp(dtype, "uint64")   ||
-                                  !strcmp(dtype, "float128"));
-
     /* Encode the scalar into a 16-byte scratch buffer once. 16 bytes = the
        widest dtype (fp128); narrower dtypes use the leading elsize bytes.
        The scratch is zero-initialised so any unused tail bytes (e.g. when
        elsize==1 for fp4) stay deterministic. */
     char encoded[16];
     memset(encoded, 0, sizeof(encoded));
-
-    if (Z_TYPE_P(value) == IS_STRING) {
-        ndarray_set_from_string(dtype, encoded, 0, Z_STRVAL_P(value));
-    } else if (Z_TYPE_P(value) == IS_LONG) {
-        zend_long lv = Z_LVAL_P(value);
-        if (wants_string_long_path) {
-            /* PHP_INT_MAX (2^63 - 1) overflows the float64 mantissa; route
-               through the string path so int64/uint64/fp128 keep all 64
-               source bits. */
-            char tmp[32];
-            snprintf(tmp, sizeof(tmp), "%lld", (long long)lv);
-            ndarray_set_from_string(dtype, encoded, 0, tmp);
-        } else {
-            ndarray_set_from_double(dtype, encoded, 0, (double)lv);
-        }
-    } else if (Z_TYPE_P(value) == IS_DOUBLE) {
-        ndarray_set_from_double(dtype, encoded, 0, Z_DVAL_P(value));
-    } else if (Z_TYPE_P(value) == IS_TRUE) {
-        ndarray_set_from_double(dtype, encoded, 0, 1.0);
-    } else if (Z_TYPE_P(value) == IS_FALSE) {
-        ndarray_set_from_double(dtype, encoded, 0, 0.0);
-    } else {
-        zend_throw_error(NULL, "Invalid value type. Supported types are: float, int, bool, string");
+    if (!NDArray_EncodeZvalToDtype(value, dtype, encoded)) {
         return;
     }
 

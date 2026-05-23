@@ -20,7 +20,8 @@ NDArray* NDArray_Poisson(double lam, int* shape, int ndim);
 NDArray* NDArray_Uniform(double low, double high, int* shape, int ndim);
 NDArray* NDArray_Diag(NDArray *a);
 NDArray* NDArray_FillFloat(NDArray *a, float fill_value);
-NDArray* NDArray_Full(int *shape, int ndim,  double fill_value);
+NDArray* NDArray_Full(int *shape, int ndim, const char *type, int device,
+                      const char *encoded);
 NDArray* NDArray_CreateFromDoubleScalar(double scalar);
 NDArray* NDArray_CreateFromLongScalar(long scalar);
 int* Generate_Strides(const int* dimensions, int dimensions_size, int elsize);

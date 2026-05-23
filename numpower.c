@@ -2037,55 +2037,84 @@ PHP_METHOD(NumPower, diagonal) {
 }
 
 /**
- * NumPower::full
+ * @brief `NumPower::full(shape, fill_value, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Allocates an NDArray of the requested shape / dtype / device and fills
+ * every element with @c fill_value encoded into the target dtype. The
+ * fill value may be passed as `int`, `float`, `bool`, or `string`. The
+ * string form is the only way to express the full range of `float128`,
+ * `int64`, and `uint64` (values outside PHP's native long / double range
+ * stay byte-correct).
+ *
+ * For `device == 1` (GPU) the buffer is allocated directly in VRAM via
+ * `cudaMalloc` and populated by `cuda_fill_bytes` — a doubling
+ * device-to-device broadcast loop. Only the one-element seed value
+ * (≤ 16 bytes) crosses the PCIe bus, so host RAM stays `O(elsize)`
+ * regardless of the tensor size.
+ *
+ * Pre-existing bugs fixed in this refactor:
+ *   - the old implementation hardcoded float32 storage and broadcast a
+ *     float-cast fill, corrupting any non-float32 dtype if one had ever
+ *     been requested;
+ *   - empty shape `[]` was rejected with a "non-empty array" error even
+ *     though numpy returns `array(fv)` for `np.full((), fv)`;
+ *   - the shape walk forced IS_LONG entries, then re-converted them
+ *     through `NDArray_ToIntVector` (float-mantissa round-trip) which
+ *     loses precision for dimensions ≥ 2²⁴.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_full, 0, 0, 2)
 ZEND_ARG_INFO(0, shape)
 ZEND_ARG_INFO(0, fill_value)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, full) {
-    NDArray *rtn = NULL;
-    zval* shape;
-    HashTable *shape_ht;
-    double fill_value;
-    int *new_shape;
-    zend_string *key;
-    zend_ulong idx;
-    zval *val;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ARRAY(shape)
-        Z_PARAM_DOUBLE(fill_value)
+    zval *shape_zval;
+    zval *fill_value;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_ZVAL(shape_zval)
+        Z_PARAM_ZVAL(fill_value)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    shape_ht = Z_ARRVAL_P(shape);
 
-    ZEND_HASH_FOREACH_KEY_VAL(shape_ht, idx, key, val) {
-        if (Z_TYPE_P(val) != IS_LONG) {
-            zend_throw_error(NULL, "Invalid parameter: Shape elements must be integers.");
-            return;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    NDArray *nd_shape = ZVAL_TO_NDARRAY(shape);
-
-    if (nd_shape == NULL) {
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
 
-    if (NDArray_NUMELEMENTS(nd_shape) == 0) {
-        NDArray_FREE(nd_shape);
-        zend_throw_error(NULL, "Invalid parameter: Expected a non-empty array.");
+    /* Encode the fill value into the dtype's host representation once.
+       16 bytes covers the widest dtype (fp128). On encoding failure the
+       helper has already thrown — release the shape allocation we own
+       to keep the request-scope buffer balanced. */
+    char encoded[16];
+    memset(encoded, 0, sizeof(encoded));
+    if (!NDArray_EncodeZvalToDtype(fill_value, ndarrayDataType, encoded)) {
+        efree(shape);
         return;
     }
 
-    new_shape = NDArray_ToIntVector(nd_shape);
-    rtn = NDArray_Full(new_shape, NDArray_NUMELEMENTS(nd_shape), fill_value);
-
-    efree(new_shape);
-    NDArray_FREE(nd_shape);
-    ndarray_init_new_object(rtn, return_value);
+    NDArray *rtn = NDArray_Full(shape, ndim, ndarrayDataType,
+                                parsed_device, encoded);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Match zeros() / ones(): factory methods always return an NDArray,
+       even for a 0-D shape — preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
