@@ -81,11 +81,25 @@ jobs:
             echo "::warning::cublas not found; extension built without GPU support"
           fi
 
-      # make test generates tmp-php.ini from the system ini scan dir (including gd.so),
-      # then loads the extension directly from ./modules/ — no `make install` needed.
+      # `make test` builds tmp-php.ini from the host PHP's loaded ini + conf.d,
+      # but the upstream phpize Makefile filters out every `^extension=` line via
+      # PHP_DEPRECATED_DIRECTIVES_REGEX — so even though setup-php enabled `gd`
+      # globally, the resulting tmp-php.ini lands GD-less and every
+      # `tests/image/*.phpt` skips with "GD extension not loaded".
+      #
+      # Fix: bypass the Makefile's tmp-php.ini layer for GD by injecting it via
+      # PHP_TEST_SHARED_EXTENSIONS (the variable run-tests.php propagates as `-d`
+      # to each child test process). We must also re-include the project's own
+      # `-d extension=ndarray.so` because we're replacing the default value of
+      # the variable, not appending to it.
+      #
       # REPORT_EXIT_STATUS=1 is required: without it run-tests.php always exits 0.
       - name: Run tests
-        run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
+        run: |
+          GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+          REPORT_EXIT_STATUS=1 make test \
+            PHP_TEST_SHARED_EXTENSIONS=" -d extension=$GD_PATH -d extension=ndarray.so" \
+            TESTS="-q --show-diff"
 
       - name: Upload failure diffs
         if: failure()
@@ -121,6 +135,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
+          extensions: gd
           tools: none
           coverage: none
 
@@ -145,8 +160,15 @@ jobs:
           ./configure
           make -j$(sysctl -n hw.ncpu)
 
+      # Same GD-loading workaround as the Linux job — see the long comment
+      # there for why `make test`'s tmp-php.ini lands GD-less and how
+      # PHP_TEST_SHARED_EXTENSIONS gets it back in front of each child test.
       - name: Run tests
-        run: REPORT_EXIT_STATUS=1 make test TESTS="-q --show-diff"
+        run: |
+          GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+          REPORT_EXIT_STATUS=1 make test \
+            PHP_TEST_SHARED_EXTENSIONS=" -d extension=$GD_PATH -d extension=ndarray.so" \
+            TESTS="-q --show-diff"
 
       - name: Upload failure diffs
         if: failure()
