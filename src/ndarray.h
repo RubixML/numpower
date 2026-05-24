@@ -174,7 +174,7 @@ float NDArray_GetFloatScalar(NDArray *a);
 double NDArray_GetDoubleScalar(NDArray *a);
 void NDArray_FREEDATA(NDArray *target);
 int NDArray_Overwrite(NDArray *target, NDArray *values);
-NDArray* NDArray_FromGD(zval *a, bool channel_last);
+NDArray* NDArray_FromGD(zval *a, bool channel_last, const char *dtype, int device);
 void NDArray_ToGD(NDArray *a, NDArray *n_alpha, zval *output);
 void NDArray_Save(NDArray *a, char * filename, int length);
 NDArray* NDArray_Load(char * filename);

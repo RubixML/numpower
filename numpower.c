@@ -356,7 +356,12 @@ NDArray* ZVAL_TO_NDARRAY(zval* obj) {
         zend_string* class_name = Z_OBJ_P(obj)->ce->name;
         /* Check if the zend_object class name is "GdImage" */
         if (strcmp(ZSTR_VAL(class_name), "GdImage") == 0) {
-            return NDArray_FromGD(obj, false);
+            /* Legacy intake path — kept on float32/CHW/CPU so callers
+               passing a GdImage where an NDArray was expected do not
+               silently change their numeric type. The user-facing
+               `NumPower::fromImage()` exposes the dtype / device knobs. */
+            return NDArray_FromGD(obj, false, NDARRAY_TYPE_FLOAT32,
+                                  NDARRAY_DEVICE_CPU);
         }
 #endif
     }
@@ -1118,7 +1123,31 @@ PHP_METHOD(NDArray, toArray) {
     RETURN_ZVAL(&rtn, 0, 0);
 }
 
+/**
+ * @brief `NDArray::toImage($alpha = null): \GdImage` — convert any
+ *        RGB-shaped NDArray (CHW or HWC, CPU or GPU, any dtype) into a
+ *        GD truecolor image.
+ *
+ * The legacy implementation only accepted float32 CHW arrays resident in
+ * CPU RAM, forcing every GPU pipeline to do an explicit `->cpu()` and
+ * every HWC pipeline (notably the default output of `fromImage`) to first
+ * transpose. The shape gate also rejected HWC outright with a misleading
+ * "must be 3-dimensional" message even though the array was 3-D. This
+ * version detects CHW vs HWC at the C layer, stages GPU operands via
+ * `NDArray_TypedD2H`, and clamps every channel to [0, 255] before bit-
+ * packing so float values that drift outside the displayable range do
+ * not corrupt adjacent color bytes.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval populated with a fresh `\GdImage`.
+ *
+ * @throws \Error When called against a build without GD; when the array is
+ *                not 3-D with a channel axis of size 3; when an alpha
+ *                argument is provided but its shape disagrees with the
+ *                image's `(H, W)`.
+ */
 ZEND_BEGIN_ARG_INFO(arginfo_toImage, 0)
+    ZEND_ARG_OBJ_INFO_WITH_DEFAULT_VALUE(0, alpha, NDArray, 1, "null")
 ZEND_END_ARG_INFO();
 PHP_METHOD(NDArray, toImage) {
     zval *alpha = NULL;
@@ -1129,23 +1158,20 @@ PHP_METHOD(NDArray, toImage) {
     Z_PARAM_ZVAL(alpha)
     ZEND_PARSE_PARAMETERS_END();
     NDArray* array = ZVAL_TO_NDARRAY(obj_zval);
-    if (alpha != NULL) {
-        n_alpha = ZVAL_TO_NDARRAY(alpha);
-    }
     if (array == NULL) {
         return;
     }
-    if (NDArray_DEVICE(array) == NDARRAY_DEVICE_GPU) {
-        zend_throw_error(NULL, "NDArray must be on CPU RAM before it can be converted to a GD image.");
-        return;
-    }
-    if (NDArray_NDIM(array) != 3 || NDArray_SHAPE(array)[0] != 3) {
-        zend_throw_error(NULL, "NDArray must be 3-dimensional before it can be converted to a RGB image.");
-        return;
+    if (alpha != NULL && Z_TYPE_P(alpha) != IS_NULL) {
+        n_alpha = ZVAL_TO_NDARRAY(alpha);
+        if (n_alpha == NULL) {
+            return;
+        }
     }
 #ifdef HAVE_GD
+    /* Layout / dtype / device checks all live in NDArray_ToGD so that
+       the future toImage() shape detector stays single-sourced. */
     NDArray_ToGD(array, n_alpha, return_value);
-    if (alpha != NULL) {
+    if (alpha != NULL && Z_TYPE_P(alpha) != IS_NULL) {
         CHECK_INPUT_AND_FREE(alpha, n_alpha);
     }
 #else
@@ -3339,29 +3365,76 @@ PHP_METHOD(NumPower, arccosh) {
 }
 
 /**
- * NumPower::fromImage
+ * @brief `NumPower::fromImage($image, $channelLast = true, $dtype = "uint8",
+ *        $device = 0): NDArray` — load a GD image into a typed NDArray.
  *
- * @param execute_data
- * @param return_value
+ * Pixel values are integers in [0, 255], so `uint8` is the default dtype —
+ * 4× smaller than the legacy float32 storage. Callers who need a different
+ * numeric range (e.g. normalized float pipelines feeding into ML) can pass
+ * any of the 14 supported dtypes; non-uint8 dtypes get the raw 0..255
+ * values encoded into their representation, ready for downstream arithmetic.
+ * The legacy implementation produced HWC `[W, H, 3]` (width and height
+ * swapped) — this version emits `[H, W, 3]` to match numpy/PIL/PyTorch.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
+ *
+ * @throws \Error When called against a build without GD; when the dtype is
+ *                unknown; when the device is GPU and the build lacks CUDA.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_fromimage, 0, 0, 1)
     ZEND_ARG_INFO(0, image)
-    ZEND_ARG_INFO(0, channelLast)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, channelLast, _IS_BOOL, 0, "true")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "\"uint8\"")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, fromImage) {
-    NDArray *rtn = NULL;
     zval *image;
     bool channelLast = true;
-    ZEND_PARSE_PARAMETERS_START(1, 2)
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 4)
         Z_PARAM_ZVAL(image)
         Z_PARAM_OPTIONAL
         Z_PARAM_BOOL(channelLast)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 #ifdef HAVE_GD
-    rtn = NDArray_FromGD(image, channelLast);
-    ndarray_init_new_object(rtn, return_value);
+    if (Z_TYPE_P(image) != IS_OBJECT ||
+        strcmp(ZSTR_VAL(Z_OBJ_P(image)->ce->name), "GdImage") != 0) {
+        zend_throw_error(NULL,
+            "NumPower::fromImage() expects a \\GdImage instance as the first argument.");
+        return;
+    }
+
+    /* Default to uint8 — pixel values are 0..255 by definition. The
+       ndarray_parse_dtype_device helper canonicalises the string and
+       validates that GPU was requested only when CUDA is compiled in. */
+    const char *ndarrayDataType;
+    int parsed_device;
+    const char *requested_dtype = (dataType != NULL && dataTypeLen > 0)
+                                  ? dataType : "uint8";
+    if (!ndarray_parse_dtype_device(requested_dtype, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_FromGD(image, channelLast, ndarrayDataType,
+                                  parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* fromImage always returns a 3-D NDArray, never a host scalar, so the
+       always-NDArray installer is the right choice — it keeps the result
+       chainable with `->gpu()` / `->reshape()` / etc. regardless of the
+       (H, W) values. */
+    ndarray_install_object(rtn, return_value);
 #else
-    (void)image; (void)channelLast; (void)rtn;
+    (void)image; (void)channelLast; (void)dataType; (void)dataTypeLen;
+    (void)device;
     zend_throw_error(NULL, "NumPower::fromImage() requires the extension to be built with GD support.");
 #endif
 }

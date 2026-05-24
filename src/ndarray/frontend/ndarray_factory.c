@@ -559,7 +559,16 @@ NDArray *NDArrayFactory_createFromZval(zval *obj, const char *type) {
 #ifdef HAVE_GD
         zend_string *class_name = Z_OBJ_P(obj)->ce->name;
         if (strcmp(ZSTR_VAL(class_name), "GdImage") == 0) {
-            NDArray *ndarray = NDArray_FromGD(obj, false);
+            /* Legacy intake path used by NDArrayFactory_FromZval; the
+               typed-and-deviced fromImage live below in numpower.c. We keep
+               the legacy default (float32 / CHW / CPU) here because callers
+               of this codepath have not opted into the new uint8 default —
+               they are passing a GdImage where an NDArray-of-numerics was
+               expected, and silently switching their dtype would be a
+               breaking surprise. */
+            NDArray *ndarray = NDArray_FromGD(obj, false,
+                                              NDARRAY_TYPE_FLOAT32,
+                                              NDARRAY_DEVICE_CPU);
             add_to_buffer(ndarray);
             return ndarray;
         }

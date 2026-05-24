@@ -45,27 +45,84 @@ zend_always_inline php_gd_image_object *php_gd_exgdimage_from_zobj_p(zend_object
     return (php_gd_image_object *) ((char *) (obj) - XtOffsetOf(php_gd_image_object, std));
 }
 
+/**
+ * @brief Wrap a libgd `gdImagePtr` into a PHP `\GdImage` object zval.
+ *
+ * Looks up the `GdImage` class entry once, populates @p val with a fresh
+ * instance whose internal image slot is set to @p image. The class entry
+ * is cached in a function-local static: a fresh `zend_string` was being
+ * allocated per call with `persistent=1` and never released, slowly
+ * bleeding the persistent pool on every `toImage()` invocation. Caching
+ * the lookup both eliminates that pre-existing leak and saves a hash
+ * lookup per call.
+ *
+ * @param[out] val   Uninitialised zval to populate.
+ * @param[in]  image Raw libgd image pointer (ownership transfers to the
+ *                   created PHP object — its destructor calls
+ *                   `gdImageDestroy`).
+ */
 void
 php_gd_assign_libgdimageptr_as_extgdimage(zval *val, gdImagePtr image) {
-    zend_class_entry *gd_image_ce = zend_lookup_class(zend_string_init("GdImage", strlen("GdImage"), 1));
-    object_init_ex(val, gd_image_ce);
+    static zend_class_entry *gd_image_ce_cached = NULL;
+    if (gd_image_ce_cached == NULL) {
+        zend_string *name = zend_string_init("GdImage", sizeof("GdImage") - 1, 0);
+        gd_image_ce_cached = zend_lookup_class(name);
+        zend_string_release(name);
+    }
+    object_init_ex(val, gd_image_ce_cached);
     php_gd_exgdimage_from_zobj_p(Z_OBJ_P(val))->image = image;
 }
 
+/**
+ * @brief Allocate a truecolor `gdImage` whose backing storage matches the
+ *        allocator libgd uses internally.
+ *
+ * libgd's `gdImageDestroy` (which fires when the PHP `\GdImage` object is
+ * garbage-collected) releases every buffer with system `free()`. The
+ * previous implementation here allocated `im`, `im->tpixels`, and each
+ * `im->tpixels[i]` row with PHP's `emalloc` / `ecalloc` — passing those
+ * heap blocks to libgd's `free()` triggered `double free or corruption`
+ * the moment any `imagedestroy()` or implicit object dtor ran, including
+ * normal PHP request shutdown. Switching to plain `malloc` / `calloc`
+ * fixes that pre-existing crash without any change to the layout libgd
+ * expects.
+ *
+ * @param[in] sx Width  (columns) of the image, in pixels.
+ * @param[in] sy Height (rows)    of the image, in pixels.
+ * @return Pointer to a fully-initialised truecolor `gdImage`, or NULL if
+ *         any allocation step failed.
+ */
 gdImagePtr gdImageCreateTrueColor_(int sx, int sy) {
     int i;
     gdImagePtr im;
 
-    im = (gdImage *) emalloc(sizeof(gdImage));
+    im = (gdImage *) malloc(sizeof(gdImage));
+    if (im == NULL) {
+        return NULL;
+    }
     memset(im, 0, sizeof(gdImage));
-    im->tpixels = (int **) emalloc(sizeof(int *) * sy);
+    if (sy > 0) {
+        im->tpixels = (int **) malloc(sizeof(int *) * (size_t) sy);
+        if (im->tpixels == NULL) {
+            free(im);
+            return NULL;
+        }
+    } else {
+        im->tpixels = NULL;
+    }
     im->polyInts = 0;
     im->polyAllocated = 0;
     im->brush = 0;
     im->tile = 0;
     im->style = 0;
     for (i = 0; i < sy; i++) {
-        im->tpixels[i] = (int *) ecalloc(sx, sizeof(int));
+        im->tpixels[i] = (int *) calloc((size_t)(sx > 0 ? sx : 1), sizeof(int));
+        if (im->tpixels[i] == NULL) {
+            for (int k = 0; k < i; k++) free(im->tpixels[k]);
+            free(im->tpixels);
+            free(im);
+            return NULL;
+        }
     }
     im->sx = sx;
     im->sy = sy;
@@ -93,198 +150,370 @@ gdImagePtr gdImageCreateTrueColor_(int sx, int sy) {
     return im;
 }
 
-NDArray *
-NDArray_FromGD(zval *a, bool channel_last) {
-    NDArray *rtn;
-    int color_index, j, i;
-    int offset_green, offset_red, offset_blue;
-    int red, green, blue;
-    int *i_shape = emalloc(sizeof(int) * 3);
-    gdImagePtr img_ptr = gdImagePtr_from_zobj_p(Z_OBJ_P(a));
-    if (!channel_last) {
-        i_shape[0] = 3;
-        i_shape[1] = (int) img_ptr->sy;
-        i_shape[2] = (int) img_ptr->sx;
+/**
+ * @brief Clamp a real-valued pixel sample to the GD 8-bit color band.
+ *
+ * Used by `NDArray_ToGD` when packing channel values back into the 32-bit
+ * GD `tpixels` word. Any value outside [0, 255] (NaN, negatives produced by
+ * normalized-then-denormalized floats, or oversaturated arithmetic) would
+ * otherwise be cast to `int` with implementation-defined behavior and OR'd
+ * into adjacent color bytes — the clamp keeps the bit pack exactly
+ * `(A<<24)|(R<<16)|(G<<8)|B`. NaN is treated as 0 since `v >= 0.0` is false
+ * for NaN, matching the "missing pixel → black" convention used by Pillow.
+ *
+ * @param[in] v Channel sample as a host double.
+ * @return Integer in [0, 255].
+ */
+static int
+ndarray_gd_clamp_byte(double v) {
+    if (!(v >= 0.0)) return 0;
+    if (v > 255.0)   return 255;
+    return (int)v;
+}
+
+/**
+ * @brief Compute (row_stride, col_stride, channel_stride) for the layout.
+ *
+ * Both supported layouts use 3-D shape but differ in which axis is the RGB
+ * channel:
+ *   - CHW (@p channel_last == false): shape `[3, H, W]`, channel axis 0.
+ *   - HWC (@p channel_last == true):  shape `[H, W, 3]`, channel axis 2.
+ *
+ * Returning per-element strides (not byte strides) lets the loop bodies
+ * stay dtype-agnostic and avoids redundant division by `NDArray_ELSIZE`
+ * inside the inner loop. All three strides are returned in *element* units.
+ *
+ * @param[in]  strides_bytes  `NDArray_STRIDES(arr)` — byte strides per axis.
+ * @param[in]  elsize         Element size in bytes (`NDArray_ELSIZE(arr)`).
+ * @param[in]  channel_last   true for HWC, false for CHW.
+ * @param[out] row_stride     Per-element stride to advance one image row.
+ * @param[out] col_stride     Per-element stride to advance one image column.
+ * @param[out] channel_stride Per-element stride to advance one RGB channel.
+ */
+static void
+ndarray_gd_layout_strides(int *strides_bytes, int elsize, bool channel_last,
+                          long *row_stride, long *col_stride,
+                          long *channel_stride) {
+    if (channel_last) {
+        *row_stride     = strides_bytes[0] / elsize;
+        *col_stride     = strides_bytes[1] / elsize;
+        *channel_stride = strides_bytes[2] / elsize;
     } else {
-        i_shape[1] = (int) img_ptr->sy;
-        i_shape[0] = (int) img_ptr->sx;
-        i_shape[2] = 3;
+        *channel_stride = strides_bytes[0] / elsize;
+        *row_stride     = strides_bytes[1] / elsize;
+        *col_stride     = strides_bytes[2] / elsize;
     }
-    rtn = NDArray_Zeros(i_shape, 3, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-    for (i = 0; i < img_ptr->sy; i++) {
-        for (j = 0; j < img_ptr->sx; j++) {
-            if (img_ptr->trueColor) {
-                if (!channel_last) {
-                    offset_red = (NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn) * 0) +
-                                 ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                 ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * j);
-                    offset_green = ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * 1) +
-                                   ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                   ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * j);
-                    offset_blue = ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * 2) +
-                                  ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                  ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * j);
+}
+
+/**
+ * @brief Detect whether a 3-D NDArray is a CHW or HWC RGB image and return
+ *        `(channel_last, H, W)` so callers don't have to repeat the check.
+ *
+ * Ambiguous 3×3×3 inputs (where both layouts are valid) resolve to HWC —
+ * that matches the default produced by `NumPower::fromImage($img)` and the
+ * numpy/PIL/PyTorch HWC convention used by ML preprocessing pipelines.
+ *
+ * @param[in]  a            3-D NDArray of either shape `[3, H, W]` or
+ *                          `[H, W, 3]`.
+ * @param[out] channel_last true when the channel axis is the last one (HWC).
+ * @param[out] H            Image height (in rows).
+ * @param[out] W            Image width  (in columns).
+ * @return 1 on success, 0 if @p a is not a valid image shape (Error thrown).
+ */
+static int
+ndarray_gd_detect_layout(NDArray *a, bool *channel_last, int *H, int *W) {
+    if (NDArray_NDIM(a) != 3) {
+        zend_throw_error(NULL,
+            "NDArray must be 3-dimensional to be converted to a GD image; got ndim=%d.",
+            NDArray_NDIM(a));
+        return 0;
+    }
+    int *shape = NDArray_SHAPE(a);
+    if (shape[2] == 3) {
+        *channel_last = true;
+        *H = shape[0];
+        *W = shape[1];
+        return 1;
+    }
+    if (shape[0] == 3) {
+        *channel_last = false;
+        *H = shape[1];
+        *W = shape[2];
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "NDArray must be RGB-shaped [3, H, W] (CHW) or [H, W, 3] (HWC) "
+        "to be converted to a GD image; got [%d, %d, %d].",
+        shape[0], shape[1], shape[2]);
+    return 0;
+}
+
+/**
+ * @brief Materialise @p a's element buffer in CPU RAM as a typed staging copy.
+ *
+ * Both `NDArray_FromGD` (write path) and `NDArray_ToGD` (read path) need a
+ * dtype-aware host buffer to call `ndarray_set_from_double` /
+ * `ndarray_element_to_double` against. For a CPU NDArray we return its
+ * `data` pointer directly and set `*owned == false` so the caller skips the
+ * release. For a GPU NDArray we `emalloc` a host buffer, copy via
+ * `NDArray_TypedD2H` (which handles fp128's DD→__float128 reassembly),
+ * and set `*owned == true`. The caller frees with `efree()` when done.
+ *
+ * @param[in]  a     Source NDArray, on CPU or GPU.
+ * @param[out] owned true if the returned buffer was emalloc'd by this
+ *                   helper and must be `efree`d by the caller.
+ * @return Host pointer to @p a's elements (read-only for the caller).
+ */
+static char *
+ndarray_gd_stage_to_host(NDArray *a, bool *owned) {
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
+        *owned = false;
+        return (char *)NDArray_DATA(a);
+    }
+#ifdef HAVE_CUBLAS
+    long n = (long)NDArray_NUMELEMENTS(a);
+    int elsize = NDArray_ELSIZE(a);
+    char *stage = (char *)emalloc((size_t)n * (size_t)elsize);
+    NDArray_TypedD2H(stage, (const char *)NDArray_DATA(a), n, NDArray_TYPE(a));
+    *owned = true;
+    return stage;
+#else
+    *owned = false;
+    return NULL;
+#endif
+}
+
+/**
+ * @brief `NumPower::fromImage` — typed/device-aware GD → NDArray converter.
+ *
+ * The previous implementation hardcoded float32 storage, produced the wrong
+ * shape for HWC (returned `[W, H, 3]` instead of `[H, W, 3]`), swapped row
+ * and column for palette-mode pixel lookups, and could only build on CPU.
+ * This rewrite:
+ *   - allocates the result in the caller's dtype (default `uint8`, the
+ *     natural fit for 0..255 pixel data — 4× smaller than the legacy
+ *     float32) and on the caller's device (CPU directly into emalloc'd
+ *     storage, GPU via host staging + `NDArray_TypedH2D`);
+ *   - emits HWC = `[H, W, 3]` (was `[W, H, 3]`) to match numpy/PIL/PyTorch;
+ *   - hits each pixel exactly once and writes R/G/B in declaration order
+ *     so the value-channel correspondence cannot drift between layouts;
+ *   - uses `gdImagePalettePixel(img, x, y)` correctly (the legacy code
+ *     swapped @p x and @p y) for indexed (non-truecolor) images.
+ *
+ * @param[in] a            zval wrapping a `\GdImage` instance.
+ * @param[in] channel_last true for HWC `[H, W, 3]`; false for CHW
+ *                         `[3, H, W]`.
+ * @param[in] dtype        Canonical dtype string (validated by caller).
+ * @param[in] device       NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray on success, NULL on allocation failure.
+ */
+NDArray *
+NDArray_FromGD(zval *a, bool channel_last, const char *dtype, int device) {
+    gdImagePtr img_ptr = gdImagePtr_from_zobj_p(Z_OBJ_P(a));
+    int W = (int)img_ptr->sx;
+    int H = (int)img_ptr->sy;
+    bool is_truecolor = img_ptr->trueColor != 0;
+
+    int *shape = emalloc(sizeof(int) * 3);
+    if (channel_last) {
+        shape[0] = H;
+        shape[1] = W;
+        shape[2] = 3;
+    } else {
+        shape[0] = 3;
+        shape[1] = H;
+        shape[2] = W;
+    }
+
+    /* Allocate the result on CPU first; the GPU device is materialised at
+       the end via a single H2D copy so we don't have to thread CUDA into
+       the per-pixel decode loop. `NDArray_Empty` leaves the buffer
+       uninitialised — fine here, since every byte is written below. The
+       zero-pixel edge case (H == 0 or W == 0) leaves the buffer untouched
+       but still allocates a balanced slot; `NDArray_Empty` with `n == 0`
+       is a no-op allocator and `NDArray_FREE` will release it. */
+    NDArray *rtn = NDArray_Empty(shape, 3, dtype, NDARRAY_DEVICE_CPU);
+    if (rtn == NULL) {
+        return NULL;
+    }
+
+    if (H > 0 && W > 0) {
+        long row_stride, col_stride, channel_stride;
+        ndarray_gd_layout_strides(NDArray_STRIDES(rtn), NDArray_ELSIZE(rtn),
+                                  channel_last, &row_stride, &col_stride,
+                                  &channel_stride);
+        char *buf = (char *)NDArray_DATA(rtn);
+        const char *type = NDArray_TYPE(rtn);
+
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                int color_index;
+                int r, g, b;
+                if (is_truecolor) {
+                    color_index = img_ptr->tpixels[y][x];
+                    r = (color_index >> 16) & 0xFF;
+                    g = (color_index >>  8) & 0xFF;
+                    b =  color_index        & 0xFF;
                 } else {
-                    offset_red = (NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn) * 0) +
-                                 ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                 ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * j);
-                    offset_green = ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * 1) +
-                                   ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                   ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * j);
-                    offset_blue = ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * 2) +
-                                  ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * i) +
-                                  ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * j);
+                    /* gdImagePalettePixel(img, x, y) — x first, y second.
+                       The legacy code passed (y, x) and silently read out-of
+                       -bounds palette indices on non-square images. */
+                    color_index = gdImagePalettePixel(img_ptr, x, y);
+                    r = img_ptr->red[color_index];
+                    g = img_ptr->green[color_index];
+                    b = img_ptr->blue[color_index];
                 }
-                color_index = img_ptr->tpixels[i][j];
-                red = (color_index >> 16) & 0xFF;
-                green = (color_index >> 8) & 0xFF;
-                blue = color_index & 0xFF;
-                NDArray_F32DATA(rtn)[offset_red] = (float) red;
-                NDArray_F32DATA(rtn)[offset_blue] = (float) blue;
-                NDArray_F32DATA(rtn)[offset_green] = (float) green;
-            } else {
-                if (!channel_last) {
-                    offset_red = (NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn) * 0) +
-                                 ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                 ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * i);
-                    offset_green = ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * 1) +
-                                   ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                   ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * i);
-                    offset_blue = ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * 2) +
-                                  ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                  ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * i);
-                } else {
-                    offset_red = (NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn) * 0) +
-                                 ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                 ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * i);
-                    offset_green = ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * 1) +
-                                   ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                   ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * i);
-                    offset_blue = ((NDArray_STRIDES(rtn)[2] / NDArray_ELSIZE(rtn)) * 2) +
-                                  ((NDArray_STRIDES(rtn)[1] / NDArray_ELSIZE(rtn)) * j) +
-                                  ((NDArray_STRIDES(rtn)[0] / NDArray_ELSIZE(rtn)) * i);
-                }
-                color_index = gdImagePalettePixel(img_ptr, i, j);
-                red = img_ptr->red[color_index];
-                green = img_ptr->green[color_index];
-                blue = img_ptr->blue[color_index];
-                NDArray_F32DATA(rtn)[offset_red] = (float) red;
-                NDArray_F32DATA(rtn)[offset_blue] = (float) blue;
-                NDArray_F32DATA(rtn)[offset_green] = (float) green;
+                long base = row_stride * (long)y + col_stride * (long)x;
+                ndarray_set_from_double(type, buf, base + channel_stride * 0, (double)r);
+                ndarray_set_from_double(type, buf, base + channel_stride * 1, (double)g);
+                ndarray_set_from_double(type, buf, base + channel_stride * 2, (double)b);
             }
         }
     }
+
+#ifdef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* The CPU build is the staging copy; transfer the typed bytes to a
+           fresh VRAM-resident NDArray and release the CPU buffer. Going
+           through `NDArray_TypedH2D` keeps the fp128 ↔ DD conversion in one
+           place — the on-GPU storage uses (hi, lo) double-double pairs. */
+        long n = (long)NDArray_NUMELEMENTS(rtn);
+        int *gpu_shape = emalloc(sizeof(int) * 3);
+        memcpy(gpu_shape, NDArray_SHAPE(rtn), sizeof(int) * 3);
+        NDArray *gpu = NDArray_Empty(gpu_shape, 3, dtype, NDARRAY_DEVICE_GPU);
+        if (gpu == NULL) {
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        if (n > 0) {
+            NDArray_TypedH2D((char *)NDArray_DATA(gpu),
+                             (const char *)NDArray_DATA(rtn), n, dtype);
+        }
+        NDArray_FREE(rtn);
+        return gpu;
+    }
+#else
+    (void)device;
+#endif
     return rtn;
 }
 
+/**
+ * @brief `NDArray::toImage` — typed/device-aware NDArray → GD converter.
+ *
+ * Accepts either CHW `[3, H, W]` or HWC `[H, W, 3]` input on any device and
+ * for any dtype. Values are clamped to [0, 255] before being packed into
+ * the GD `tpixels` word — float pixel pipelines that drift outside the
+ * displayable range (post-normalization, post-activation, etc.) no longer
+ * corrupt adjacent color bytes via signed-int truncation. GPU input is
+ * staged through `NDArray_TypedD2H` so callers never have to remember to
+ * `->cpu()` first; an explicit error is still thrown if the dtype/shape is
+ * unusable. The alpha companion (when provided) is read with its own
+ * 2-D strides — the legacy code used the 3-D image strides for the alpha
+ * lookup, which read far out of bounds on every row beyond the first.
+ *
+ * @param[in]  a       Source NDArray; ndim must be 3 and one axis must be 3
+ *                     (RGB channel).
+ * @param[in]  n_alpha Optional 2-D alpha NDArray of shape `[H, W]`. When
+ *                     present its dtype and device are unconstrained.
+ * @param[out] output  Populated with a fresh `\GdImage` zval (RGB or RGBA).
+ */
 void
 NDArray_ToGD(NDArray *a, NDArray *n_alpha, zval *output) {
-    if (NDArray_NDIM(a) != 3 || NDArray_SHAPE(a)[0] != 3) {
-        zend_throw_error(NULL, "Incompatible shape for image");
+    bool channel_last;
+    int H, W;
+    if (!ndarray_gd_detect_layout(a, &channel_last, &H, &W)) {
         return;
     }
-    int color_index, i, j;
-    int offset_green, offset_red, offset_blue, offset_alpha;
-    int red, green, blue, alpha;
-    gdImagePtr im = gdImageCreateTrueColor_(NDArray_SHAPE(a)[2], NDArray_SHAPE(a)[1]);
-
-#if HAVE_AVX2
-    __m256i alpha_values;
-    int elsize = NDArray_ELSIZE(a);
-    __m256i alpha_mask = _mm256_set_epi32(0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF);
-
-    for (i = 0; i < im->sy; i++) {
-        for (j = 0; j < im->sx - 7; j += 8) {
-            offset_alpha = (NDArray_STRIDES(a)[0] / elsize * i) +
-                           ((NDArray_STRIDES(a)[1] / elsize) * j);
-            offset_red = (NDArray_STRIDES(a)[0] / elsize * 0) +
-                         ((NDArray_STRIDES(a)[1] / elsize) * i) +
-                         ((NDArray_STRIDES(a)[2] / elsize) * j);
-            offset_green = ((NDArray_STRIDES(a)[0] / elsize) * 1) +
-                           ((NDArray_STRIDES(a)[1] / elsize) * i) +
-                           ((NDArray_STRIDES(a)[2] / elsize) * j);
-            offset_blue = ((NDArray_STRIDES(a)[0] / elsize) * 2) +
-                          ((NDArray_STRIDES(a)[1] / elsize) * i) +
-                          ((NDArray_STRIDES(a)[2] / elsize) * j);
-
-            __m256 red_values = _mm256_loadu_ps(&NDArray_F32DATA(a)[offset_red]);
-            __m256 green_values = _mm256_loadu_ps(&NDArray_F32DATA(a)[offset_green]);
-            __m256 blue_values = _mm256_loadu_ps(&NDArray_F32DATA(a)[offset_blue]);
-
-            __m256i red_int = _mm256_cvtps_epi32(red_values);
-            __m256i green_int = _mm256_cvtps_epi32(green_values);
-            __m256i blue_int = _mm256_cvtps_epi32(blue_values);
-
-            __m256i color_indices;
-
-            if (n_alpha != NULL) {
-                alpha_values = _mm256_cvtps_epi32(_mm256_loadu_ps(&NDArray_F32DATA(n_alpha)[offset_alpha]));
-                alpha_values = _mm256_and_si256(alpha_values, alpha_mask);
-
-                color_indices = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(alpha_values, 24),
-                                                                _mm256_slli_epi32(red_int, 16)),
-                                                _mm256_or_si256(_mm256_slli_epi32(green_int, 8), blue_int));
-            } else {
-                // Handle the case when n_alpha is NULL
-                // Set color_indices using only red, green, and blue values
-                color_indices = _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(red_int, 16),
-                                                                _mm256_slli_epi32(green_int, 8)),
-                                                blue_int);
-            }
-
-            _mm256_storeu_si256((__m256i *) &im->tpixels[i][j], color_indices);
-        }
-        for (; j < im->sx; j++) {
-            offset_alpha = (NDArray_STRIDES(a)[0] / NDArray_ELSIZE(a) * i) +
-                           ((NDArray_STRIDES(a)[1] / NDArray_ELSIZE(a)) * j);
-            offset_red = (NDArray_STRIDES(a)[0] / NDArray_ELSIZE(a) * 0) +
-                         ((NDArray_STRIDES(a)[1] / NDArray_ELSIZE(a)) * i) +
-                         ((NDArray_STRIDES(a)[2] / NDArray_ELSIZE(a)) * j);
-            offset_green = ((NDArray_STRIDES(a)[0] / NDArray_ELSIZE(a)) * 1) +
-                           ((NDArray_STRIDES(a)[1] / NDArray_ELSIZE(a)) * i) +
-                           ((NDArray_STRIDES(a)[2] / NDArray_ELSIZE(a)) * j);
-            offset_blue = ((NDArray_STRIDES(a)[0] / NDArray_ELSIZE(a)) * 2) +
-                          ((NDArray_STRIDES(a)[1] / NDArray_ELSIZE(a)) * i) +
-                          ((NDArray_STRIDES(a)[2] / NDArray_ELSIZE(a)) * j);
-            red = NDArray_F32DATA(a)[offset_red];
-            blue = NDArray_F32DATA(a)[offset_blue];
-            green = NDArray_F32DATA(a)[offset_green];
-            if (n_alpha != NULL) {
-                alpha = NDArray_F32DATA(n_alpha)[offset_alpha];
-                color_index = (alpha << 24) | (red << 16) | (green << 8) | blue;
-            } else {
-                color_index = (red << 16) | (green << 8) | blue;
-            }
-            im->tpixels[i][j] = color_index;
+    if (n_alpha != NULL) {
+        if (NDArray_NDIM(n_alpha) != 2 ||
+            NDArray_SHAPE(n_alpha)[0] != H ||
+            NDArray_SHAPE(n_alpha)[1] != W) {
+            zend_throw_error(NULL,
+                "alpha must be a 2-D NDArray of shape [%d, %d]; "
+                "got %d-D shape [%d, %d].", H, W, NDArray_NDIM(n_alpha),
+                NDArray_NDIM(n_alpha) > 0 ? NDArray_SHAPE(n_alpha)[0] : 0,
+                NDArray_NDIM(n_alpha) > 1 ? NDArray_SHAPE(n_alpha)[1] : 0);
+            return;
         }
     }
-#else
-    for (int i = 0; i < im->sy; i++) {
-        for (int j = 0; j < im->sx; j++) {
-            offset_alpha = (NDArray_STRIDES(a)[0]/ NDArray_ELSIZE(a) * i) +
-                           ((NDArray_STRIDES(a)[1]/ NDArray_ELSIZE(a)) * j);
-            offset_red = (NDArray_STRIDES(a)[0]/ NDArray_ELSIZE(a) * 0) +
-                         ((NDArray_STRIDES(a)[1]/ NDArray_ELSIZE(a)) * i) +
-                         ((NDArray_STRIDES(a)[2]/ NDArray_ELSIZE(a)) * j);
-            offset_green = ((NDArray_STRIDES(a)[0]/ NDArray_ELSIZE(a)) * 1) +
-                           ((NDArray_STRIDES(a)[1]/ NDArray_ELSIZE(a)) * i) +
-                           ((NDArray_STRIDES(a)[2]/ NDArray_ELSIZE(a)) * j);
-            offset_blue = ((NDArray_STRIDES(a)[0]/ NDArray_ELSIZE(a)) * 2) +
-                          ((NDArray_STRIDES(a)[1]/ NDArray_ELSIZE(a)) * i) +
-                          ((NDArray_STRIDES(a)[2]/ NDArray_ELSIZE(a)) * j);
-            red = NDArray_F32DATA(a)[offset_red];
-            blue = NDArray_F32DATA(a)[offset_blue];
-            green = NDArray_F32DATA(a)[offset_green];
-            if (n_alpha != NULL) {
-                alpha = NDArray_F32DATA(n_alpha)[offset_alpha];
-                color_index = (alpha << 24) | (red << 16) | (green << 8) | blue;
-            } else {
-                color_index = (red << 16) | (green << 8) | blue;
-            }
-            im->tpixels[i][j] = color_index;
+
+    /* Stage GPU operands to host once, with a single emalloc per array,
+       rather than per-pixel — `NDArray_TypedD2H` handles the fp128 DD →
+       __float128 reassembly internally. CPU NDArrays return their data
+       pointer directly. */
+    bool a_owned;
+    char *a_buf = ndarray_gd_stage_to_host(a, &a_owned);
+    if (a_buf == NULL) {
+        zend_throw_error(NULL,
+            "Cannot stage GPU NDArray to host — the extension was built without CUDA support.");
+        return;
+    }
+    bool alpha_owned = false;
+    char *alpha_buf = NULL;
+    if (n_alpha != NULL) {
+        alpha_buf = ndarray_gd_stage_to_host(n_alpha, &alpha_owned);
+        if (alpha_buf == NULL) {
+            if (a_owned) efree(a_buf);
+            zend_throw_error(NULL,
+                "Cannot stage GPU alpha NDArray to host — CUDA support is unavailable.");
+            return;
         }
     }
-#endif
+
+    gdImagePtr im = gdImageCreateTrueColor_(W, H);
+    if (im == NULL) {
+        if (a_owned)     efree(a_buf);
+        if (alpha_owned) efree(alpha_buf);
+        zend_throw_error(NULL,
+            "Cannot allocate GD truecolor image of size %d x %d "
+            "(out of memory).", W, H);
+        return;
+    }
+
+    if (H > 0 && W > 0) {
+        long row_stride, col_stride, channel_stride;
+        ndarray_gd_layout_strides(NDArray_STRIDES(a), NDArray_ELSIZE(a),
+                                  channel_last, &row_stride, &col_stride,
+                                  &channel_stride);
+        const char *a_type = NDArray_TYPE(a);
+
+        /* Alpha is always 2-D [H, W]; compute its element-strides once. */
+        long alpha_row_stride = 0, alpha_col_stride = 0;
+        const char *alpha_type = NULL;
+        if (n_alpha != NULL) {
+            alpha_row_stride = NDArray_STRIDES(n_alpha)[0] / NDArray_ELSIZE(n_alpha);
+            alpha_col_stride = NDArray_STRIDES(n_alpha)[1] / NDArray_ELSIZE(n_alpha);
+            alpha_type = NDArray_TYPE(n_alpha);
+        }
+
+        for (int y = 0; y < H; y++) {
+            for (int x = 0; x < W; x++) {
+                long base = row_stride * (long)y + col_stride * (long)x;
+                int r = ndarray_gd_clamp_byte(ndarray_element_to_double(
+                    a_type, a_buf, (size_t)(base + channel_stride * 0)));
+                int g = ndarray_gd_clamp_byte(ndarray_element_to_double(
+                    a_type, a_buf, (size_t)(base + channel_stride * 1)));
+                int b = ndarray_gd_clamp_byte(ndarray_element_to_double(
+                    a_type, a_buf, (size_t)(base + channel_stride * 2)));
+                int color_index;
+                if (n_alpha != NULL) {
+                    long alpha_idx = alpha_row_stride * (long)y +
+                                     alpha_col_stride * (long)x;
+                    int alpha = ndarray_gd_clamp_byte(ndarray_element_to_double(
+                        alpha_type, alpha_buf, (size_t)alpha_idx));
+                    color_index = (alpha << 24) | (r << 16) | (g << 8) | b;
+                } else {
+                    color_index = (r << 16) | (g << 8) | b;
+                }
+                im->tpixels[y][x] = color_index;
+            }
+        }
+    }
+
+    if (a_owned)     efree(a_buf);
+    if (alpha_owned) efree(alpha_buf);
+
     php_gd_assign_libgdimageptr_as_extgdimage(output, im);
 }
 
