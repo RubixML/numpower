@@ -55,7 +55,8 @@ NDArrayNormalKind NDArray_NormalKindFor(const char *type);
 
 NDArray* NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
                         const char *type, int device);
-NDArray* NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator);
+NDArray* NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape,
+                                 int ndim, const char *type, int device);
 NDArray* NDArray_StandardNormal(int* shape, int ndim);
 NDArray* NDArray_Poisson(double lam, int* shape, int ndim);
 NDArray* NDArray_Uniform(double low, double high, int* shape, int ndim);

@@ -1957,49 +1957,122 @@ PHP_METHOD(NumPower, normal) {
 }
 
 /**
- * NumPower::truncatedNormal
+ * @brief `NumPower::truncatedNormal(shape, loc = 0.0, scale = 1.0, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Same contract as `NumPower::normal()` except every per-element draw
+ * is rejection-bounded so the result lies in `[loc - 2σ, loc + 2σ]`.
+ * The implementation reuses the `NDArrayNormalSpec` discriminator and
+ * the `coerce_zval_to_*` helpers — `loc` and `scale` accept
+ * `int | float | string`, with the string form being the only
+ * precision-loss-free path for the wide dtypes (`float128` via
+ * `strtoflt128` / DD fallback; `uint64` via `strtoull`).
+ *
+ * GPU paths (`device == 1`) build the result directly in VRAM via the
+ * new `cuda_truncated_normal_f32` / `cuda_truncated_normal_f64`
+ * rejection-sample kernels; for `float128` GPU the values go through a
+ * standardised f64 truncated stream + `cuda_normal_dd_affine` so the
+ * user's fp128 loc/scale survive bit-for-bit through the (hi, lo) DD
+ * layout. See `NDArray_TruncatedNormal` for the per-dtype dispatch
+ * table.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_truncated_normal, 0, 0, 1)
-    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, shape)
     ZEND_ARG_INFO(0, loc)
     ZEND_ARG_INFO(0, scale)
-    ZEND_ARG_INFO(0, accelerator)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, truncatedNormal) {
-    NDArray *rtn = NULL;
-    int *shape;
-    zval* size;
-    long accelerator = NDARRAY_DEVICE_CPU;
-    double loc = 0.0, scale = 1.0;
+    zval *shape_zval;
+    zval *loc_zv   = NULL;
+    zval *scale_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
 
-    ZEND_PARSE_PARAMETERS_START(1, 4)
-        Z_PARAM_ZVAL(size)
+    ZEND_PARSE_PARAMETERS_START(1, 5)
+        Z_PARAM_ZVAL(shape_zval)
     Z_PARAM_OPTIONAL
-        Z_PARAM_DOUBLE(loc)
-        Z_PARAM_DOUBLE(scale)
-        Z_PARAM_LONG(accelerator)
+        Z_PARAM_ZVAL(loc_zv)
+        Z_PARAM_ZVAL(scale_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 
-    int accelerator_i = (int) accelerator;
-    NDArray *nda = ZVAL_TO_NDARRAY(size);
-
-    if (nda == NULL) {
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
 
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
+    NDArrayNormalSpec spec;
+    spec.kind = NDArray_NormalKindFor(ndarrayDataType);
 
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        shape[i] = (int) NDArray_F32DATA(nda)[i];
+    switch (spec.kind) {
+        case NDARRAY_NORMAL_KIND_FP128: {
+            spec.v.f128.loc   = NDARRAY_FP128_ZERO();
+            spec.v.f128.scale = NDARRAY_FP128_FROM_I64(1);
+            if (loc_zv != NULL &&
+                !coerce_zval_to_fp128(loc_zv, "truncatedNormal", "loc",
+                                       &spec.v.f128.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_fp128(scale_zv, "truncatedNormal", "scale",
+                                       &spec.v.f128.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
+        case NDARRAY_NORMAL_KIND_UINT64: {
+            spec.v.u64.loc   = 0;
+            spec.v.u64.scale = 1;
+            if (loc_zv != NULL &&
+                !coerce_zval_to_uint64(loc_zv, "truncatedNormal", "loc",
+                                        &spec.v.u64.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_uint64(scale_zv, "truncatedNormal", "scale",
+                                        &spec.v.u64.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
+        case NDARRAY_NORMAL_KIND_DOUBLE:
+        default: {
+            spec.kind        = NDARRAY_NORMAL_KIND_DOUBLE;
+            spec.v.d.loc     = 0.0;
+            spec.v.d.scale   = 1.0;
+            if (loc_zv != NULL &&
+                !coerce_zval_to_double(loc_zv, "truncatedNormal", "loc",
+                                        &spec.v.d.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_double(scale_zv, "truncatedNormal", "scale",
+                                        &spec.v.d.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
     }
 
-    rtn = NDArray_TruncatedNormal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
-    NDArray_FREE(nda);
-
-    ndarray_init_new_object(rtn, return_value);
+    NDArray *rtn = NDArray_TruncatedNormal(&spec, shape, ndim, ndarrayDataType,
+                                            parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Hand back an NDArray even for a 0-D shape — matches every other
+       typed factory and preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**

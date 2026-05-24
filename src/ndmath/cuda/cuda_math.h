@@ -84,7 +84,37 @@ NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOpera
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
 void cuda_float_positive(int nblocks, float *d_array);
 void cuda_float_reciprocal(int nblocks, float *d_array);
-void cuda_truncated_normal(float* d_data, int size, double loc, double scale);
+/**
+ * @brief Fill a GPU float32 buffer with truncated-Gaussian samples.
+ *
+ * Per-element value is `loc + scale * z` where `z ~ N(0, 1)` is
+ * rejection-sampled to lie in `[-2, 2]`. Stored values are therefore in
+ * `[loc - 2σ, loc + 2σ]`. Each thread runs its own cuRAND state seeded
+ * from `(seed, idx)` so the streams are independent; the seed itself is
+ * fresh per call via `cuda_normal_next_seed` (was pinned to `1234ULL`
+ * in the previous implementation, producing identical samples on every
+ * call within one process).
+ *
+ * @param[out] d_data Destination GPU buffer of @p n floats.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_truncated_normal_f32(float *d_data, long n, float loc, float scale);
+
+/**
+ * @brief Fill a GPU float64 buffer with truncated-Gaussian samples.
+ *
+ * Companion to `cuda_truncated_normal_f32` for double precision. The
+ * underlying samples carry 53-bit precision before the affine
+ * transform; truncation bounds are evaluated in double too.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n doubles.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_truncated_normal_f64(double *d_data, long n, double loc, double scale);
 
 /**
  * @brief Fill a GPU float32 buffer with N(@p mean, @p stddev^2) samples.

@@ -668,42 +668,11 @@ NDArray_Identity(int size, const char *type, int device) {
     return rtn;
 }
 
-/**
- * Random samples from a truncated Gaussian distribution.
- *
- * The values generated are similar to values from a Normal distribution,
- * except that values more than two standard deviations from the mean are
- * discarded and re-drawn.
- * 
- * @param size
- * @return
- */
-NDArray*
-NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator) {
-    NDArray *rtn;
-    scale = scale / 0.88;
-
-    if (accelerator == NDARRAY_DEVICE_GPU) {
-#ifdef HAVE_CUBLAS
-        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_GPU);
-        int size = NDArray_NUMELEMENTS(rtn);
-        cuda_truncated_normal(NDArray_F32DATA(rtn), size, loc, scale);
-#endif
-    } else {
-        rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-        for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
-            float z;
-            do {
-                float u1 = (float)rand() / (float)RAND_MAX;
-                float u2 = (float)rand() / (float)RAND_MAX;
-                z = sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
-                z = (float)loc + (float)scale * z;
-                NDArray_F32DATA(rtn)[i] = z;
-            } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
-        }
-    }
-    return rtn;
-}
+/* The truncated-normal sampler shares the (loc, scale) coercion plumbing
+   and the per-dtype dispatch with `NDArray_Normal` — every helper below
+   reuses the same `NDArrayNormalSpec` discriminator. The full
+   per-element fillers are defined further down, alongside the standard
+   sampler; the truncated variant just adds a rejection guard on top. */
 
 /**
  * @brief Sample one standard-normal `double` z ~ N(0, 1).
@@ -1083,6 +1052,306 @@ NDArray_StandardNormal(int* shape, int ndim) {
     spec.v.d.scale   = 1.0;
     return NDArray_Normal(&spec, shape, ndim, NDARRAY_TYPE_FLOAT32,
                           NDARRAY_DEVICE_CPU);
+}
+
+/**
+ * @brief Sample one truncated standard-normal `double` z ~ N(0, 1) | |z| ≤ 2.
+ *
+ * Rejection-sampling wrapper around `ndarray_normal_sample`: keeps
+ * drawing until the sample lands in `[-2, 2]`. The acceptance rate at
+ * ±2σ is ~95.45%, so the average runtime is ~1.05 calls to the
+ * underlying polar sampler per accepted value — well bounded.
+ *
+ * @return One sample drawn from N(0, 1) truncated to [-2, 2].
+ */
+static double ndarray_truncated_normal_sample(void) {
+    double z;
+    do {
+        z = ndarray_normal_sample();
+    } while (z < -2.0 || z > 2.0);
+    return z;
+}
+
+/**
+ * @brief CPU fill: write @p n truncated-Gaussian samples into @p data.
+ *
+ * Companion to `normal_fill_cpu_double`; samples are rejection-bounded
+ * to `[loc - 2σ, loc + 2σ]` (the truncation is on the standardised z,
+ * which is then affinely transformed). Routes the per-element store
+ * through `ndarray_set_from_double` so each dtype gets its
+ * dtype-correct quantisation.
+ *
+ * @param[out] data  Destination host buffer; ≥ `n * get_type_size(type)` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  type  Canonical dtype string.
+ * @param[in]  loc   Distribution mean (µ).
+ * @param[in]  scale Distribution stddev (σ).
+ */
+static void truncated_normal_fill_cpu_double(char *data, long n,
+                                              const char *type,
+                                              double loc, double scale) {
+    for (long i = 0; i < n; i++) {
+        double v = loc + scale * ndarray_truncated_normal_sample();
+        ndarray_set_from_double(type, data, (size_t)i, v);
+    }
+}
+
+/**
+ * @brief CPU fill for the float128 dtype.
+ *
+ * Same precision discipline as `normal_fill_cpu_fp128` — the affine
+ * `loc + scale * fp128(z)` runs in fp128 arithmetic so wide-range
+ * loc/scale (`'1e+200'` via string input) keep full precision. The
+ * z-sample is a (truncated) standard-normal double.
+ *
+ * @param[out] data  Destination host buffer of `n * NDARRAY_FP128_SIZE` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  loc   Distribution mean as fp128.
+ * @param[in]  scale Distribution stddev as fp128.
+ */
+static void truncated_normal_fill_cpu_fp128(char *data, long n,
+                                             ndarray_fp128_t loc,
+                                             ndarray_fp128_t scale) {
+    ndarray_fp128_t *p = (ndarray_fp128_t *)data;
+    for (long i = 0; i < n; i++) {
+        ndarray_fp128_t z = NDARRAY_FP128_FROM_D(ndarray_truncated_normal_sample());
+        p[i] = NDARRAY_FP128_ADD(loc, NDARRAY_FP128_MUL(scale, z));
+    }
+}
+
+/**
+ * @brief CPU fill for the uint64 dtype.
+ *
+ * Companion to `normal_fill_cpu_uint64`: the standardised z is bounded
+ * to `[-2, 2]`, so the signed delta `(int64_t)(scale_d * z)` lies in
+ * `[-2·scale, 2·scale]`. The `uint64` modular addition preserves the
+ * 2^64 wrap if the user picks a tiny `loc` and a `scale` larger than
+ * `loc / 2`; callers near the boundary should size their parameters
+ * accordingly.
+ *
+ * @param[out] data  Destination host buffer of `n * sizeof(uint64_t)` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  loc   Distribution mean as uint64.
+ * @param[in]  scale Distribution stddev as uint64.
+ */
+static void truncated_normal_fill_cpu_uint64(char *data, long n,
+                                              uint64_t loc, uint64_t scale) {
+    uint64_t *p = (uint64_t *)data;
+    double   scale_d = (double)scale;
+    for (long i = 0; i < n; i++) {
+        double  z       = ndarray_truncated_normal_sample();
+        int64_t delta_s = (int64_t)(scale_d * z);
+        p[i] = loc + (uint64_t)delta_s;
+    }
+}
+
+/**
+ * @brief Build a truncated-Gaussian NDArray of the requested shape / dtype / device.
+ *
+ * Mirrors `NDArray_Normal` exactly — same `NDArrayNormalSpec`
+ * discriminator, same CPU fill pattern, same GPU VRAM-direct
+ * pipeline — except every per-element draw is rejection-sampled so the
+ * accepted `(z - 0) / 1` value lies in `[-2, 2]` and the stored value
+ * therefore lies in `[loc - 2σ, loc + 2σ]`.
+ *
+ * GPU dispatch:
+ *  - `dtype == float32`: `cuda_truncated_normal_f32` fills directly.
+ *  - `dtype == float64`: `cuda_truncated_normal_f64` fills directly.
+ *  - Other DOUBLE-kind dtypes: transient f32 scratch filled by
+ *    `cuda_truncated_normal_f32`, then `cuda_cast_f32_to_<dst>` quantises.
+ *    `int64` uses an f64 scratch for the same reason as `NDArray_Normal`
+ *    (avoids float32 mantissa aliasing past 2^24).
+ *  - `dtype == float128`: f64 scratch holds standard-truncated z-samples
+ *    (loc = 0, scale = 1), then `cuda_normal_dd_affine` applies the
+ *    user's fp128 loc/scale in DD arithmetic on device.
+ *  - `dtype == uint64`: same host-staging path as `NDArray_Normal` for
+ *    uint64 — no on-device signed affine kernel for u64 yet.
+ *
+ * Pre-existing bugs fixed:
+ *  - Silent `scale = scale / 0.88` rescale that mutated the user's σ
+ *    before sampling and again before the truncation check — removed,
+ *    so `scale` now means what the caller passed.
+ *  - Pinned `1234ULL` cuRAND seed → identical samples on every call;
+ *    now `cuda_normal_next_seed` gives a fresh per-call stream.
+ *  - Dtype was hardcoded float32 / CPU regardless of the caller's
+ *    request, ignoring loc/scale precision for fp128 / uint64.
+ *  - CPU loop wrote to `rtn->data[i]` *inside* the do-while reject
+ *    body, doing one or more wasted writes per accepted sample. The
+ *    per-sample helper resolves this naturally.
+ *  - GPU kernel used a cos-only Box-Muller variant via `curand_normal`
+ *    — fine, but combined with the pinned seed it was deterministic.
+ *
+ * @param[in] spec   Discriminated (loc, scale) pair in the kind
+ *                   dictated by @p type.
+ * @param[in] shape  Newly-allocated `int[ndim]`; ownership transfers
+ *                   into the returned NDArray's `dimensions`.
+ * @param[in] ndim   Number of dimensions; 0 yields a 0-D scalar.
+ * @param[in] type   Canonical NDArray dtype string.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray on success, NULL on failure (Error in flight).
+ */
+NDArray*
+NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape, int ndim,
+                        const char *type, int device) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) efree(shape);
+        return NULL;
+    }
+
+    NDArray *rtn = NDArray_Empty(shape, ndim, type, device);
+    if (rtn == NULL) {
+        return NULL;
+    }
+    long n = (long) NDArray_NUMELEMENTS(rtn);
+    if (n <= 0) {
+        return rtn;
+    }
+
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS before requesting
+           GPU. If they didn't, fail loudly instead of returning an
+           NDArray with uninitialised on-device storage. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        switch (spec->kind) {
+            case NDARRAY_NORMAL_KIND_DOUBLE:
+                truncated_normal_fill_cpu_double((char *)rtn->data, n, type,
+                                                  spec->v.d.loc,
+                                                  spec->v.d.scale);
+                break;
+            case NDARRAY_NORMAL_KIND_FP128:
+                truncated_normal_fill_cpu_fp128((char *)rtn->data, n,
+                                                 spec->v.f128.loc,
+                                                 spec->v.f128.scale);
+                break;
+            case NDARRAY_NORMAL_KIND_UINT64:
+                truncated_normal_fill_cpu_uint64((char *)rtn->data, n,
+                                                  spec->v.u64.loc,
+                                                  spec->v.u64.scale);
+                break;
+        }
+        return rtn;
+    }
+
+#ifdef HAVE_CUBLAS
+    /* device == NDARRAY_DEVICE_GPU. The destination buffer lives in VRAM
+       (NDArray_Empty allocated it via vmalloc/cudaMalloc); every branch
+       below writes into it without copying the result through host
+       memory. */
+    if (spec->kind == NDARRAY_NORMAL_KIND_DOUBLE) {
+        double loc   = spec->v.d.loc;
+        double scale = spec->v.d.scale;
+
+        if (!strcmp(type, "float32")) {
+            cuda_truncated_normal_f32((float *)rtn->data, n,
+                                       (float)loc, (float)scale);
+            return rtn;
+        }
+        if (!strcmp(type, "float64")) {
+            cuda_truncated_normal_f64((double *)rtn->data, n, loc, scale);
+            return rtn;
+        }
+
+        /* Other dtypes in the DOUBLE kind: generate truncated samples
+           into a transient GPU f32 scratch, then quantise via
+           `cuda_cast_f32_to_<dst>`. */
+        float *scratch = NULL;
+        vmalloc((void **)&scratch, (unsigned int)((size_t)n * sizeof(float)));
+        if (scratch == NULL) {
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        cuda_truncated_normal_f32(scratch, n, (float)loc, (float)scale);
+
+        if (!strcmp(type, "float4")) {
+            cuda_cast_f32_to_fp4(scratch, (uint8_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "float8")) {
+            cuda_cast_f32_to_fp8(scratch, (uint8_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "float16")) {
+            cuda_cast_f32_to_f16(scratch, (uint16_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "int8")) {
+            cuda_cast_f32_to_i8(scratch, (int8_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "uint8")) {
+            cuda_cast_f32_to_u8(scratch, (uint8_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "int16")) {
+            cuda_cast_f32_to_i16(scratch, (int16_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "uint16")) {
+            cuda_cast_f32_to_u16(scratch, (uint16_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "int32")) {
+            cuda_cast_f32_to_i32(scratch, (int32_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "uint32")) {
+            cuda_cast_f32_to_u32(scratch, (uint32_t *)rtn->data, (int)n);
+        } else if (!strcmp(type, "int64")) {
+            /* int64 with values past 2^24 would alias through float32;
+               regenerate at fp64 precision so the truncation window is
+               preserved (the [-2σ, +2σ] check is exact in double for
+               any |loc|, |scale| < 2^53). */
+            double *scratch64 = NULL;
+            vmalloc((void **)&scratch64,
+                    (unsigned int)((size_t)n * sizeof(double)));
+            if (scratch64 != NULL) {
+                cuda_truncated_normal_f64(scratch64, n, loc, scale);
+                cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
+                vfree(scratch64);
+            }
+        } else {
+            /* Unreachable: NDArray_NormalKindFor only returns DOUBLE for
+               these dtypes; any other dtype routes to FP128 / UINT64. */
+            vfree(scratch);
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        vfree(scratch);
+        return rtn;
+    }
+
+    if (spec->kind == NDARRAY_NORMAL_KIND_FP128) {
+        /* Generate standardised truncated-normal z-samples (loc = 0,
+           scale = 1) in a transient GPU f64 scratch, then a DD-affine
+           kernel applies the user's fp128 loc/scale on device. The
+           entire pipeline stays VRAM-side. */
+        double *z = NULL;
+        vmalloc((void **)&z, (unsigned int)((size_t)n * sizeof(double)));
+        if (z == NULL) {
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        cuda_truncated_normal_f64(z, n, 0.0, 1.0);
+
+        double loc_hi, loc_lo, scale_hi, scale_lo;
+        ndarray_fp128_split(spec->v.f128.loc, &loc_hi, &loc_lo);
+        ndarray_fp128_split(spec->v.f128.scale, &scale_hi, &scale_lo);
+
+        cuda_normal_dd_affine(z, (double *)rtn->data, n,
+                               loc_hi, loc_lo, scale_hi, scale_lo);
+        vfree(z);
+        return rtn;
+    }
+
+    if (spec->kind == NDARRAY_NORMAL_KIND_UINT64) {
+        /* No on-device signed affine kernel for u64 — generate truncated
+           samples on host, then ship to VRAM via TypedH2D. Host
+           staging is `n * 8` bytes, freed before return. */
+        char *stage = emalloc((size_t)n * sizeof(uint64_t));
+        truncated_normal_fill_cpu_uint64(stage, n,
+                                          spec->v.u64.loc,
+                                          spec->v.u64.scale);
+        NDArray_TypedH2D((char *)rtn->data, stage, n, type);
+        efree(stage);
+        return rtn;
+    }
+#endif
+
+    /* Defensive: every reachable (device, kind) combination is handled
+       above. If we get here something is mis-wired — free and bail. */
+    NDArray_FREE(rtn);
+    return NULL;
 }
 
 /**
