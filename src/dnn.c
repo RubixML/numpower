@@ -302,6 +302,10 @@ NDArrayDNN_Conv2D_Forward(NDArray *x, NDArray *filters, int *kernel_size, char a
                 4,
                 'v');
         rtn = NDArray_Empty(output_shape, 4, NDArray_TYPE(x), NDArray_DEVICE(x));
+        /* NDArray_Empty allocated rtn->data via vmalloc; release it
+           before swapping in the cuDNN-allocated buffer, otherwise the
+           original VRAM slot leaks and the VCHECK counter drifts. */
+        vfree(rtn->data);
         rtn->data = (void*)output;
 #else
         zend_throw_error(NULL, "DNN features for GPU not enabled. You must compile the NumPower extension in an environment with the cuDNN library available.");

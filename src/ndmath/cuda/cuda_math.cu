@@ -2924,16 +2924,17 @@ void cuda_normal_f32(float *d_data, long n, float mean, float stddev) {
                                                 mean, stddev));
     } else {
         /* Odd size — cuRAND requires even. Write `n + 1` into a transient
-           pad buffer, then copy `n` floats into the destination. The pad
-           buffer is freed before the wrapper returns. */
+           pad buffer (vmalloc so NDARRAY_VCHECK sees it), then copy
+           `n` floats into the destination. The pad buffer is freed before
+           the wrapper returns. */
         float *pad = NULL;
-        cudaMalloc((void**)&pad, sizeof(float) * (size_t)(n + 1));
+        vmalloc((void **)&pad, (unsigned int)(sizeof(float) * (size_t)(n + 1)));
         if (pad != NULL) {
             cuda_normal_check(curandGenerateNormal(gen, pad, (size_t)(n + 1),
                                                     mean, stddev));
             cudaMemcpy(d_data, pad, sizeof(float) * (size_t)n,
                        cudaMemcpyDeviceToDevice);
-            cudaFree(pad);
+            vfree(pad);
         }
     }
     curandDestroyGenerator(gen);
@@ -2951,15 +2952,17 @@ void cuda_normal_f64(double *d_data, long n, double mean, double stddev) {
         cuda_normal_check(curandGenerateNormalDouble(gen, d_data, (size_t)n,
                                                       mean, stddev));
     } else {
+        /* Odd size — same pad-and-copy trick as f32, but through vmalloc
+           so NDARRAY_VCHECK can balance the allocation against vfree. */
         double *pad = NULL;
-        cudaMalloc((void**)&pad, sizeof(double) * (size_t)(n + 1));
+        vmalloc((void **)&pad, (unsigned int)(sizeof(double) * (size_t)(n + 1)));
         if (pad != NULL) {
             cuda_normal_check(curandGenerateNormalDouble(gen, pad,
                                                           (size_t)(n + 1),
                                                           mean, stddev));
             cudaMemcpy(d_data, pad, sizeof(double) * (size_t)n,
                        cudaMemcpyDeviceToDevice);
-            cudaFree(pad);
+            vfree(pad);
         }
     }
     curandDestroyGenerator(gen);

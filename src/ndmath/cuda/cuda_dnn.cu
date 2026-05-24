@@ -7,6 +7,7 @@
 #include "../../../config.h"
 #endif
 #include "cuda_dnn.cuh"
+#include "../../gpu_alloc.h"
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <vector>
@@ -118,16 +119,20 @@ cuda_dnn_conv2d_float32(float *input, int num_channels, int num_elements, int ba
                                                        convolution_algorithm[0].algo,
                                                        &workspace_bytes));
 
+    /* All three buffers below go through vmalloc so NDARRAY_VCHECK sees them.
+       The previous raw cudaMalloc calls were invisible to the counter and
+       d_workspace + d_kernel additionally leaked on every call — they were
+       allocated, used, and the function returned without freeing them. */
     void* d_workspace = NULL;
     if (workspace_bytes > 0) {
-        cudaMalloc(&d_workspace, workspace_bytes);
+        vmalloc(&d_workspace, (unsigned int)workspace_bytes);
     }
 
     float *d_input = input;
 
     int image_bytes = batch_size * new_channels * new_height * new_width * sizeof(float);
     float* d_output{nullptr};
-    cudaMalloc(&d_output, image_bytes);
+    vmalloc((void **)&d_output, (unsigned int)image_bytes);
     cudaMemset(d_output, 0, image_bytes);
 
     // Mystery kernel
@@ -150,7 +155,7 @@ cuda_dnn_conv2d_float32(float *input, int num_channels, int num_elements, int ba
 
 
     float* d_kernel{nullptr};
-    cudaMalloc(&d_kernel, sizeof(h_kernel));
+    vmalloc((void **)&d_kernel, (unsigned int)sizeof(h_kernel));
     cudaMemcpy(d_kernel, h_kernel, sizeof(h_kernel), cudaMemcpyHostToDevice);
 
     const float alpha = 1, beta = 0;
@@ -171,6 +176,12 @@ cuda_dnn_conv2d_float32(float *input, int num_channels, int num_elements, int ba
     output_shape[1] = new_height;
     output_shape[2] = new_width;
     output_shape[3] = new_channels;
+
+    /* d_workspace and d_kernel are local to this call — release them
+       before transferring ownership of d_output to the caller. (Pre-fix,
+       both were silently leaked on every conv2d forward.) */
+    if (d_workspace != NULL) vfree(d_workspace);
+    vfree(d_kernel);
     return d_output;
 }
 
@@ -266,8 +277,12 @@ cuda_dnn_conv2d_float32_backward(float *data_output,
     checkCUDNN ( cudnnGetConvolutionBackwardDataWorkspaceSize(cudnn, kernel_descriptor, output_descriptor, convolution_descriptor,
                                                               input_descriptor, algo, &workSpaceSize) );
 
+    /* vmalloc + vfree so NDARRAY_VCHECK can balance the local-lifetime
+       workspace buffer (the previous raw cudaMalloc/cudaFree was invisible
+       to the counter — leaks elsewhere on the GPU path would have been
+       masked by this pair's silent decrement). */
     if (workSpaceSize > 0) {
-        cudaMalloc(&workSpace, workSpaceSize);
+        vmalloc(&workSpace, (unsigned int)workSpaceSize);
     }
     checkCUDNN ( cudnnConvolutionBackwardData (cudnn,
                                                   (void*)(&alpha),
@@ -279,7 +294,7 @@ cuda_dnn_conv2d_float32_backward(float *data_output,
                                                   (void*)(&beta),
                                                   input_descriptor, data_input) );
     if (workSpace) {
-        cudaFree(workSpace);
+        vfree(workSpace);
         workSpace = 0;
     }
     return data_input;
