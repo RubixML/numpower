@@ -93,12 +93,27 @@ jobs:
       # `-d extension=ndarray.so` because we're replacing the default value of
       # the variable, not appending to it.
       #
+      # The probe matters: Ubuntu's shivammathur PHP loads GD dynamically via
+      # `/etc/php/.../conf.d/20-gd.ini`, so `php -n -m` does NOT list `gd` and
+      # we inject the absolute `$extension_dir/gd.so` path. macOS Homebrew PHP
+      # links GD statically into the binary, so `php -n -m` lists `gd` and
+      # `extension_dir` points at the PECL dir where no separate gd.so file
+      # exists — injecting the path there triggers a startup warning that
+      # corrupts every test's expected output. Detecting "already loaded"
+      # keeps both matrices clean.
+      #
       # REPORT_EXIT_STATUS=1 is required: without it run-tests.php always exits 0.
       - name: Run tests
         run: |
-          GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+          EXTRA_EXT=""
+          if ! php -n -m 2>/dev/null | grep -qi '^gd$'; then
+            GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+            if [ -f "$GD_PATH" ]; then
+              EXTRA_EXT=" -d extension=$GD_PATH"
+            fi
+          fi
           REPORT_EXIT_STATUS=1 make test \
-            PHP_TEST_SHARED_EXTENSIONS=" -d extension=$GD_PATH -d extension=ndarray.so" \
+            PHP_TEST_SHARED_EXTENSIONS="$EXTRA_EXT -d extension=ndarray.so" \
             TESTS="-q --show-diff"
 
       - name: Upload failure diffs
@@ -163,11 +178,19 @@ jobs:
       # Same GD-loading workaround as the Linux job — see the long comment
       # there for why `make test`'s tmp-php.ini lands GD-less and how
       # PHP_TEST_SHARED_EXTENSIONS gets it back in front of each child test.
+      # On macOS, Homebrew PHP links GD statically; the probe below skips
+      # the inject so we don't fight a non-existent /opt/homebrew/.../gd.so.
       - name: Run tests
         run: |
-          GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+          EXTRA_EXT=""
+          if ! php -n -m 2>/dev/null | grep -qi '^gd$'; then
+            GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+            if [ -f "$GD_PATH" ]; then
+              EXTRA_EXT=" -d extension=$GD_PATH"
+            fi
+          fi
           REPORT_EXIT_STATUS=1 make test \
-            PHP_TEST_SHARED_EXTENSIONS=" -d extension=$GD_PATH -d extension=ndarray.so" \
+            PHP_TEST_SHARED_EXTENSIONS="$EXTRA_EXT -d extension=ndarray.so" \
             TESTS="-q --show-diff"
 
       - name: Upload failure diffs
