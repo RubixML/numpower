@@ -44,7 +44,22 @@ void buffer_init(int size) {
 }
 
 /**
- * Free the buffer
+ * @brief Release every surviving NDArray slot and the buffer itself.
+ *
+ * PHP's request-shutdown sequence calls `zend_deactivate_modules()` — and
+ * therefore this extension's RSHUTDOWN — *before* `zend_deactivate()`
+ * cleans up the symbol table and fires the `free_obj` handlers. Any
+ * NDArray still referenced by a PHP variable at RSHUTDOWN (e.g. two
+ * globals aliasing the same NDArray) would otherwise leak its CPU buffer
+ * or VRAM: by the time its `free_obj` finally runs, `MAIN_MEM_STACK.buffer`
+ * has already been freed and `buffer_ndarray_free` no-ops.
+ *
+ * Walking every non-NULL slot here and calling `NDArray_FREE` first
+ * decrements each NDArray's internal refcount to 0 (basic case) or
+ * relies on a view's later destructor to chase its `base` pointer (when
+ * refcount > 1 because views also live in the buffer). After this loop
+ * any subsequent `free_obj` -> `buffer_ndarray_free` call sees
+ * `MAIN_MEM_STACK.buffer == NULL` and safely no-ops.
  */
 void buffer_free() {
 #ifdef ZTS
@@ -52,6 +67,15 @@ void buffer_free() {
 #endif
 
     if (MAIN_MEM_STACK.buffer != NULL) {
+        for (int i = 0; i < MAIN_MEM_STACK.numElements; i++) {
+            NDArray *slot = MAIN_MEM_STACK.buffer[i];
+            if (slot == NULL) {
+                continue;
+            }
+            MAIN_MEM_STACK.buffer[i] = NULL;
+            MAIN_MEM_STACK.totalFreed++;
+            NDArray_FREE(slot);
+        }
         efree(MAIN_MEM_STACK.buffer);
         MAIN_MEM_STACK.buffer = NULL;
         MAIN_MEM_STACK.numElements = 0;

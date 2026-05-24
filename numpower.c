@@ -1382,32 +1382,165 @@ PHP_FUNCTION(print_r_) {
 }
 
 /**
- * NumPower::zeros
+ * @brief Validate the (dtype, device) parameter pair shared by every
+ *        typed-and-deviced initializer.
  *
- * @param execute_data
- * @param return_value
+ * Resolves @p data_type to its canonical static pointer (NULL or empty
+ * selects float32) and checks @p device against
+ * `{NDARRAY_DEVICE_CPU, NDARRAY_DEVICE_GPU}`. On a non-CUDA build the
+ * GPU device is rejected loudly here so callers never receive an
+ * NDArray with uninitialised on-device storage. Throws a catchable
+ * `\Error` and returns 0 on any failure.
+ *
+ * @param[in]  data_type  Optional dtype alias; NULL/empty → float32.
+ * @param[in]  device     Long device id from `Z_PARAM_LONG`.
+ * @param[out] out_dtype  Canonical static dtype pointer.
+ * @param[out] out_device Validated device id (int).
+ * @return 1 on success, 0 on validation failure (Error in flight).
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_zeros, 1)
-ZEND_ARG_INFO(0, shape_zval)
-ZEND_END_ARG_INFO()
-PHP_METHOD(NumPower, zeros) {
-    NDArray *rtn = NULL;
-    int *shape;
-    zval *shape_zval;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(shape_zval)
-    ZEND_PARSE_PARAMETERS_END();
+static int
+ndarray_parse_dtype_device(const char *data_type, zend_long device,
+                           const char **out_dtype, int *out_device) {
+    const char *ndarray_dtype = NDARRAY_TYPE_FLOAT32;
+    if (data_type != NULL && *data_type != '\0') {
+        ndarray_dtype = type_canonicalize(data_type);
+        if (ndarray_dtype == NULL) {
+            zend_throw_error(NULL,
+                "Invalid data type '%s'. Supported: float4, float8, float16, "
+                "float32, float64, float128, int8, uint8, int16, uint16, "
+                "int32, uint32, int64, uint64", data_type);
+            return 0;
+        }
+    }
+
+    if (device != NDARRAY_DEVICE_CPU && device != NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL,
+            "Invalid device %lld. Use 0 (CPU) or 1 (GPU).",
+            (long long) device);
+        return 0;
+    }
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL,
+            "GPU device requested but the extension was built without CUDA support.");
+        return 0;
+    }
+#endif
+
+    *out_dtype  = ndarray_dtype;
+    *out_device = (int) device;
+    return 1;
+}
+
+/**
+ * @brief Parse the (shape, dtype, device) parameter triplet shared by the
+ *        typed-and-deviced shape initializers (`zeros`, `ones`, `full`).
+ *
+ * Wraps `ndarray_parse_dtype_device` with the shape-extraction half:
+ * the shape zval is routed through `ZVAL_TO_NDARRAY` and every entry is
+ * checked against negativity. On success the caller owns @p out_shape
+ * (freshly emalloc'd, transferred into the NDArray builder).
+ *
+ * @param[in]  shape_zval   PHP shape value (array / scalar / NDArray).
+ * @param[in]  data_type    Optional dtype alias.
+ * @param[in]  device       Long device id.
+ * @param[out] out_dtype    Canonical static dtype pointer.
+ * @param[out] out_device   Validated device id.
+ * @param[out] out_shape    Newly-allocated `int[*out_ndim]`.
+ * @param[out] out_ndim     Number of dimensions.
+ * @return 1 on success, 0 on validation failure (Error in flight).
+ */
+static int
+ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
+                          zend_long device, const char **out_dtype,
+                          int *out_device, int **out_shape, int *out_ndim) {
+    if (!ndarray_parse_dtype_device(data_type, device, out_dtype, out_device)) {
+        return 0;
+    }
+
     NDArray *nda = ZVAL_TO_NDARRAY(shape_zval);
     if (nda == NULL) {
+        return 0;
+    }
+    int ndim = NDArray_NUMELEMENTS(nda);
+    /* Allocate at least one int slot even for ndim == 0 — `emalloc(0)` is
+       valid but yields an opaque token, while a real slot keeps ASAN /
+       Valgrind happy and gives the NDArray builder a non-NULL dimensions
+       pointer to store. */
+    int *shape = emalloc(sizeof(int) * (ndim > 0 ? (size_t) ndim : 1));
+    for (int i = 0; i < ndim; i++) {
+        double raw = (double) NDArray_F32DATA(nda)[i];
+        if (raw < 0.0) {
+            efree(shape);
+            /* `CHECK_INPUT_AND_FREE` releases the temporary NDArray built
+               by `ZVAL_TO_NDARRAY` only for scalar / array sources; an
+               existing NDArray passed as shape keeps its refcount, so a
+               bare `NDArray_FREE` here would drop the user's live array
+               into a dangling buffer slot. */
+            CHECK_INPUT_AND_FREE(shape_zval, nda);
+            zend_throw_error(NULL, "negative dimensions are not allowed");
+            return 0;
+        }
+        shape[i] = (int) raw;
+    }
+    CHECK_INPUT_AND_FREE(shape_zval, nda);
+
+    *out_shape = shape;
+    *out_ndim  = ndim;
+    return 1;
+}
+
+/**
+ * @brief `NumPower::zeros(shape, dtype = "float32", device = 0): NDArray`.
+ *
+ * Allocates a zero-initialised NDArray of the requested shape and dtype on
+ * the requested device. For `device == 1` (GPU) the buffer is allocated
+ * directly in VRAM via `cudaMalloc` and zeroed in place with `cudaMemset`,
+ * so no host buffer is ever materialised; the host->device copy that
+ * `->gpu()` would normally pay is skipped entirely.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
+ */
+ZEND_BEGIN_ARG_INFO(arginfo_ndarray_zeros, 0)
+ZEND_ARG_INFO(0, shape)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
+ZEND_END_ARG_INFO()
+PHP_METHOD(NumPower, zeros) {
+    zval *shape_zval;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_ZVAL(shape_zval)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
+    ZEND_PARSE_PARAMETERS_END();
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        shape[i] = (int) NDArray_F32DATA(nda)[i];
+
+    NDArray *rtn = NDArray_Zeros(shape, ndim, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
     }
-    rtn = NDArray_Zeros(shape, NDArray_NUMELEMENTS(nda), NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-    NDArray_FREE(nda);
-    ndarray_init_new_object(rtn, return_value);
+    /* Factory methods always return an NDArray, even for a 0-D shape (`[]`),
+       matching numpy's `zeros(())` → `array(0.)` contract. Collapsing 0-D to
+       a host primitive via `ndarray_init_new_object` would defeat the entire
+       point of an explicit `device == GPU` call: the user paid for the VRAM
+       allocation and expects an NDArray they can `->dump()`, feed back into
+       further GPU ops, etc. Use the always-NDArray installer instead. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
@@ -1603,23 +1736,61 @@ PHP_METHOD(NumPower, notEqual) {
 }
 
 /**
- * NumPower::identity
+ * @brief `NumPower::identity(size, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Builds a `size × size` identity matrix on the requested device with
+ * the dtype-appropriate representation of 1 on the main diagonal and
+ * zeros elsewhere. For `device == 1` (GPU) the backing buffer is
+ * allocated directly in VRAM (`cudaMalloc` + `cudaMemset(0)`) and the
+ * diagonal is written by a single `cudaMemcpy2D` H2D with a stride of
+ * `(size + 1) * elsize` — the destination matrix itself never traverses
+ * host memory; only the small (`≤ 16 * size`-byte) host source seed
+ * carrying the dtype's "1" representation does.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_identity, 1)
-ZEND_ARG_INFO(0, size)
+ZEND_BEGIN_ARG_INFO(arginfo_ndarray_identity, 0)
+ZEND_ARG_TYPE_INFO(0, size, IS_LONG, 0)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, identity) {
-    NDArray *rtn = NULL;
-    int *shape;
-    long size;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_LONG(size)
+    zend_long size;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_LONG(size)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    rtn = NDArray_Identity((int)size);
-    ndarray_init_new_object(rtn, return_value);
+
+    /* Range-check `size` against `int` *before* truncating: a value that
+       overflows `int` would otherwise wrap to a small / negative number
+       and silently produce the wrong matrix or trip the negative-dim
+       guard with a misleading error. */
+    if (size < 0 || size > INT_MAX) {
+        zend_throw_error(NULL,
+            "identity: size %lld is out of range (must be 0..%d)",
+            (long long) size, INT_MAX);
+        return;
+    }
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_Identity((int) size, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
@@ -1880,27 +2051,62 @@ PHP_METHOD(NumPower, uniform) {
 }
 
 /**
- * NumPower::diag
+ * @brief `NumPower::diag(target, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Dual-mode like numpy's `diag`:
+ *  - **1-D input** → builds an `N×N` diagonal matrix.
+ *  - **2-D input** → extracts the main diagonal as a 1-D vector of
+ *    `min(rows, cols)` elements.
+ *
+ * The result lives in the requested @c dtype on the requested @c device.
+ * When the input doesn't already match, it is cast and / or moved to a
+ * fresh copy that is freed before this function returns; the diagonal
+ * traffic itself is a single `cudaMemcpy2D` D2D call on GPU (see
+ * `NDArray_Diag`).
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_diag, 0, 0, 1)
-ZEND_ARG_INFO(0, target)
+    ZEND_ARG_INFO(0, target)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, diag) {
-    NDArray *rtn = NULL;
-    zval* target;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    zval *target;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
         Z_PARAM_ZVAL(target)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(target);
-    if (nda == NULL)  return;
-    rtn = NDArray_Diag(nda);
-    if (Z_TYPE_P(target) == IS_ARRAY) {
-        NDArray_FREE(nda);
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
     }
-    ndarray_init_new_object(rtn, return_value);
+
+    NDArray *nda = ZVAL_TO_NDARRAY(target);
+    if (nda == NULL) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_Diag(nda, ndarrayDataType, parsed_device);
+
+    /* Release the temporary NDArray created by ZVAL_TO_NDARRAY only when
+       the source zval is a scalar/array (an existing NDArray object
+       reference keeps its refcount). */
+    CHECK_INPUT_AND_FREE(target, nda);
+    if (rtn == NULL) {
+        return;
+    }
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
@@ -1928,116 +2134,393 @@ PHP_METHOD(NumPower, diagonal) {
 }
 
 /**
- * NumPower::full
+ * @brief `NumPower::full(shape, fill_value, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Allocates an NDArray of the requested shape / dtype / device and fills
+ * every element with @c fill_value encoded into the target dtype. The
+ * fill value may be passed as `int`, `float`, `bool`, or `string`. The
+ * string form is the only way to express the full range of `float128`,
+ * `int64`, and `uint64` (values outside PHP's native long / double range
+ * stay byte-correct).
+ *
+ * For `device == 1` (GPU) the buffer is allocated directly in VRAM via
+ * `cudaMalloc` and populated by `cuda_fill_bytes` — a doubling
+ * device-to-device broadcast loop. Only the one-element seed value
+ * (≤ 16 bytes) crosses the PCIe bus, so host RAM stays `O(elsize)`
+ * regardless of the tensor size.
+ *
+ * Pre-existing bugs fixed in this refactor:
+ *   - the old implementation hardcoded float32 storage and broadcast a
+ *     float-cast fill, corrupting any non-float32 dtype if one had ever
+ *     been requested;
+ *   - empty shape `[]` was rejected with a "non-empty array" error even
+ *     though numpy returns `array(fv)` for `np.full((), fv)`;
+ *   - the shape walk forced IS_LONG entries, then re-converted them
+ *     through `NDArray_ToIntVector` (float-mantissa round-trip) which
+ *     loses precision for dimensions ≥ 2²⁴.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_full, 0, 0, 2)
 ZEND_ARG_INFO(0, shape)
 ZEND_ARG_INFO(0, fill_value)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, full) {
-    NDArray *rtn = NULL;
-    zval* shape;
-    HashTable *shape_ht;
-    double fill_value;
-    int *new_shape;
-    zend_string *key;
-    zend_ulong idx;
-    zval *val;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ARRAY(shape)
-        Z_PARAM_DOUBLE(fill_value)
+    zval *shape_zval;
+    zval *fill_value;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(2, 4)
+        Z_PARAM_ZVAL(shape_zval)
+        Z_PARAM_ZVAL(fill_value)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    shape_ht = Z_ARRVAL_P(shape);
 
-    ZEND_HASH_FOREACH_KEY_VAL(shape_ht, idx, key, val) {
-        if (Z_TYPE_P(val) != IS_LONG) {
-            zend_throw_error(NULL, "Invalid parameter: Shape elements must be integers.");
-            return;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    NDArray *nd_shape = ZVAL_TO_NDARRAY(shape);
-
-    if (nd_shape == NULL) {
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
 
-    if (NDArray_NUMELEMENTS(nd_shape) == 0) {
-        NDArray_FREE(nd_shape);
-        zend_throw_error(NULL, "Invalid parameter: Expected a non-empty array.");
+    /* Encode the fill value into the dtype's host representation once.
+       16 bytes covers the widest dtype (fp128). On encoding failure the
+       helper has already thrown — release the shape allocation we own
+       to keep the request-scope buffer balanced. */
+    char encoded[16];
+    memset(encoded, 0, sizeof(encoded));
+    if (!NDArray_EncodeZvalToDtype(fill_value, ndarrayDataType, encoded)) {
+        efree(shape);
         return;
     }
 
-    new_shape = NDArray_ToIntVector(nd_shape);
-    rtn = NDArray_Full(new_shape, NDArray_NUMELEMENTS(nd_shape), fill_value);
-
-    efree(new_shape);
-    NDArray_FREE(nd_shape);
-    ndarray_init_new_object(rtn, return_value);
+    NDArray *rtn = NDArray_Full(shape, ndim, ndarrayDataType,
+                                parsed_device, encoded);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Match zeros() / ones(): factory methods always return an NDArray,
+       even for a 0-D shape — preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
- * NumPower::ones
+ * @brief `NumPower::ones(shape, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Allocates an NDArray of the requested shape and dtype on the requested
+ * device, with every element set to the dtype-appropriate representation
+ * of 1. For `device == 1` (GPU) the buffer is allocated directly in VRAM
+ * and populated via a doubling device-to-device broadcast (see
+ * `cuda_fill_bytes`) — no full host-side staging buffer is allocated, only
+ * the one-element seed value crosses the bus.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_ones, 1)
-ZEND_ARG_INFO(0, shape_zval)
+ZEND_BEGIN_ARG_INFO(arginfo_ndarray_ones, 0)
+ZEND_ARG_INFO(0, shape)
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, ones) {
-    double *ptr;
-    NDArray *rtn = NULL;
-    int *shape;
     zval *shape_zval;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(shape_zval)
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_ZVAL(shape_zval)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(shape_zval);
-    if (nda == NULL) {
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
-    shape = NDArray_ToIntVector(nda);
-    rtn = NDArray_Ones(shape, NDArray_NUMELEMENTS(nda), NDARRAY_TYPE_FLOAT32);
-    NDArray_FREE(nda);
-    ndarray_init_new_object(rtn, return_value);
+
+    NDArray *rtn = NDArray_Ones(shape, ndim, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* See `zeros()` above for the rationale — same contract: factory methods
+       return an NDArray even for a 0-D shape, preserving the GPU residency
+       contract when the caller passed `device == GPU`. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
- * NumPower::arange
+ * @brief Coerce a PHP scalar @p z into a double for arange's "narrow"
+ *        arithmetic path.
  *
- * @param execute_data
- * @param return_value
+ * Accepts `int`, `float`, and numeric `string` inputs. The string path
+ * uses `zend_string` → `strtod`, matching PHP's standard numeric-string
+ * coercion. The double @p out_dst is set only on success; on failure a
+ * catchable `\Error` is in flight.
+ *
+ * @param[in]  z         PHP scalar.
+ * @param[in]  name      Argument label for the error message.
+ * @param[out] out_dst   Receives the coerced double on success.
+ * @return 1 on success, 0 on a type rejection.
+ */
+static int
+arange_coerce_zval_double(zval *z, const char *name, double *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = (double) Z_LVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = Z_DVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = strtod(Z_STRVAL_P(z), NULL);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into an `int64_t` for the int64 arange path.
+ *
+ * IS_LONG is taken verbatim (PHP's native long is 64-bit signed on every
+ * supported platform). IS_DOUBLE is cast through `(int64_t)`. IS_STRING
+ * routes through `strtoll` so values outside PHP's long range stay
+ * byte-correct.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the int64 value on success.
+ * @return 1 on success, 0 on type rejection (Error in flight).
+ */
+static int
+arange_coerce_zval_int64(zval *z, const char *name, int64_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = (int64_t) Z_LVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = (int64_t) Z_DVAL_P(z);
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = (int64_t) strtoll(Z_STRVAL_P(z), NULL, 10);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into a `uint64_t` for the uint64 arange path.
+ *
+ * IS_LONG is range-checked (a negative value is rejected for unsigned).
+ * IS_STRING routes through `strtoull` so `"18446744073709551615"` and
+ * other values above `LLONG_MAX` survive intact.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the uint64 value on success.
+ * @return 1 on success, 0 on type rejection or negative-long.
+ */
+static int
+arange_coerce_zval_uint64(zval *z, const char *name, uint64_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_LONG) {
+        zend_long lv = Z_LVAL_P(z);
+        if (lv < 0) {
+            zend_throw_error(NULL,
+                "arange: %s must be non-negative for uint64 dtype", name);
+            return 0;
+        }
+        *out_dst = (uint64_t) lv;
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        double dv = Z_DVAL_P(z);
+        if (dv < 0.0) {
+            zend_throw_error(NULL,
+                "arange: %s must be non-negative for uint64 dtype", name);
+            return 0;
+        }
+        *out_dst = (uint64_t) dv;
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = (uint64_t) strtoull(Z_STRVAL_P(z), NULL, 10);
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief Coerce a PHP scalar @p z into `ndarray_fp128_t` for the float128 path.
+ *
+ * IS_STRING is the precision-loss-free path (via `strtoflt128` on glibc,
+ * or the DD fallback). IS_LONG / IS_DOUBLE go through the dtype's
+ * standard conversion helpers.
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the fp128 value on success.
+ * @return 1 on success, 0 on type rejection.
+ */
+static int
+arange_coerce_zval_fp128(zval *z, const char *name, ndarray_fp128_t *out_dst) {
+    if (Z_TYPE_P(z) == IS_STRING) {
+        *out_dst = ndarray_string_to_fp128(Z_STRVAL_P(z));
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_LONG) {
+        *out_dst = NDARRAY_FP128_FROM_I64((int64_t) Z_LVAL_P(z));
+        return 1;
+    }
+    if (Z_TYPE_P(z) == IS_DOUBLE) {
+        *out_dst = ndarray_double_to_fp128(Z_DVAL_P(z));
+        return 1;
+    }
+    zend_throw_error(NULL,
+        "arange: %s must be int, float, or numeric string", name);
+    return 0;
+}
+
+/**
+ * @brief `NumPower::arange(stop, start = 0, step = 1, dtype = "float32", device = 0): NDArray`.
+ *
+ * Generates a 1-D NDArray whose values follow `a[i] = start + i * step`
+ * for `i` in `[0, ceil((stop - start) / step))`. The sign of `step` must
+ * be consistent with the (start, stop) interval; otherwise an empty
+ * array is returned (numpy behaviour).
+ *
+ * The first three parameters accept `int`, `float`, and numeric `string`
+ * inputs. The string form is the only loss-free route for the wide
+ * dtypes: `float128` strings flow through `strtoflt128` / the DD parser,
+ * `uint64` strings through `strtoull`, and `int64` strings through
+ * `strtoll`. For every other dtype the value is coerced through `double`
+ * (which represents every smaller dtype's range exactly).
+ *
+ * For `device == 1` (GPU) the destination matrix is allocated directly
+ * in VRAM via `NDArray_Empty`; the closed-form values are computed in a
+ * transient host scratch and then shipped to the device via
+ * `NDArray_TypedH2D` (which handles fp128's host→DD layout conversion).
+ * Writing the elements via a custom on-device kernel would be a pure-
+ * VRAM alternative; the current shape of the code keeps host involvement
+ * to the `n * elsize` scratch which is freed immediately afterwards.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arange, 0, 0, 1)
     ZEND_ARG_INFO(0, stop)
     ZEND_ARG_INFO(0, start)
     ZEND_ARG_INFO(0, step)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arange) {
-    NDArray *rtn = NULL;
-    double start, stop, step;
+    zval *stop_zv;
+    zval *start_zv = NULL;
+    zval *step_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
 
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-        Z_PARAM_DOUBLE(stop)
-    Z_PARAM_OPTIONAL
-        Z_PARAM_DOUBLE(start)
-        Z_PARAM_DOUBLE(step)
+    ZEND_PARSE_PARAMETERS_START(1, 5)
+        Z_PARAM_ZVAL(stop_zv)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ZVAL(start_zv)
+        Z_PARAM_ZVAL(step_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (ZEND_NUM_ARGS() == 1) {
-        start = 0.0f;
-        step  = 1.0f;
-    }
-    if (ZEND_NUM_ARGS() == 2) {
-        step  = 1.0f;
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
     }
 
-    rtn = NDArray_Arange(start, stop, step);
-    ndarray_init_new_object(rtn, return_value);
+    /* Defaults are dtype-aware: `start = 0` and `step = 1` are encoded
+       in the same precision as the explicit args so the four dispatch
+       paths stay symmetric. */
+    NDArrayArangeSpec spec;
+    spec.kind = NDArray_ArangeKindFor(ndarrayDataType);
+
+    switch (spec.kind) {
+        case NDARRAY_ARANGE_KIND_FP128: {
+            spec.v.f128.start = NDARRAY_FP128_ZERO();
+            spec.v.f128.step  = NDARRAY_FP128_FROM_I64(1);
+            if (!arange_coerce_zval_fp128(stop_zv, "stop", &spec.v.f128.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_fp128(start_zv, "start", &spec.v.f128.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_fp128(step_zv,  "step",  &spec.v.f128.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_INT64: {
+            spec.v.i64.start = 0;
+            spec.v.i64.step  = 1;
+            if (!arange_coerce_zval_int64(stop_zv, "stop", &spec.v.i64.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_int64(start_zv, "start", &spec.v.i64.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_int64(step_zv,  "step",  &spec.v.i64.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_UINT64: {
+            spec.v.u64.start = 0;
+            spec.v.u64.step  = 1;
+            if (!arange_coerce_zval_uint64(stop_zv, "stop", &spec.v.u64.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_uint64(start_zv, "start", &spec.v.u64.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_uint64(step_zv,  "step",  &spec.v.u64.step)) return;
+            break;
+        }
+        case NDARRAY_ARANGE_KIND_DOUBLE:
+        default: {
+            spec.kind = NDARRAY_ARANGE_KIND_DOUBLE;
+            spec.v.d.start = 0.0;
+            spec.v.d.step  = 1.0;
+            if (!arange_coerce_zval_double(stop_zv, "stop", &spec.v.d.stop)) return;
+            if (start_zv != NULL &&
+                !arange_coerce_zval_double(start_zv, "start", &spec.v.d.start)) return;
+            if (step_zv != NULL &&
+                !arange_coerce_zval_double(step_zv,  "step",  &spec.v.d.step)) return;
+            break;
+        }
+    }
+
+    NDArray *rtn = NDArray_Arange(&spec, ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* arange always returns at least a 1-D array (possibly empty), so the
+       0-D scalar collapse in `ndarray_init_new_object` never triggers;
+       use `ndarray_install_object` for uniformity with the other typed
+       factories. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
