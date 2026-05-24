@@ -795,36 +795,233 @@ NDArray_Uniform(double low, double high, int* shape, int ndim) {
 }
 
 /**
- * @param a
- * @return
+ * @brief Normalise @p a into a fresh NDArray of @p type on @p device.
+ *
+ * Returns @p a unchanged (and sets `*owned` to 0) when the source already
+ * matches the requested dtype/device; otherwise produces a fresh copy
+ * (via `NDArray_AsType` for the dtype cast and `NDArray_ToGPU` /
+ * `NDArray_ToCPU` for the device move) and sets `*owned` to 1 so the
+ * caller knows to release it with `NDArray_FREE`. On failure returns
+ * NULL with an Error in flight.
+ *
+ * @param[in]  a      Source NDArray.
+ * @param[in]  type   Canonical target dtype.
+ * @param[in]  device Target device id.
+ * @param[out] owned  1 if the returned pointer is a fresh copy, 0 otherwise.
+ * @return The normalised NDArray, or NULL on failure.
+ */
+static NDArray *
+ndarray_diag_prepare_input(NDArray *a, const char *type, int device, int *owned) {
+    *owned = 0;
+    NDArray *prep = a;
+    if (strcmp(NDArray_TYPE(prep), type) != 0) {
+        NDArray *cast = NDArray_AsType(prep, type);
+        if (*owned) NDArray_FREE(prep);
+        prep   = cast;
+        *owned = 1;
+        if (prep == NULL) return NULL;
+    }
+    if (NDArray_DEVICE(prep) != device) {
+#ifdef HAVE_CUBLAS
+        NDArray *moved = (device == NDARRAY_DEVICE_GPU)
+            ? NDArray_ToGPU(prep) : NDArray_ToCPU(prep);
+        if (*owned) NDArray_FREE(prep);
+        prep   = moved;
+        *owned = 1;
+        if (prep == NULL) return NULL;
+#else
+        if (*owned) NDArray_FREE(prep);
+        zend_throw_error(NULL,
+            "diag: GPU device requested but CUDA support is not compiled in.");
+        return NULL;
+#endif
+    }
+    return prep;
+}
+
+/**
+ * @brief Build an N×N diagonal matrix whose diagonal is @p prep's 1-D contents.
+ *
+ * Both @p prep and the result live on @p device with dtype @p type. The
+ * zero-fill is delegated to `NDArray_Zeros` (`cudaMalloc` + `cudaMemset(0)`
+ * on GPU, `ecalloc` on CPU). The diagonal is then written:
+ *  - CPU: per-element `memcpy` from prep[i] to dst[i*(N+1)].
+ *  - GPU: a single `cudaMemcpy2D` D2D with `spitch == NDArray_STRIDES(prep)[0]`
+ *         and `dpitch == (N+1) * elsize`.
+ *
+ * @param[in] prep   1-D source NDArray, already in (@p type, @p device).
+ * @param[in] type   Canonical dtype string.
+ * @param[in] device Target device.
+ * @return New N×N NDArray, or NULL on failure.
+ */
+static NDArray *
+ndarray_diag_vector_to_matrix(NDArray *prep, const char *type, int device) {
+    long n = NDArray_NUMELEMENTS(prep);
+    int *shape = emalloc(sizeof(int) * 2);
+    shape[0] = (int)n;
+    shape[1] = (int)n;
+
+    NDArray *rtn = NDArray_Zeros(shape, 2, type, device);
+    if (rtn == NULL || n == 0) {
+        return rtn;
+    }
+
+    int    elsize      = NDArray_ELSIZE(rtn);
+    size_t diag_stride = ((size_t)n + 1) * (size_t)elsize;
+    size_t src_stride  = (size_t) NDArray_STRIDES(prep)[0];
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        const char *src = (const char *)NDArray_DATA(prep);
+        char       *dst = (char *)NDArray_DATA(rtn);
+        for (long i = 0; i < n; i++) {
+            memcpy(dst + (size_t)i * diag_stride,
+                   src + (size_t)i * src_stride,
+                   (size_t)elsize);
+        }
+        return rtn;
+    }
+#ifdef HAVE_CUBLAS
+    cudaError_t err = cudaMemcpy2D(
+        (char *)NDArray_DATA(rtn), diag_stride,
+        (const char *)NDArray_DATA(prep), src_stride,
+        (size_t)elsize, (size_t)n,
+        cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        NDArray_FREE(rtn);
+        zend_throw_error(NULL, "diag: cudaMemcpy2D failed: %s",
+                         cudaGetErrorString(err));
+        return NULL;
+    }
+#endif
+    return rtn;
+}
+
+/**
+ * @brief Extract the main diagonal of a 2-D NDArray into a 1-D NDArray.
+ *
+ * The output length is `min(rows, cols)` — matching numpy. The previous
+ * implementation used the input's last dimension directly, which read
+ * out of bounds when `rows < cols`.
+ *
+ * Both @p prep and the result live on @p device with dtype @p type. The
+ * diagonal lookup uses `prep`'s own strides so the math is correct even
+ * for non-contiguous views: position `(i, i)` sits at byte offset
+ * `i * (strides[0] + strides[1])`. On GPU a single `cudaMemcpy2D` D2D
+ * does the gather with that stride as `spitch` and `elsize` as `dpitch`.
+ *
+ * @param[in] prep   2-D source NDArray, already in (@p type, @p device).
+ * @param[in] type   Canonical dtype string.
+ * @param[in] device Target device.
+ * @return New 1-D NDArray of length min(rows, cols), or NULL on failure.
+ */
+static NDArray *
+ndarray_diag_matrix_to_vector(NDArray *prep, const char *type, int device) {
+    int rows = NDArray_SHAPE(prep)[0];
+    int cols = NDArray_SHAPE(prep)[1];
+    int n    = (rows < cols) ? rows : cols;
+
+    int *shape = emalloc(sizeof(int));
+    shape[0] = n;
+
+    NDArray *rtn = NDArray_Empty(shape, 1, type, device);
+    if (rtn == NULL || n == 0) {
+        return rtn;
+    }
+
+    int    elsize     = NDArray_ELSIZE(rtn);
+    size_t src_stride = (size_t)(NDArray_STRIDES(prep)[0] +
+                                 NDArray_STRIDES(prep)[1]);
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        const char *src = (const char *)NDArray_DATA(prep);
+        char       *dst = (char *)NDArray_DATA(rtn);
+        for (long i = 0; i < (long)n; i++) {
+            memcpy(dst + (size_t)i * (size_t)elsize,
+                   src + (size_t)i * src_stride,
+                   (size_t)elsize);
+        }
+        return rtn;
+    }
+#ifdef HAVE_CUBLAS
+    cudaError_t err = cudaMemcpy2D(
+        (char *)NDArray_DATA(rtn), (size_t)elsize,
+        (const char *)NDArray_DATA(prep), src_stride,
+        (size_t)elsize, (size_t)n,
+        cudaMemcpyDeviceToDevice);
+    if (err != cudaSuccess) {
+        NDArray_FREE(rtn);
+        zend_throw_error(NULL, "diag: cudaMemcpy2D failed: %s",
+                         cudaGetErrorString(err));
+        return NULL;
+    }
+#endif
+    return rtn;
+}
+
+/**
+ * @brief `NumPower::diag` — dual-mode diagonal constructor / extractor.
+ *
+ * Mirrors numpy:
+ *  - **1-D input** → 2-D `N×N` matrix with @p a on the main diagonal.
+ *  - **2-D input** → 1-D vector of `min(rows, cols)` elements holding
+ *    the input's main diagonal.
+ *
+ * The output dtype is @p type and the output device is @p device. If
+ * the input doesn't match those it is cast (`NDArray_AsType`) and / or
+ * moved (`NDArray_ToGPU` / `NDArray_ToCPU`) into a fresh copy that's
+ * freed before this function returns. The actual diagonal traffic is
+ * one `cudaMemcpy2D` D2D call on GPU or a tight `memcpy` loop on CPU —
+ * see the per-direction helpers for details.
+ *
+ * Pre-existing bugs fixed:
+ *  - Both `NDArray_Diag` and `NDArray_Diagonal` were float32 / CPU
+ *    hardcoded; they would read/write 4 bytes per element regardless
+ *    of input dtype, corrupting any non-float32 input.
+ *  - `NDArray_Diagonal` walked `shape[ndim - 1]` (last dim) as the
+ *    diagonal length, which read out of bounds when `rows < cols`
+ *    (e.g. a 3×4 matrix would dereference position (3,3)).
+ *  - The 2-D-input branch of the old `NDArray_Diag` mutated
+ *    `rtn->ndim`, `rtn->dimensions[0]`, and `rtn->strides[0]` after
+ *    receiving a 1-D result from `NDArray_Diagonal`, which was already
+ *    1-D — the mutations were no-ops at best and corrupted views in
+ *    edge cases.
+ *
+ * @param[in] a      Input NDArray (1-D or 2-D).
+ * @param[in] type   Canonical dtype string of the result.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return Newly-allocated result NDArray, or NULL on failure.
  */
 NDArray*
-NDArray_Diag(NDArray *a) {
-    int i;
-    int index;
-    NDArray *rtn;
-    if (NDArray_NDIM(a) != 1 && NDArray_NDIM(a) != 2) {
-        zend_throw_error(NULL, "Input array must be a vector or 2-dimensional");
+NDArray_Diag(NDArray *a, const char *type, int device) {
+    int ndim = NDArray_NDIM(a);
+    if (ndim != 1 && ndim != 2) {
+        zend_throw_error(NULL, "diag: input must be 1-D or 2-D");
+        return NULL;
+    }
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        return NULL;
+    }
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        zend_throw_error(NULL,
+            "diag: GPU device requested but CUDA support is not compiled in.");
+        return NULL;
+    }
+#endif
+
+    int prep_owned;
+    NDArray *prep = ndarray_diag_prepare_input(a, type, device, &prep_owned);
+    if (prep == NULL) {
         return NULL;
     }
 
-    if (NDArray_NDIM(a) == 1) {
-        int *rtn_shape = emalloc(sizeof(int) * 2);
-        rtn_shape[0] = NDArray_NUMELEMENTS(a);
-        rtn_shape[1] = NDArray_NUMELEMENTS(a);
-        rtn = NDArray_Zeros(rtn_shape, 2, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
+    NDArray *rtn = (ndim == 1)
+        ? ndarray_diag_vector_to_matrix(prep, type, device)
+        : ndarray_diag_matrix_to_vector(prep, type, device);
 
-        for (i = 0; i < NDArray_NUMELEMENTS(a); i++) {
-            index = ((i * NDArray_STRIDES(rtn)[0]) + (i * NDArray_STRIDES(rtn)[1])) / NDArray_ELSIZE(rtn);
-            NDArray_F32DATA(rtn)[index] = NDArray_F32DATA(a)[i];
-        }
-    }
-
-    if (NDArray_NDIM(a) == 2) {
-        rtn = NDArray_Diagonal(a, 0);
-        rtn->ndim = 1;
-        rtn->dimensions[0] = NDArray_NUMELEMENTS(rtn);
-        rtn->strides[0] = NDArray_ELSIZE(rtn);
+    if (prep_owned) {
+        NDArray_FREE(prep);
     }
     return rtn;
 }

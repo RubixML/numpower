@@ -2046,27 +2046,62 @@ PHP_METHOD(NumPower, uniform) {
 }
 
 /**
- * NumPower::diag
+ * @brief `NumPower::diag(target, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Dual-mode like numpy's `diag`:
+ *  - **1-D input** → builds an `N×N` diagonal matrix.
+ *  - **2-D input** → extracts the main diagonal as a 1-D vector of
+ *    `min(rows, cols)` elements.
+ *
+ * The result lives in the requested @c dtype on the requested @c device.
+ * When the input doesn't already match, it is cast and / or moved to a
+ * fresh copy that is freed before this function returns; the diagonal
+ * traffic itself is a single `cudaMemcpy2D` D2D call on GPU (see
+ * `NDArray_Diag`).
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_diag, 0, 0, 1)
-ZEND_ARG_INFO(0, target)
+    ZEND_ARG_INFO(0, target)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, diag) {
-    NDArray *rtn = NULL;
-    zval* target;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    zval *target;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 3)
         Z_PARAM_ZVAL(target)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(target);
-    if (nda == NULL)  return;
-    rtn = NDArray_Diag(nda);
-    if (Z_TYPE_P(target) == IS_ARRAY) {
-        NDArray_FREE(nda);
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    if (!ndarray_parse_dtype_device(dataType, device,
+                                    &ndarrayDataType, &parsed_device)) {
+        return;
     }
-    ndarray_init_new_object(rtn, return_value);
+
+    NDArray *nda = ZVAL_TO_NDARRAY(target);
+    if (nda == NULL) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_Diag(nda, ndarrayDataType, parsed_device);
+
+    /* Release the temporary NDArray created by ZVAL_TO_NDARRAY only when
+       the source zval is a scalar/array (an existing NDArray object
+       reference keeps its refcount). */
+    CHECK_INPUT_AND_FREE(target, nda);
+    if (rtn == NULL) {
+        return;
+    }
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
