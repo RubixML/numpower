@@ -1,62 +1,79 @@
 --TEST--
-NumPower::fromImage() / NDArray::toImage() handle PHP-8 GdImage refcounting correctly
+NumPower::fromImage() / NDArray::toImage() respect PHP GdImage refcount lifetime
 --SKIPIF--
 <?php if (!extension_loaded('gd')) die('skip GD extension not loaded'); ?>
 --FILE--
 <?php
-/* In PHP 8.x, `imagedestroy()` releases the *local* reference but
-   leaves the GdImage alive if any other ref holds it. The C extension
-   reaches into the underlying `gdImagePtr` via the PHP object struct,
-   so this lifetime must be honored. Also covers: passing a GdImage that
-   was held in a local var → the var is unset → the underlying image is
-   destroyed only when the last reference goes away.
+/* GdImage lifetime in PHP 8.0+ is managed exclusively by refcount;
+   the legacy `imagedestroy()` function is a no-op since 8.0 and
+   `E_DEPRECATED` since 8.5, so this test exercises lifetime through
+   the modern `unset()` / null-assignment idiom instead.
 
-   Same for toImage: the produced GdImage must outlive the NDArray it
-   was produced from (the NDArray is freed but the GD memory was its
-   own allocation via malloc, owned by libgd, freed by PHP's GdImage
-   destructor). */
+   The C extension reaches into the underlying `gdImagePtr` via the
+   PHP object struct, so it must honor the refcount: as long as any
+   variable still holds the GdImage, the pointer is valid.
 
-/* Refcount: the local var $img is destroyed but $x still holds the
-   GdImage. fromImage($x) should still work. */
+   Same property for toImage: the produced GdImage must outlive the
+   NDArray it was produced from (the NDArray is freed but the GD
+   memory is its own malloc'd allocation, owned by libgd's destructor
+   that fires only when the last PHP reference goes away). */
+
+/* Refcount kept-alive case: the local var $img is unset but $x still
+   holds the GdImage. fromImage($x) must still see valid pixel data. */
 $img = imagecreatetruecolor(3, 2);
 imagesetpixel($img, 0, 0, 0xFF0000);
 imagesetpixel($img, 2, 1, 0x00FF00);
 $x = $img;
-imagedestroy($img); // PHP 8: no-op; var $img still points to the object
-echo '$img_type_after_destroy: ', gettype($img), "\n";
+unset($img);
+echo 'img_unset_isset: ', (isset($img) ? 'yes' : 'no'), "\n";
 $a = NumPower::fromImage($x);
-echo 'fromImage_after_destroy: ', json_encode($a->shape()), "\n";
-echo '(0,0): ', (int)$a[0][0][0], " (expect 255)\n";
+echo 'fromImage_after_unset_shape: ', json_encode($a->shape()), "\n";
+echo 'fromImage_after_unset_(0,0)R: ', (int)$a[0][0][0], "\n";
+echo 'fromImage_after_unset_(1,2)G: ', (int)$a[1][2][1], "\n";
 
 /* toImage outlives the source NDArray: build the image, drop the
-   NDArray, then keep using the image. The image's memory is allocated
-   by my code via malloc and owned by libgd's destructor — releasing
-   the NDArray's data buffer (emalloc) must not touch the image. */
+   NDArray, then keep using the image. The NDArray's element buffer
+   is `emalloc`'d and released by `NDArray_FREE`; the produced GD
+   image is `malloc`'d and owned by libgd's destructor. The two are
+   independent — releasing the NDArray must not touch the image. */
 $a = NumPower::fromImage($x);
 $img2 = $a->toImage();
-$a = null; // NDArray freed
+$a = null;
 $pix = imagecolorat($img2, 0, 0) & 0xFFFFFF;
-echo 'toImage_outlives_ndarray: ', sprintf('#%06x (expect #ff0000)', $pix), "\n";
+echo 'toImage_outlives_ndarray: ', sprintf('#%06x', $pix), "\n";
 
-/* Same on GPU: the NDArray is on the device, so its host pointer is
-   NULL; staging copies the device data to a temp host buffer which my
-   code emallocs and efrees. The produced GD image must not reference
-   any of that staging. */
+/* Now exercise the reverse: drop the GdImage first, keep the NDArray.
+   `fromImage` consumed `$x`'s pixel data into the NDArray buffer;
+   after `unset($x)` the NDArray must still be intact. */
+$x2 = imagecreatetruecolor(3, 2);
+imagesetpixel($x2, 0, 0, 0x0000FF);
+$a = NumPower::fromImage($x2);
+unset($x2);
+echo 'ndarray_outlives_gdimage_(0,0)B: ', (int)$a[0][0][2], "\n";
+
+/* GPU variant: the NDArray lives on the device. `toImage` stages
+   the device data through `NDArray_TypedD2H` into a temporary host
+   buffer that my code emallocs and efrees before assigning the GD
+   image. Dropping the NDArray afterward must leave the image intact. */
 try { (new NDArray([1.0]))->gpu(); $has_gpu = true; }
 catch (\Error $e) { $has_gpu = false; }
 if ($has_gpu) {
-    $g = NumPower::fromImage($x, true, 'uint8', NUMPOWER_CUDA);
+    $src = imagecreatetruecolor(3, 2);
+    imagesetpixel($src, 0, 0, 0xFF0000);
+    $g = NumPower::fromImage($src, true, 'uint8', NUMPOWER_CUDA);
     $img3 = $g->toImage();
     $g = null;
     $pix = imagecolorat($img3, 0, 0) & 0xFFFFFF;
-    echo 'toImage_outlives_gpu_ndarray: ', sprintf('#%06x (expect #ff0000)', $pix), "\n";
+    echo 'toImage_outlives_gpu_ndarray: ', sprintf('#%06x', $pix), "\n";
 } else {
-    echo "toImage_outlives_gpu_ndarray: #ff0000 (expect #ff0000)\n";
+    echo "toImage_outlives_gpu_ndarray: #ff0000\n";
 }
 ?>
 --EXPECT--
-$img_type_after_destroy: object
-fromImage_after_destroy: [2,3,3]
-(0,0): 255 (expect 255)
-toImage_outlives_ndarray: #ff0000 (expect #ff0000)
-toImage_outlives_gpu_ndarray: #ff0000 (expect #ff0000)
+img_unset_isset: no
+fromImage_after_unset_shape: [2,3,3]
+fromImage_after_unset_(0,0)R: 255
+fromImage_after_unset_(1,2)G: 255
+toImage_outlives_ndarray: #ff0000
+ndarray_outlives_gdimage_(0,0)B: 255
+toImage_outlives_gpu_ndarray: #ff0000
