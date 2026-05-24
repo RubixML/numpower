@@ -13,7 +13,48 @@ NDArray* NDArray_FromNDArray(NDArray *target, int buffer_offset, int* shape, int
 NDArray* NDArray_Zeros(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Ones(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Identity(int size, const char *type, int device);
-NDArray* NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator);
+
+/**
+ * @brief Arithmetic kind used to encode the (loc, scale) pair for the
+ *        Gaussian sampler.
+ *
+ * Selected by the requested dtype: `float128` carries loc/scale in fp128
+ * so wide-range parameters keep full 113-bit (or DD-equivalent)
+ * precision; `uint64` uses native unsigned 64-bit arithmetic so means
+ * past 2^53 stay exact; every other dtype uses double, which represents
+ * each smaller dtype's range without loss.
+ */
+typedef enum {
+    NDARRAY_NORMAL_KIND_DOUBLE = 0,
+    NDARRAY_NORMAL_KIND_FP128  = 1,
+    NDARRAY_NORMAL_KIND_UINT64 = 2
+} NDArrayNormalKind;
+
+/**
+ * @brief Discriminated (loc, scale) parameter set for the Gaussian sampler.
+ *
+ * `kind` selects the active union arm; the others are not initialised.
+ * Construction is handled by `PHP_METHOD(NumPower, normal)`.
+ */
+typedef struct {
+    NDArrayNormalKind kind;
+    union {
+        struct { double          loc, scale; } d;
+        struct { ndarray_fp128_t loc, scale; } f128;
+        struct { uint64_t        loc, scale; } u64;
+    } v;
+} NDArrayNormalSpec;
+
+/**
+ * @brief Map a canonical dtype string to its normal-sampler arithmetic kind.
+ *
+ * @param[in] type Canonical dtype string.
+ * @return one of NDARRAY_NORMAL_KIND_*.
+ */
+NDArrayNormalKind NDArray_NormalKindFor(const char *type);
+
+NDArray* NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
+                        const char *type, int device);
 NDArray* NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator);
 NDArray* NDArray_StandardNormal(int* shape, int ndim);
 NDArray* NDArray_Poisson(double lam, int* shape, int ndim);

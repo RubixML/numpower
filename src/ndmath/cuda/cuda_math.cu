@@ -11,6 +11,7 @@
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <time.h>
 
 #define CHECK_CUDA(func) do { \
   cudaError_t status = (func); \
@@ -2830,6 +2831,142 @@ int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
     return 0;
+}
+
+/* ───────────────── Normal sampler ──────────────────────────────────────── */
+
+/**
+ * @brief Derive a fresh PRNG seed for each `cuda_normal_*` call.
+ *
+ * Combines wall-clock seconds with a monotonically-increasing 64-bit
+ * counter so successive calls in the same second still produce
+ * statistically-independent streams. The previous implementation pinned
+ * the seed to `1234ULL` which made repeated calls within one process
+ * generate identical sample sequences — a real entropy bug.
+ *
+ * @return New 64-bit seed.
+ */
+static unsigned long long cuda_normal_next_seed(void) {
+    static unsigned long long counter = 0;
+    unsigned long long t = (unsigned long long)time(NULL);
+    /* The 17-bit shift gives each call a wide jump in the seed even when
+       the wall-clock didn't advance; the xor lets `time(NULL) == 0` (an
+       edge case during early init) still produce non-zero seeds. */
+    return (t << 32) ^ (counter++ << 17) ^ 0x9e3779b97f4a7c15ULL;
+}
+
+/**
+ * @brief curandStatus → return-or-throw helper.
+ *
+ * cuRAND failure modes here are: out-of-memory, invalid handle, no
+ * device. None are recoverable inside the wrapper so we surface them as
+ * a catchable PHP Error and leave the destination buffer in whatever
+ * state cuRAND left it (caller will `NDArray_FREE` and propagate
+ * `return NULL`).
+ *
+ * @param[in] st curandStatus_t.
+ * @return 1 on CURAND_STATUS_SUCCESS, 0 on every failure (Error in flight).
+ */
+static int cuda_normal_check(curandStatus_t st) {
+    if (st == CURAND_STATUS_SUCCESS) return 1;
+    /* Don't throw a PHP error from libcudart-linked code; just signal
+       failure. Callers translate to an Error in PHP-frame functions. */
+    return 0;
+}
+
+void cuda_normal_f32(float *d_data, long n, float mean, float stddev) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+
+    if ((n & 1) == 0) {
+        /* Even size — cuRAND can write directly into the destination. */
+        cuda_normal_check(curandGenerateNormal(gen, d_data, (size_t)n,
+                                                mean, stddev));
+    } else {
+        /* Odd size — cuRAND requires even. Write `n + 1` into a transient
+           pad buffer, then copy `n` floats into the destination. The pad
+           buffer is freed before the wrapper returns. */
+        float *pad = NULL;
+        cudaMalloc((void**)&pad, sizeof(float) * (size_t)(n + 1));
+        if (pad != NULL) {
+            cuda_normal_check(curandGenerateNormal(gen, pad, (size_t)(n + 1),
+                                                    mean, stddev));
+            cudaMemcpy(d_data, pad, sizeof(float) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+            cudaFree(pad);
+        }
+    }
+    curandDestroyGenerator(gen);
+}
+
+void cuda_normal_f64(double *d_data, long n, double mean, double stddev) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+
+    if ((n & 1) == 0) {
+        cuda_normal_check(curandGenerateNormalDouble(gen, d_data, (size_t)n,
+                                                      mean, stddev));
+    } else {
+        double *pad = NULL;
+        cudaMalloc((void**)&pad, sizeof(double) * (size_t)(n + 1));
+        if (pad != NULL) {
+            cuda_normal_check(curandGenerateNormalDouble(gen, pad,
+                                                          (size_t)(n + 1),
+                                                          mean, stddev));
+            cudaMemcpy(d_data, pad, sizeof(double) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+            cudaFree(pad);
+        }
+    }
+    curandDestroyGenerator(gen);
+}
+
+/**
+ * @brief Per-thread DD affine kernel: `dst[i] = loc + scale * z[i]` in dd.
+ *
+ * Reads one standard-normal double `z[i]`, computes the affine transform
+ * in true double-double arithmetic on device, and stores the result at
+ * `dst[2i..2i+1]`. The transform is intentionally done with full DD
+ * precision so a caller's fp128 `loc`/`scale` survive the trip through
+ * VRAM intact; the only precision loss along the pipeline is the
+ * standard-normal sample `z`, which is inherently 53-bit (cuRAND's
+ * `curandGenerateNormalDouble` produces fp64 samples).
+ */
+__global__ void cuda_normal_dd_affine_kernel(const double *z, double *dst,
+                                              long n,
+                                              double loc_hi, double loc_lo,
+                                              double scale_hi, double scale_lo) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dd_real zdd    = dd_make(z[i], 0.0);
+        dd_real scale  = dd_make(scale_hi, scale_lo);
+        dd_real loc    = dd_make(loc_hi, loc_lo);
+        dd_real prod   = dd_mul(zdd, scale);
+        dd_real result = dd_add(loc, prod);
+        dst[2*i]     = result.hi;
+        dst[2*i + 1] = result.lo;
+    }
+}
+
+void cuda_normal_dd_affine(const double *z, double *dst, long n,
+                           double loc_hi, double loc_lo,
+                           double scale_hi, double scale_lo) {
+    if (z == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_normal_dd_affine_kernel<<<blocks, block>>>(z, dst, n,
+                                                      loc_hi, loc_lo,
+                                                      scale_hi, scale_lo);
 }
 
 }

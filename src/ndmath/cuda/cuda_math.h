@@ -86,6 +86,58 @@ void cuda_float_positive(int nblocks, float *d_array);
 void cuda_float_reciprocal(int nblocks, float *d_array);
 void cuda_truncated_normal(float* d_data, int size, double loc, double scale);
 
+/**
+ * @brief Fill a GPU float32 buffer with N(@p mean, @p stddev^2) samples.
+ *
+ * Wraps `curandGenerateNormal`. cuRAND's contract requires an even sample
+ * count, so the wrapper transparently uses an internal +1 padding buffer
+ * when @p n is odd. The seed is derived from `time(NULL)` xored with a
+ * monotonically-increasing call counter so successive calls inside the
+ * same second still produce independent streams.
+ *
+ * @param[out] d_data  GPU buffer of @p n floats.
+ * @param[in]  n       Element count; ≥ 0.
+ * @param[in]  mean    Distribution mean (µ).
+ * @param[in]  stddev  Distribution standard deviation (σ); must be > 0
+ *                     for cuRAND to be well-defined.
+ */
+void cuda_normal_f32(float *d_data, long n, float mean, float stddev);
+
+/**
+ * @brief Fill a GPU float64 buffer with N(@p mean, @p stddev^2) samples.
+ *
+ * Companion to `cuda_normal_f32` for double precision. Same odd-size
+ * handling and same per-call seeding policy.
+ *
+ * @param[out] d_data  GPU buffer of @p n doubles.
+ * @param[in]  n       Element count; ≥ 0.
+ * @param[in]  mean    Distribution mean (µ).
+ * @param[in]  stddev  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_normal_f64(double *d_data, long n, double mean, double stddev);
+
+/**
+ * @brief Widen a GPU float64 normal stream into the on-device DD layout.
+ *
+ * Reads @p z[i] (a standard-normal double), evaluates the affine
+ * transform `value = loc + scale * z[i]` in true double-double
+ * arithmetic on device using the same `dd_add` / `dd_mul` primitives the
+ * arithmetic kernels use, and stores the result at
+ * `dst[2*i]` (hi) and `dst[2*i + 1]` (lo). Used by `NDArray_Normal` to
+ * keep the fp128 GPU path VRAM-direct (no host transit of the result).
+ *
+ * @param[in]  z         Length-@p n GPU buffer of standard-normal doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  loc_hi    DD high word of the distribution mean.
+ * @param[in]  loc_lo    DD low word of the distribution mean.
+ * @param[in]  scale_hi  DD high word of the distribution stddev.
+ * @param[in]  scale_lo  DD low word of the distribution stddev.
+ */
+void cuda_normal_dd_affine(const double *z, double *dst, long n,
+                           double loc_hi, double loc_lo,
+                           double scale_hi, double scale_lo);
+
 //Doubles
 void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements);
 

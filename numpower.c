@@ -1819,48 +1819,141 @@ PHP_METHOD(NumPower, identity) {
     ndarray_install_object(rtn, return_value);
 }
 
+/* Forward declarations: the polymorphic zval→numeric coercion helpers
+   live further down in this file (next to `arange`). `normal` was added
+   later so it needs the declarations to call them. */
+static int coerce_zval_to_double(zval *z, const char *op, const char *name,
+                                 double *out_dst);
+static int coerce_zval_to_uint64(zval *z, const char *op, const char *name,
+                                 uint64_t *out_dst);
+static int coerce_zval_to_fp128(zval *z, const char *op, const char *name,
+                                ndarray_fp128_t *out_dst);
+
 /**
- * NumPower::normal
+ * @brief `NumPower::normal(shape, loc = 0.0, scale = 1.0, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Generates an NDArray of the requested shape filled with samples drawn
+ * from N(@p loc, @p scale^2). The result dtype and residency device are
+ * caller-selectable; on `device == 1` (GPU) the buffer is allocated
+ * directly in VRAM (via `NDArray_Empty`) and populated by cuRAND
+ * (`curandGenerateNormal` / `curandGenerateNormalDouble`) plus
+ * `cuda_cast_*` quantisation for non-fp32/fp64 dtypes — no full-size
+ * host staging of the result. For `dtype == float128` on GPU the values
+ * are computed in true double-double arithmetic on device via a custom
+ * `cuda_normal_dd_affine` kernel so the user's fp128 loc/scale are
+ * preserved bit-for-bit through the (hi, lo) DD layout.
+ *
+ * `loc` and `scale` accept `int | float | string`. The string form is
+ * the only precision-loss-free route for the wide dtypes:
+ * `float128` strings parse via `strtoflt128` (or the DD fallback),
+ * `uint64` strings via `strtoull`. Every other dtype is coerced through
+ * `double`, which represents each smaller dtype's range exactly.
+ *
+ * `device` is `0` for CPU (default) or `1` for GPU. The same `NUMPOWER_CPU`
+ * / `NUMPOWER_CUDA` constants the rest of the API uses.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_normal, 0, 0, 1)
-    ZEND_ARG_INFO(0, size)
+    ZEND_ARG_INFO(0, shape)
     ZEND_ARG_INFO(0, loc)
     ZEND_ARG_INFO(0, scale)
-    ZEND_ARG_INFO(0, accelerator)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, normal) {
-    NDArray *rtn = NULL;
-    int *shape;
-    zval* size;
-    long accelerator = NDARRAY_DEVICE_CPU;
-    double loc = 0.0, scale = 1.0;
-    
-    ZEND_PARSE_PARAMETERS_START(1, 4)
-        Z_PARAM_ZVAL(size)
+    zval *shape_zval;
+    zval *loc_zv   = NULL;
+    zval *scale_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 5)
+        Z_PARAM_ZVAL(shape_zval)
     Z_PARAM_OPTIONAL
-        Z_PARAM_DOUBLE(loc)
-        Z_PARAM_DOUBLE(scale)
-        Z_PARAM_LONG(accelerator)
+        Z_PARAM_ZVAL(loc_zv)
+        Z_PARAM_ZVAL(scale_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    
-    int accelerator_i = (int) accelerator;
-    NDArray *nda = ZVAL_TO_NDARRAY(size);
-    
-    if (nda == NULL) return;
-    
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        shape[i] = (int) NDArray_F32DATA(nda)[i];
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
+        return;
     }
 
-    rtn = NDArray_Normal(loc, scale, shape, NDArray_NUMELEMENTS(nda), accelerator_i);
-    NDArray_FREE(nda);
-    
-    ndarray_init_new_object(rtn, return_value);
+    /* Defaults are dtype-aware: `loc = 0` and `scale = 1` are encoded
+       in the same precision as any explicit arg so the three dispatch
+       paths stay symmetric. */
+    NDArrayNormalSpec spec;
+    spec.kind = NDArray_NormalKindFor(ndarrayDataType);
+
+    switch (spec.kind) {
+        case NDARRAY_NORMAL_KIND_FP128: {
+            spec.v.f128.loc   = NDARRAY_FP128_ZERO();
+            spec.v.f128.scale = NDARRAY_FP128_FROM_I64(1);
+            if (loc_zv != NULL &&
+                !coerce_zval_to_fp128(loc_zv, "normal", "loc",
+                                       &spec.v.f128.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_fp128(scale_zv, "normal", "scale",
+                                       &spec.v.f128.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
+        case NDARRAY_NORMAL_KIND_UINT64: {
+            spec.v.u64.loc   = 0;
+            spec.v.u64.scale = 1;
+            if (loc_zv != NULL &&
+                !coerce_zval_to_uint64(loc_zv, "normal", "loc",
+                                        &spec.v.u64.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_uint64(scale_zv, "normal", "scale",
+                                        &spec.v.u64.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
+        case NDARRAY_NORMAL_KIND_DOUBLE:
+        default: {
+            spec.kind        = NDARRAY_NORMAL_KIND_DOUBLE;
+            spec.v.d.loc     = 0.0;
+            spec.v.d.scale   = 1.0;
+            if (loc_zv != NULL &&
+                !coerce_zval_to_double(loc_zv, "normal", "loc",
+                                        &spec.v.d.loc)) {
+                efree(shape); return;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_double(scale_zv, "normal", "scale",
+                                        &spec.v.d.scale)) {
+                efree(shape); return;
+            }
+            break;
+        }
+    }
+
+    NDArray *rtn = NDArray_Normal(&spec, shape, ndim, ndarrayDataType,
+                                  parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Match every other typed factory (zeros / ones / arange) — always
+       hand back an NDArray, even for a 0-D shape, so the GPU-residency
+       contract isn't broken by a primitive-zval collapse. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
@@ -2292,21 +2385,25 @@ PHP_METHOD(NumPower, ones) {
 }
 
 /**
- * @brief Coerce a PHP scalar @p z into a double for arange's "narrow"
- *        arithmetic path.
+ * @brief Coerce a PHP scalar @p z into a `double`.
  *
  * Accepts `int`, `float`, and numeric `string` inputs. The string path
- * uses `zend_string` → `strtod`, matching PHP's standard numeric-string
- * coercion. The double @p out_dst is set only on success; on failure a
- * catchable `\Error` is in flight.
+ * uses `strtod`, matching PHP's standard numeric-string coercion. The
+ * double @p out_dst is set only on success; on failure a catchable
+ * `\Error` is in flight, prefixed with @p op so the caller's surface is
+ * obvious in the error message (e.g. `"arange: stop must be …"`).
  *
- * @param[in]  z         PHP scalar.
- * @param[in]  name      Argument label for the error message.
- * @param[out] out_dst   Receives the coerced double on success.
+ * Shared by every PHP method that accepts a polymorphic numeric scalar
+ * (currently `arange`, `normal`).
+ *
+ * @param[in]  z       PHP scalar.
+ * @param[in]  op      Method name prefix for the error message.
+ * @param[in]  name    Argument label for the error message.
+ * @param[out] out_dst Receives the coerced double on success.
  * @return 1 on success, 0 on a type rejection.
  */
 static int
-arange_coerce_zval_double(zval *z, const char *name, double *out_dst) {
+coerce_zval_to_double(zval *z, const char *op, const char *name, double *out_dst) {
     if (Z_TYPE_P(z) == IS_LONG) {
         *out_dst = (double) Z_LVAL_P(z);
         return 1;
@@ -2320,12 +2417,12 @@ arange_coerce_zval_double(zval *z, const char *name, double *out_dst) {
         return 1;
     }
     zend_throw_error(NULL,
-        "arange: %s must be int, float, or numeric string", name);
+        "%s: %s must be int, float, or numeric string", op, name);
     return 0;
 }
 
 /**
- * @brief Coerce a PHP scalar @p z into an `int64_t` for the int64 arange path.
+ * @brief Coerce a PHP scalar @p z into an `int64_t`.
  *
  * IS_LONG is taken verbatim (PHP's native long is 64-bit signed on every
  * supported platform). IS_DOUBLE is cast through `(int64_t)`. IS_STRING
@@ -2333,12 +2430,13 @@ arange_coerce_zval_double(zval *z, const char *name, double *out_dst) {
  * byte-correct.
  *
  * @param[in]  z       PHP scalar.
+ * @param[in]  op      Method name prefix for the error message.
  * @param[in]  name    Argument label for the error message.
  * @param[out] out_dst Receives the int64 value on success.
  * @return 1 on success, 0 on type rejection (Error in flight).
  */
 static int
-arange_coerce_zval_int64(zval *z, const char *name, int64_t *out_dst) {
+coerce_zval_to_int64(zval *z, const char *op, const char *name, int64_t *out_dst) {
     if (Z_TYPE_P(z) == IS_LONG) {
         *out_dst = (int64_t) Z_LVAL_P(z);
         return 1;
@@ -2352,29 +2450,30 @@ arange_coerce_zval_int64(zval *z, const char *name, int64_t *out_dst) {
         return 1;
     }
     zend_throw_error(NULL,
-        "arange: %s must be int, float, or numeric string", name);
+        "%s: %s must be int, float, or numeric string", op, name);
     return 0;
 }
 
 /**
- * @brief Coerce a PHP scalar @p z into a `uint64_t` for the uint64 arange path.
+ * @brief Coerce a PHP scalar @p z into a `uint64_t`.
  *
  * IS_LONG is range-checked (a negative value is rejected for unsigned).
  * IS_STRING routes through `strtoull` so `"18446744073709551615"` and
  * other values above `LLONG_MAX` survive intact.
  *
  * @param[in]  z       PHP scalar.
+ * @param[in]  op      Method name prefix for the error message.
  * @param[in]  name    Argument label for the error message.
  * @param[out] out_dst Receives the uint64 value on success.
  * @return 1 on success, 0 on type rejection or negative-long.
  */
 static int
-arange_coerce_zval_uint64(zval *z, const char *name, uint64_t *out_dst) {
+coerce_zval_to_uint64(zval *z, const char *op, const char *name, uint64_t *out_dst) {
     if (Z_TYPE_P(z) == IS_LONG) {
         zend_long lv = Z_LVAL_P(z);
         if (lv < 0) {
             zend_throw_error(NULL,
-                "arange: %s must be non-negative for uint64 dtype", name);
+                "%s: %s must be non-negative for uint64 dtype", op, name);
             return 0;
         }
         *out_dst = (uint64_t) lv;
@@ -2384,7 +2483,7 @@ arange_coerce_zval_uint64(zval *z, const char *name, uint64_t *out_dst) {
         double dv = Z_DVAL_P(z);
         if (dv < 0.0) {
             zend_throw_error(NULL,
-                "arange: %s must be non-negative for uint64 dtype", name);
+                "%s: %s must be non-negative for uint64 dtype", op, name);
             return 0;
         }
         *out_dst = (uint64_t) dv;
@@ -2395,24 +2494,26 @@ arange_coerce_zval_uint64(zval *z, const char *name, uint64_t *out_dst) {
         return 1;
     }
     zend_throw_error(NULL,
-        "arange: %s must be int, float, or numeric string", name);
+        "%s: %s must be int, float, or numeric string", op, name);
     return 0;
 }
 
 /**
- * @brief Coerce a PHP scalar @p z into `ndarray_fp128_t` for the float128 path.
+ * @brief Coerce a PHP scalar @p z into `ndarray_fp128_t`.
  *
  * IS_STRING is the precision-loss-free path (via `strtoflt128` on glibc,
  * or the DD fallback). IS_LONG / IS_DOUBLE go through the dtype's
  * standard conversion helpers.
  *
  * @param[in]  z       PHP scalar.
+ * @param[in]  op      Method name prefix for the error message.
  * @param[in]  name    Argument label for the error message.
  * @param[out] out_dst Receives the fp128 value on success.
  * @return 1 on success, 0 on type rejection.
  */
 static int
-arange_coerce_zval_fp128(zval *z, const char *name, ndarray_fp128_t *out_dst) {
+coerce_zval_to_fp128(zval *z, const char *op, const char *name,
+                     ndarray_fp128_t *out_dst) {
     if (Z_TYPE_P(z) == IS_STRING) {
         *out_dst = ndarray_string_to_fp128(Z_STRVAL_P(z));
         return 1;
@@ -2426,7 +2527,7 @@ arange_coerce_zval_fp128(zval *z, const char *name, ndarray_fp128_t *out_dst) {
         return 1;
     }
     zend_throw_error(NULL,
-        "arange: %s must be int, float, or numeric string", name);
+        "%s: %s must be int, float, or numeric string", op, name);
     return 0;
 }
 
@@ -2497,31 +2598,31 @@ PHP_METHOD(NumPower, arange) {
         case NDARRAY_ARANGE_KIND_FP128: {
             spec.v.f128.start = NDARRAY_FP128_ZERO();
             spec.v.f128.step  = NDARRAY_FP128_FROM_I64(1);
-            if (!arange_coerce_zval_fp128(stop_zv, "stop", &spec.v.f128.stop)) return;
+            if (!coerce_zval_to_fp128(stop_zv, "arange", "stop", &spec.v.f128.stop)) return;
             if (start_zv != NULL &&
-                !arange_coerce_zval_fp128(start_zv, "start", &spec.v.f128.start)) return;
+                !coerce_zval_to_fp128(start_zv, "arange", "start", &spec.v.f128.start)) return;
             if (step_zv != NULL &&
-                !arange_coerce_zval_fp128(step_zv,  "step",  &spec.v.f128.step)) return;
+                !coerce_zval_to_fp128(step_zv,  "arange", "step",  &spec.v.f128.step)) return;
             break;
         }
         case NDARRAY_ARANGE_KIND_INT64: {
             spec.v.i64.start = 0;
             spec.v.i64.step  = 1;
-            if (!arange_coerce_zval_int64(stop_zv, "stop", &spec.v.i64.stop)) return;
+            if (!coerce_zval_to_int64(stop_zv, "arange", "stop", &spec.v.i64.stop)) return;
             if (start_zv != NULL &&
-                !arange_coerce_zval_int64(start_zv, "start", &spec.v.i64.start)) return;
+                !coerce_zval_to_int64(start_zv, "arange", "start", &spec.v.i64.start)) return;
             if (step_zv != NULL &&
-                !arange_coerce_zval_int64(step_zv,  "step",  &spec.v.i64.step)) return;
+                !coerce_zval_to_int64(step_zv,  "arange", "step",  &spec.v.i64.step)) return;
             break;
         }
         case NDARRAY_ARANGE_KIND_UINT64: {
             spec.v.u64.start = 0;
             spec.v.u64.step  = 1;
-            if (!arange_coerce_zval_uint64(stop_zv, "stop", &spec.v.u64.stop)) return;
+            if (!coerce_zval_to_uint64(stop_zv, "arange", "stop", &spec.v.u64.stop)) return;
             if (start_zv != NULL &&
-                !arange_coerce_zval_uint64(start_zv, "start", &spec.v.u64.start)) return;
+                !coerce_zval_to_uint64(start_zv, "arange", "start", &spec.v.u64.start)) return;
             if (step_zv != NULL &&
-                !arange_coerce_zval_uint64(step_zv,  "step",  &spec.v.u64.step)) return;
+                !coerce_zval_to_uint64(step_zv,  "arange", "step",  &spec.v.u64.step)) return;
             break;
         }
         case NDARRAY_ARANGE_KIND_DOUBLE:
@@ -2529,11 +2630,11 @@ PHP_METHOD(NumPower, arange) {
             spec.kind = NDARRAY_ARANGE_KIND_DOUBLE;
             spec.v.d.start = 0.0;
             spec.v.d.step  = 1.0;
-            if (!arange_coerce_zval_double(stop_zv, "stop", &spec.v.d.stop)) return;
+            if (!coerce_zval_to_double(stop_zv, "arange", "stop", &spec.v.d.stop)) return;
             if (start_zv != NULL &&
-                !arange_coerce_zval_double(start_zv, "start", &spec.v.d.start)) return;
+                !coerce_zval_to_double(start_zv, "arange", "start", &spec.v.d.start)) return;
             if (step_zv != NULL &&
-                !arange_coerce_zval_double(step_zv,  "step",  &spec.v.d.step)) return;
+                !coerce_zval_to_double(step_zv,  "arange", "step",  &spec.v.d.step)) return;
             break;
         }
     }
