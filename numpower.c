@@ -1472,13 +1472,18 @@ ndarray_parse_typed_shape(zval *shape_zval, const char *data_type,
         double raw = (double) NDArray_F32DATA(nda)[i];
         if (raw < 0.0) {
             efree(shape);
-            NDArray_FREE(nda);
+            /* `CHECK_INPUT_AND_FREE` releases the temporary NDArray built
+               by `ZVAL_TO_NDARRAY` only for scalar / array sources; an
+               existing NDArray passed as shape keeps its refcount, so a
+               bare `NDArray_FREE` here would drop the user's live array
+               into a dangling buffer slot. */
+            CHECK_INPUT_AND_FREE(shape_zval, nda);
             zend_throw_error(NULL, "negative dimensions are not allowed");
             return 0;
         }
         shape[i] = (int) raw;
     }
-    NDArray_FREE(nda);
+    CHECK_INPUT_AND_FREE(shape_zval, nda);
 
     *out_shape = shape;
     *out_ndim  = ndim;

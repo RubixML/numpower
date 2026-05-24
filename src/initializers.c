@@ -235,33 +235,65 @@ NDArray_FromNDArray(NDArray *target, int buffer_offset, int* shape, int* strides
 }
 
 /**
- * Initialize NDArray with empty values
+ * @brief Allocate an NDArray with uninitialised storage of @p ndim × @p shape.
  *
- * @param shape
- * @param ndim
- * @return
+ * Mirrors `NDArray_Zeros` for callers that immediately overwrite every
+ * element (e.g. arange, the diag/identity diagonal write path). The
+ * dtype is validated *before* `Create_NDArray` so a bogus @p type
+ * doesn't leak the rtn struct / shape / descriptor through the old
+ * `elsize == 0 → return NULL` branch. `rtn->data` is initialised to
+ * NULL before any allocator call so that a downstream `NDArray_FREE`
+ * is safe even if the device allocation fails halfway.
+ *
+ * @param[in] shape  Newly-allocated int[ndim]; ownership transfers into
+ *                   the returned NDArray's `dimensions`.
+ * @param[in] ndim   Number of dimensions (0 yields a 0-D scalar).
+ * @param[in] type   Canonical dtype string.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray with uninitialised data buffer, or NULL on
+ *         validation failure / GPU requested in a non-CUDA build.
  */
 NDArray*
 NDArray_Empty(int *shape, int ndim, const char *type, int device) {
-    NDArray* rtn = Create_NDArray(shape, ndim, type, NDARRAY_DEVICE_CPU);
-
-    if (rtn == NULL) {
-        return rtn;
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) {
+            efree(shape);
+        }
+        return NULL;
     }
 
-    int elsize = get_type_size(type);
-    if (elsize == 0) return NULL;
+    NDArray* rtn = Create_NDArray(shape, ndim, type, NDARRAY_DEVICE_CPU);
+    if (rtn == NULL) {
+        return NULL;
+    }
+    /* Ensure NDArray_FREE is safe even if the device allocator below
+       returns without writing `rtn->data` (e.g. cudaMalloc failure
+       inside `vmalloc`, or an unreachable GPU branch on a non-CUDA build
+       reached defensively). */
+    rtn->data = NULL;
+
+    size_t bytes = (size_t)NDArray_NUMELEMENTS(rtn) * (size_t)elsize;
 
     if (device == NDARRAY_DEVICE_CPU) {
         rtn->device = NDARRAY_DEVICE_CPU;
-        rtn->data = emalloc((size_t)NDArray_NUMELEMENTS(rtn) * (size_t)elsize);
+        rtn->data   = emalloc(bytes);
     }
 #ifdef HAVE_CUBLAS
-    else {
+    else if (device == NDARRAY_DEVICE_GPU) {
         rtn->device = NDARRAY_DEVICE_GPU;
-        vmalloc((void **)&rtn->data, (size_t)NDArray_NUMELEMENTS(rtn) * (size_t)elsize);
+        vmalloc((void **)&rtn->data, (unsigned int) bytes);
+    }
+#else
+    else if (device == NDARRAY_DEVICE_GPU) {
+        /* GPU requested without CUDA — bail loudly rather than hand back
+           an NDArray with `data == NULL` and `device == GPU` (which
+           every downstream op would dereference). */
+        NDArray_FREE(rtn);
+        return NULL;
     }
 #endif
+
     return rtn;
 }
 
@@ -816,21 +848,31 @@ ndarray_diag_prepare_input(NDArray *a, const char *type, int device, int *owned)
     NDArray *prep = a;
     if (strcmp(NDArray_TYPE(prep), type) != 0) {
         NDArray *cast = NDArray_AsType(prep, type);
-        if (*owned) NDArray_FREE(prep);
+        if (cast == NULL) {
+            /* The user's input `a` was never owned by us — leave *owned == 0
+               so the caller doesn't try to free it on the NULL return. */
+            return NULL;
+        }
         prep   = cast;
         *owned = 1;
-        if (prep == NULL) return NULL;
     }
     if (NDArray_DEVICE(prep) != device) {
 #ifdef HAVE_CUBLAS
         NDArray *moved = (device == NDARRAY_DEVICE_GPU)
             ? NDArray_ToGPU(prep) : NDArray_ToCPU(prep);
+        if (moved == NULL) {
+            /* The cast copy from the previous step (if any) must be
+               released before bailing — *owned tracks exactly that. */
+            if (*owned) NDArray_FREE(prep);
+            *owned = 0;
+            return NULL;
+        }
         if (*owned) NDArray_FREE(prep);
         prep   = moved;
         *owned = 1;
-        if (prep == NULL) return NULL;
 #else
         if (*owned) NDArray_FREE(prep);
+        *owned = 0;
         zend_throw_error(NULL,
             "diag: GPU device requested but CUDA support is not compiled in.");
         return NULL;
@@ -1243,12 +1285,20 @@ NDArrayArangeKind NDArray_ArangeKindFor(const char *type) {
  */
 #define NDARRAY_ARANGE_LEN_ERROR ((long)-1)
 
-/* Length helpers — each returns the non-negative element count for its
-   arithmetic kind, 0 when the sign of `step` is incompatible with the
-   (start, stop) interval (mirroring numpy's empty-result behaviour), or
-   NDARRAY_ARANGE_LEN_ERROR when the input is degenerate (step == 0,
-   NaN, or the result overflows). */
-
+/**
+ * @brief Length of the floating-point arange interval @p start..@p stop, step @p step.
+ *
+ * Every arithmetic kind's length helper returns the non-negative element
+ * count, 0 when the sign of @p step is incompatible with `(stop - start)`
+ * (mirroring numpy's empty-result behaviour), or
+ * `NDARRAY_ARANGE_LEN_ERROR` for degenerate inputs (step == 0, NaN, or
+ * a length that would not fit in `long`).
+ *
+ * @param[in] start First sequence value (inclusive).
+ * @param[in] stop  Sequence end (exclusive).
+ * @param[in] step  Increment; must be non-zero and finite.
+ * @return Element count, 0, or `NDARRAY_ARANGE_LEN_ERROR`.
+ */
 static long arange_length_double(double start, double stop, double step) {
     if (step == 0.0 || isnan(step) || isnan(start) || isnan(stop)) {
         return NDARRAY_ARANGE_LEN_ERROR;
@@ -1264,29 +1314,94 @@ static long arange_length_double(double start, double stop, double step) {
     return (long)l;
 }
 
+/**
+ * @brief Length of the integer arange interval @p start..@p stop, step @p step.
+ *
+ * The signed-domain arithmetic that the previous implementation used
+ * (`stop - start`, `-step`, `diff + step - 1`) overflows whenever the
+ * (start, stop) span exceeds INT64_MAX or @p step is INT64_MIN. The
+ * present formulation reinterprets the magnitude in `uint64_t` (well-
+ * defined wrap on the int64↔uint64 cast) and ceils via the
+ * `(udiff - 1) / abs_step + 1` identity so neither the subtraction nor
+ * the ceil can wrap.
+ *
+ * @param[in] start First sequence value (inclusive).
+ * @param[in] stop  Sequence end (exclusive).
+ * @param[in] step  Increment; must be non-zero.
+ * @return Non-negative element count, 0 when the sign of @p step is
+ *         incompatible with `(stop - start)`, or
+ *         `NDARRAY_ARANGE_LEN_ERROR` for `step == 0` and any length
+ *         that would not fit in `long`.
+ */
 static long arange_length_int64(int64_t start, int64_t stop, int64_t step) {
     if (step == 0) return NDARRAY_ARANGE_LEN_ERROR;
+
+    uint64_t udiff;
+    uint64_t abs_step;
     if (step > 0) {
         if (stop <= start) return 0;
-        /* Ceiling division of (stop - start) by step, with the explicit
-           `step - 1` adjustment that's only safe because (stop > start)
-           guarantees a positive diff. */
-        int64_t diff = stop - start;
-        return (long)((diff + step - 1) / step);
+        udiff    = (uint64_t)stop - (uint64_t)start;
+        abs_step = (uint64_t)step;
+    } else {
+        if (stop >= start) return 0;
+        udiff    = (uint64_t)start - (uint64_t)stop;
+        /* -(uint64_t)step is well-defined even for step == INT64_MIN
+           because the unsigned negation wraps to 2^63 — exactly the
+           magnitude of INT64_MIN. */
+        abs_step = -(uint64_t)step;
     }
-    if (stop >= start) return 0;
-    int64_t diff     = start - stop;
-    int64_t pos_step = -step;
-    return (long)((diff + pos_step - 1) / pos_step);
+
+    /* `(udiff - 1) / abs_step + 1` is the ceil-without-overflow identity
+       (udiff > 0 here, so udiff - 1 doesn't wrap). The classic
+       `(udiff + abs_step - 1) / abs_step` would overflow when udiff is
+       close to UINT64_MAX. */
+    uint64_t length = (udiff - 1) / abs_step + 1;
+    if (length > (uint64_t)LONG_MAX) {
+        return NDARRAY_ARANGE_LEN_ERROR;
+    }
+    return (long)length;
 }
 
+/**
+ * @brief Length of the unsigned arange interval @p start..@p stop, step @p step.
+ *
+ * Companion to `arange_length_int64` — same overflow-safe ceiling-
+ * division identity (`(udiff - 1) / step + 1`) so that the result
+ * doesn't wrap when @p stop is close to `UINT64_MAX`.
+ *
+ * @param[in] start First sequence value (inclusive).
+ * @param[in] stop  Sequence end (exclusive).
+ * @param[in] step  Increment; must be non-zero and is unsigned, so the
+ *                  sequence is monotonically increasing.
+ * @return Non-negative element count, 0 when `stop <= start`, or
+ *         `NDARRAY_ARANGE_LEN_ERROR` for `step == 0` / overflow.
+ */
 static long arange_length_uint64(uint64_t start, uint64_t stop, uint64_t step) {
     if (step == 0) return NDARRAY_ARANGE_LEN_ERROR;
     if (stop <= start) return 0;
-    uint64_t diff = stop - start;
-    return (long)((diff + step - 1) / step);
+    uint64_t udiff  = stop - start;
+    uint64_t length = (udiff - 1) / step + 1;
+    if (length > (uint64_t)LONG_MAX) {
+        return NDARRAY_ARANGE_LEN_ERROR;
+    }
+    return (long)length;
 }
 
+/**
+ * @brief Length of the fp128 arange interval @p start..@p stop, step @p step.
+ *
+ * Uses the platform-uniform `NDARRAY_FP128_*` macros so the same source
+ * compiles for both the native `__float128` backend and the
+ * double-double fallback. The element count is computed as
+ * `ceil((stop - start) / step)`; rounding goes through a `double` cast
+ * because every legal count is bounded by `LONG_MAX < 2^63` which is
+ * exactly representable in a double.
+ *
+ * @param[in] start First sequence value (inclusive).
+ * @param[in] stop  Sequence end (exclusive).
+ * @param[in] step  Increment; must be non-zero.
+ * @return Element count, 0, or `NDARRAY_ARANGE_LEN_ERROR`.
+ */
 static long arange_length_fp128(ndarray_fp128_t start,
                                 ndarray_fp128_t stop,
                                 ndarray_fp128_t step) {
@@ -1308,11 +1423,22 @@ static long arange_length_fp128(ndarray_fp128_t start,
     return (long)ceil(rd);
 }
 
-/* Fill helpers — each writes `n` elements into `out` (a host buffer of
-   `n * elsize` bytes). For non-fp128 / non-int64 / non-uint64 dtypes the
-   double path delegates the per-element cast to `ndarray_set_from_double`
-   so it works uniformly for every "narrow" dtype. */
-
+/**
+ * @brief Write @p n arange elements into a host buffer with double precision.
+ *
+ * Used for every dtype except `float128`, `int64`, and `uint64`: a
+ * `double` covers each of those types' representable range exactly, and
+ * the per-element cast / quantisation is delegated to
+ * `ndarray_set_from_double`. Each value is computed by the closed-form
+ * `start + i * step` so the result doesn't accumulate rounding error
+ * across the array.
+ *
+ * @param[out] out   Host buffer of `n * get_type_size(type)` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  type  Canonical dtype string (used by `ndarray_set_from_double`).
+ * @param[in]  start First sequence value.
+ * @param[in]  step  Increment.
+ */
 static void arange_fill_double(char *out, long n, const char *type,
                                 double start, double step) {
     for (long i = 0; i < n; i++) {
@@ -1321,6 +1447,19 @@ static void arange_fill_double(char *out, long n, const char *type,
     }
 }
 
+/**
+ * @brief Write @p n arange elements into a host buffer with fp128 precision.
+ *
+ * Uses the platform-uniform `NDARRAY_FP128_*` macros so the same code
+ * runs on both the native `__float128` backend and the double-double
+ * fallback. Each element is `start + i * step` in fp128 — no cumulative
+ * add so error doesn't accumulate.
+ *
+ * @param[out] out   Host buffer of `n * NDARRAY_FP128_SIZE` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  start First sequence value in host fp128 representation.
+ * @param[in]  step  Increment.
+ */
 static void arange_fill_fp128(char *out, long n,
                                ndarray_fp128_t start,
                                ndarray_fp128_t step) {
@@ -1332,6 +1471,19 @@ static void arange_fill_fp128(char *out, long n,
     }
 }
 
+/**
+ * @brief Write @p n arange elements into a host buffer as `int64_t`.
+ *
+ * `start + i * step` cannot overflow under any legal input: the length
+ * helper guarantees the last value (`start + (n - 1) * step`) lies
+ * strictly between `start` and `stop`, so the magnitude stays inside
+ * the int64 range.
+ *
+ * @param[out] out   Host buffer of `n * sizeof(int64_t)` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  start First sequence value.
+ * @param[in]  step  Increment.
+ */
 static void arange_fill_int64(char *out, long n, int64_t start, int64_t step) {
     int64_t *p = (int64_t *)out;
     for (long i = 0; i < n; i++) {
@@ -1339,6 +1491,19 @@ static void arange_fill_int64(char *out, long n, int64_t start, int64_t step) {
     }
 }
 
+/**
+ * @brief Write @p n arange elements into a host buffer as `uint64_t`.
+ *
+ * Companion to `arange_fill_int64`. Per-element value is
+ * `start + i * step`; the unsigned arithmetic is well-defined and the
+ * length helper guarantees `start + (n - 1) * step < stop`, so the
+ * result never wraps.
+ *
+ * @param[out] out   Host buffer of `n * sizeof(uint64_t)` bytes.
+ * @param[in]  n     Element count.
+ * @param[in]  start First sequence value.
+ * @param[in]  step  Increment.
+ */
 static void arange_fill_uint64(char *out, long n, uint64_t start, uint64_t step) {
     uint64_t *p = (uint64_t *)out;
     for (long i = 0; i < n; i++) {
