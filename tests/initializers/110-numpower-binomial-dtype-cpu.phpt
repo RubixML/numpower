@@ -74,11 +74,13 @@ $var_ok  = abs($var  - 21.0) < 2.0;
 echo 'dist_B100_0.3: mean_ok=', ($mean_ok ? 'OK' : "BAD($mean)"),
      ' var_ok=', ($var_ok ? 'OK' : "BAD($var)"), "\n";
 
-/* B(1000, 0.5) — exercises the O(n) loop at moderate scale. */
+/* B(1000, 0.5) — exercises the O(n) loop at moderate scale. With
+   N=4096, SE(var) ≈ sqrt(2)·250/sqrt(4095) ≈ 5.5, so use a ~5σ
+   tolerance (~30) for the variance check. */
 $a = NumPower::randomBinomial([4096], 1000, 0.5, 'float64');
 [$mean, $var] = php_mean_var($a);
 $mean_ok = abs($mean - 500.0) < 3.0;
-$var_ok  = abs($var  - 250.0) < 20.0;
+$var_ok  = abs($var  - 250.0) < 30.0;
 echo 'dist_B1000_0.5: mean_ok=', ($mean_ok ? 'OK' : "BAD($mean)"),
      ' var_ok=', ($var_ok ? 'OK' : "BAD($var)"), "\n";
 

@@ -1900,12 +1900,22 @@ ndarray_normal_spec_defaults(NDArrayNormalSpec *spec, const char *type) {
 
 /**
  * @brief Overlay user-supplied @p loc_zv / @p scale_zv onto a spec whose
- *        defaults were initialised by `ndarray_normal_spec_defaults`.
+ *        defaults were initialised by `ndarray_normal_spec_defaults`,
+ *        then validate that scale is non-negative.
  *
  * Each non-NULL zval is coerced into the active kind's native scalar
  * type via the matching `coerce_zval_to_*` helper. A failed coercion
  * leaves a catchable `Error` in flight and returns 0; the caller is
  * expected to release any shape buffer it allocated and return.
+ *
+ * After successful coercion, scale is checked for negativity — a
+ * negative standard deviation is mathematically nonsensical (σ² ≥ 0
+ * by definition) and would also feed cuRAND a value outside its
+ * documented `stddev > 0` precondition on the GPU paths. `scale == 0`
+ * is permitted (degenerate distribution where every sample equals
+ * loc); the CPU fillers handle it trivially and cuRAND empirically
+ * returns the loc value. The UINT64 arm needs no check (unsigned 64
+ * is always ≥ 0 by type).
  *
  * @param[in,out] spec      Spec carrying the dtype-aware defaults; the
  *                          active union arm is overwritten on success.
@@ -1915,7 +1925,8 @@ ndarray_normal_spec_defaults(NDArrayNormalSpec *spec, const char *type) {
  *                          default).
  * @param[in]     scale_zv  Optional user-supplied scale (NULL keeps the
  *                          default).
- * @return 1 on success, 0 on type rejection (Error in flight).
+ * @return 1 on success, 0 on type rejection or negative scale
+ *         (Error in flight).
  */
 static int
 ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
@@ -1932,6 +1943,11 @@ ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
                                        &spec->v.f128.scale)) {
                 return 0;
             }
+            if (NDARRAY_FP128_LT(spec->v.f128.scale, NDARRAY_FP128_ZERO())) {
+                zend_throw_error(NULL,
+                    "%s: scale must be non-negative", op);
+                return 0;
+            }
             break;
         case NDARRAY_NORMAL_KIND_UINT64:
             if (loc_zv != NULL &&
@@ -1944,6 +1960,7 @@ ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
                                         &spec->v.u64.scale)) {
                 return 0;
             }
+            /* uint64 scale is unsigned — no negativity check needed. */
             break;
         case NDARRAY_NORMAL_KIND_DOUBLE:
         default:
@@ -1955,6 +1972,12 @@ ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
             if (scale_zv != NULL &&
                 !coerce_zval_to_double(scale_zv, op, "scale",
                                         &spec->v.d.scale)) {
+                return 0;
+            }
+            /* `!(scale >= 0.0)` also rejects NaN. */
+            if (!(spec->v.d.scale >= 0.0)) {
+                zend_throw_error(NULL,
+                    "%s: scale must be non-negative", op);
                 return 0;
             }
             break;

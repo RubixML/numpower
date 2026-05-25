@@ -35,10 +35,15 @@ function php_mean_var($a) {
 
 function check_poisson($a, $lam_target, $tag) {
     [$m, $v] = php_mean_var($a);
-    /* Mean tolerance: 0.05 * (lam + 1) — looser for small λ where
-       the relative SE matters, tighter for large λ. */
-    $mean_tol = 0.05 * ($lam_target + 1.0);
-    $var_tol  = 0.10 * ($lam_target + 1.0);
+    /* Mean tolerance scales with the standard error sqrt(λ / N) so a
+       given multiple-of-σ window is preserved across λ. Variance of
+       the sample variance scales with sqrt(2)·λ/sqrt(N-1), so we use
+       a separate tolerance proportional to sqrt(λ). Both are sized
+       generously (~5σ) so the test passes essentially always while
+       still failing loudly if the path computes wrong moments. */
+    $n_samples = 16384;
+    $mean_tol  = max(0.05, 5.0 * sqrt($lam_target / $n_samples));
+    $var_tol   = max(0.10, 5.0 * sqrt(2.0) * $lam_target / sqrt($n_samples));
     $mean_ok = abs($m - $lam_target) < $mean_tol;
     $var_ok  = abs($v - $lam_target) < $var_tol;
     echo $tag, ': mean=', ($mean_ok ? 'OK' : "BAD(target=$lam_target got=$m)"),

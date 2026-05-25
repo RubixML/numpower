@@ -50,6 +50,47 @@ foreach (['loc' => [-1, 1], 'scale' => [0, -1]] as $tag => [$lc, $sc]) {
     }
 }
 
+/* Negative scale rejected for all DOUBLE-kind dtypes (mathematically a
+   stddev cannot be negative; cuRAND also documents `stddev > 0`). */
+foreach ([-0.1, -1.0] as $bad_scale) {
+    try {
+        NumPower::normal([4], 0.0, $bad_scale, 'float32');
+        echo "BAD: no throw on neg scale=$bad_scale\n";
+    } catch (\Error $e) {
+        echo str_contains($e->getMessage(), 'scale must be non-negative')
+            ? "neg_scale_" . str_replace(['.', '-'], ['_', 'm'], (string)$bad_scale) . ": OK\n"
+            : "neg_scale_$bad_scale: BAD ({$e->getMessage()})\n";
+    }
+}
+
+/* NaN scale rejected too. */
+try {
+    NumPower::normal([4], 0.0, NAN);
+    echo "BAD: no throw on NaN scale\n";
+} catch (\Error $e) {
+    echo str_contains($e->getMessage(), 'scale must be non-negative')
+        ? "nan_scale: OK\n"
+        : "nan_scale: BAD ({$e->getMessage()})\n";
+}
+
+/* Negative fp128 scale rejected. */
+try {
+    NumPower::normal([4], '0.0', '-1.0', 'float128');
+    echo "BAD: no throw on neg fp128 scale\n";
+} catch (\Error $e) {
+    echo str_contains($e->getMessage(), 'scale must be non-negative')
+        ? "fp128_neg_scale: OK\n"
+        : "fp128_neg_scale: BAD ({$e->getMessage()})\n";
+}
+
+/* scale = 0 is permitted (degenerate distribution; every sample = loc). */
+$ok_zero_scale = NumPower::normal([8], 7.0, 0.0, 'float32');
+$all_loc = true;
+foreach ($ok_zero_scale->toArray() as $v) {
+    if ((float)$v !== 7.0) { $all_loc = false; break; }
+}
+echo 'scale_zero_permitted: ', ($all_loc ? 'OK' : 'BAD'), "\n";
+
 /* Negative shape entries are rejected by ndarray_parse_typed_shape. */
 try {
     NumPower::normal([-1], 0, 1, 'float32');
@@ -73,5 +114,10 @@ bad_loc: OK
 bad_scale: OK
 u64_neg_loc: OK
 u64_neg_scale: OK
+neg_scale_m0_1: OK
+neg_scale_m1: OK
+nan_scale: OK
+fp128_neg_scale: OK
+scale_zero_permitted: OK
 neg_shape: OK
 recovered: OK

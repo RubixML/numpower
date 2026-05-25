@@ -50,6 +50,26 @@ foreach (['loc' => [-1, 1], 'scale' => [0, -1]] as $tag => [$lc, $sc]) {
     }
 }
 
+/* Negative scale rejected (shared validation with normal()). */
+try {
+    NumPower::truncatedNormal([4], 0.0, -1.0, 'float32');
+    echo "BAD: no throw on neg scale\n";
+} catch (\Error $e) {
+    echo str_contains($e->getMessage(), 'scale must be non-negative')
+        ? "neg_scale: OK\n"
+        : "neg_scale: BAD ({$e->getMessage()})\n";
+}
+
+/* NaN scale rejected. */
+try {
+    NumPower::truncatedNormal([4], 0.0, NAN);
+    echo "BAD: no throw on NaN scale\n";
+} catch (\Error $e) {
+    echo str_contains($e->getMessage(), 'scale must be non-negative')
+        ? "nan_scale: OK\n"
+        : "nan_scale: BAD ({$e->getMessage()})\n";
+}
+
 /* Negative shape entries are rejected by ndarray_parse_typed_shape. */
 try {
     NumPower::truncatedNormal([-1], 0, 1, 'float32');
@@ -73,5 +93,7 @@ bad_loc: OK
 bad_scale: OK
 u64_neg_loc: OK
 u64_neg_scale: OK
+neg_scale: OK
+nan_scale: OK
 neg_shape: OK
 recovered: OK

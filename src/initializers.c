@@ -939,10 +939,29 @@ NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
             return rtn;
         }
 
-        /* Every other dtype in the DOUBLE kind gets a transient GPU f32
-           scratch filled by cuRAND, then a single cuda_cast_f32_to_<dst>
-           pass quantises into the destination. The scratch lives only
-           inside this call. */
+        /* `int64` first — its destination has 63-bit mantissa-equivalent
+           range, past float32's 24-bit precision. Allocate an f64
+           scratch directly (no f32 detour, no wasted cuRAND draw, no
+           silently-uninit return on OOM as the previous structure had
+           when scratch64 == NULL fell through to `return rtn`). */
+        if (!strcmp(type, "int64")) {
+            double *scratch64 = NULL;
+            vmalloc((void **)&scratch64,
+                    (unsigned int)((size_t)n * sizeof(double)));
+            if (scratch64 == NULL) {
+                NDArray_FREE(rtn);
+                return NULL;
+            }
+            cuda_normal_f64(scratch64, n, loc, scale);
+            cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
+            vfree(scratch64);
+            return rtn;
+        }
+
+        /* Every other dtype in the DOUBLE kind shares a transient GPU
+           f32 scratch filled by cuRAND, then a single
+           `cuda_cast_f32_to_<dst>` pass quantises into the destination.
+           The scratch lives only inside this call. */
         float *scratch = NULL;
         vmalloc((void **)&scratch, (unsigned int)((size_t)n * sizeof(float)));
         if (scratch == NULL) {
@@ -969,21 +988,9 @@ NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
             cuda_cast_f32_to_i32(scratch, (int32_t *)rtn->data, (int)n);
         } else if (!strcmp(type, "uint32")) {
             cuda_cast_f32_to_u32(scratch, (uint32_t *)rtn->data, (int)n);
-        } else if (!strcmp(type, "int64")) {
-            /* int64 has range past float32's 24-bit mantissa. Promote
-               the scratch to fp64 before casting so values near 2^31..2^63
-               survive without aliasing. */
-            double *scratch64 = NULL;
-            vmalloc((void **)&scratch64,
-                    (unsigned int)((size_t)n * sizeof(double)));
-            if (scratch64 != NULL) {
-                cuda_normal_f64(scratch64, n, loc, scale);
-                cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
-                vfree(scratch64);
-            }
         } else {
             /* Should be unreachable: NDArray_NormalKindFor only returns
-               DOUBLE for these dtypes. */
+               DOUBLE for these dtypes (int64 was handled above). */
             vfree(scratch);
             NDArray_FREE(rtn);
             return NULL;
@@ -1247,9 +1254,29 @@ NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape, int ndim,
             return rtn;
         }
 
-        /* Other dtypes in the DOUBLE kind: generate truncated samples
-           into a transient GPU f32 scratch, then quantise via
-           `cuda_cast_f32_to_<dst>`. */
+        /* `int64` first — past float32's 24-bit mantissa precision, so
+           regenerate at fp64 to preserve the truncation window
+           ([-2σ, +2σ] check stays exact in double for any |loc|,
+           |scale| < 2^53). Dedicated path means no wasted f32 fill and
+           a clean OOM cleanup (the previous structure fell through to
+           `return rtn` if scratch64 alloc failed, leaving uninit data). */
+        if (!strcmp(type, "int64")) {
+            double *scratch64 = NULL;
+            vmalloc((void **)&scratch64,
+                    (unsigned int)((size_t)n * sizeof(double)));
+            if (scratch64 == NULL) {
+                NDArray_FREE(rtn);
+                return NULL;
+            }
+            cuda_truncated_normal_f64(scratch64, n, loc, scale);
+            cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
+            vfree(scratch64);
+            return rtn;
+        }
+
+        /* Other dtypes in the DOUBLE kind share an f32 scratch filled
+           by cuRAND, then a single `cuda_cast_f32_to_<dst>` quantises
+           into the destination. */
         float *scratch = NULL;
         vmalloc((void **)&scratch, (unsigned int)((size_t)n * sizeof(float)));
         if (scratch == NULL) {
@@ -1276,22 +1303,10 @@ NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape, int ndim,
             cuda_cast_f32_to_i32(scratch, (int32_t *)rtn->data, (int)n);
         } else if (!strcmp(type, "uint32")) {
             cuda_cast_f32_to_u32(scratch, (uint32_t *)rtn->data, (int)n);
-        } else if (!strcmp(type, "int64")) {
-            /* int64 with values past 2^24 would alias through float32;
-               regenerate at fp64 precision so the truncation window is
-               preserved (the [-2σ, +2σ] check is exact in double for
-               any |loc|, |scale| < 2^53). */
-            double *scratch64 = NULL;
-            vmalloc((void **)&scratch64,
-                    (unsigned int)((size_t)n * sizeof(double)));
-            if (scratch64 != NULL) {
-                cuda_truncated_normal_f64(scratch64, n, loc, scale);
-                cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
-                vfree(scratch64);
-            }
         } else {
             /* Unreachable: NDArray_NormalKindFor only returns DOUBLE for
-               these dtypes; any other dtype routes to FP128 / UINT64. */
+               these dtypes (int64 was handled above; FP128 / UINT64
+               route through the kind-specific branches below). */
             vfree(scratch);
             NDArray_FREE(rtn);
             return NULL;
@@ -1975,6 +1990,29 @@ NDArray_Uniform(const NDArrayUniformSpec *spec, int *shape, int ndim,
            scratch filled by cuRAND, then a single cuda_cast_f32_to_<dst>
            pass quantises into the destination. Scratch lives only
            inside this call. */
+        /* `int64` first — past float32's 24-bit mantissa precision.
+           Allocate an f64 scratch directly so values near 2^31..2^63
+           survive without aliasing. Dedicated path means no wasted
+           f32 fill and a clean OOM cleanup (the previous structure
+           fell through to `return rtn` if scratch64 alloc failed,
+           leaving uninit data in the destination). */
+        if (!strcmp(type, "int64")) {
+            double *scratch64 = NULL;
+            vmalloc((void **)&scratch64,
+                    (unsigned int)((size_t)n * sizeof(double)));
+            if (scratch64 == NULL) {
+                NDArray_FREE(rtn);
+                return NULL;
+            }
+            cuda_uniform_f64(scratch64, n, low, high);
+            cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
+            vfree(scratch64);
+            return rtn;
+        }
+
+        /* Other dtypes in the DOUBLE kind share an f32 scratch filled
+           by cuRAND, then a single `cuda_cast_f32_to_<dst>` quantises
+           into the destination. */
         float *scratch = NULL;
         vmalloc((void **)&scratch, (unsigned int)((size_t)n * sizeof(float)));
         if (scratch == NULL) {
@@ -2001,21 +2039,9 @@ NDArray_Uniform(const NDArrayUniformSpec *spec, int *shape, int ndim,
             cuda_cast_f32_to_i32(scratch, (int32_t *)rtn->data, (int)n);
         } else if (!strcmp(type, "uint32")) {
             cuda_cast_f32_to_u32(scratch, (uint32_t *)rtn->data, (int)n);
-        } else if (!strcmp(type, "int64")) {
-            /* int64 has range past float32's 24-bit mantissa. Promote
-               the scratch to fp64 before casting so values near 2^31..2^63
-               survive without aliasing. */
-            double *scratch64 = NULL;
-            vmalloc((void **)&scratch64,
-                    (unsigned int)((size_t)n * sizeof(double)));
-            if (scratch64 != NULL) {
-                cuda_uniform_f64(scratch64, n, low, high);
-                cuda_cast_f64_to_i64(scratch64, (int64_t *)rtn->data, (int)n);
-                vfree(scratch64);
-            }
         } else {
             /* Should be unreachable: NDArray_UniformKindFor only returns
-               DOUBLE for these dtypes. */
+               DOUBLE for these dtypes (int64 was handled above). */
             vfree(scratch);
             NDArray_FREE(rtn);
             return NULL;
