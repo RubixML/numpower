@@ -168,6 +168,105 @@ void cuda_normal_dd_affine(const double *z, double *dst, long n,
                            double loc_hi, double loc_lo,
                            double scale_hi, double scale_lo);
 
+/**
+ * @brief Fill a GPU float32 buffer with uniform `[low, high)` samples.
+ *
+ * Wraps `curandGenerateUniform` to produce `(0, 1]` samples directly
+ * into @p d_data, then reflects via `1 - u` and applies the affine
+ * `low + (1 - u) * (high - low)` so the closed endpoint sits at
+ * @p low (matching numpy's `[low, high)` contract). cuRAND's uniform
+ * generator has no parity restriction, so the call is single-pass into
+ * the destination with no pad buffer. The seed is fresh per call
+ * (`cuda_normal_next_seed`) so successive calls in the same process
+ * produce independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n floats.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  low    Lower bound (inclusive).
+ * @param[in]  high   Upper bound (exclusive).
+ */
+void cuda_uniform_f32(float *d_data, long n, float low, float high);
+
+/**
+ * @brief Fill a GPU float64 buffer with uniform `[low, high)` samples.
+ *
+ * Companion to `cuda_uniform_f32` for double precision. Uses
+ * `curandGenerateUniformDouble`; the affine reflection runs in fp64 so
+ * the full 53-bit mantissa range is preserved across `[low, high)`.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n doubles.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  low    Lower bound (inclusive).
+ * @param[in]  high   Upper bound (exclusive).
+ */
+void cuda_uniform_f64(double *d_data, long n, double low, double high);
+
+/**
+ * @brief Widen a GPU float64 uniform stream into the on-device DD layout.
+ *
+ * Reads `[0, 1)` doubles from @p u (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and evaluates
+ * `value = low + u * range` in true double-double arithmetic on
+ * device. `range = high - low` is computed on the host in fp128/DD
+ * precision and passed as a DD pair so the caller's fp128 bounds
+ * survive bit-for-bit into the interleaved (hi, lo) output. Used by
+ * `NDArray_Uniform` to keep the fp128 GPU path VRAM-direct.
+ *
+ * @param[in]  u         Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  low_hi    DD high word of the lower bound.
+ * @param[in]  low_lo    DD low word of the lower bound.
+ * @param[in]  range_hi  DD high word of `(high - low)`.
+ * @param[in]  range_lo  DD low word of `(high - low)`.
+ */
+void cuda_uniform_dd_affine(const double *u, double *dst, long n,
+                             double low_hi, double low_lo,
+                             double range_hi, double range_lo);
+
+/**
+ * @brief Apply the normal/truncated-normal `loc + (int64)(scale * z)`
+ *        affine on the GPU and store the result as uint64.
+ *
+ * Reads (possibly truncated) standard-normal doubles from @p z and
+ * writes `dst[i] = loc + (uint64_t)((int64_t)(scaled * z[i]))`. The
+ * signed→unsigned wrap is intentional — matches numpy's `astype(uint64)`
+ * semantics for negative floats and lets a negative z subtract from
+ * @p loc through modular arithmetic. Used by `NDArray_Normal` and
+ * `NDArray_TruncatedNormal` to keep the u64 GPU path VRAM-direct (no
+ * host staging of the result).
+ *
+ * @param[in]  z      Length-@p n GPU buffer of standard-normal or
+ *                    truncated-standard-normal doubles (caller picks
+ *                    the source by which cuRAND wrapper populated it).
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  loc    Distribution mean (uint64).
+ * @param[in]  scaled Distribution stddev coerced to double.
+ */
+void cuda_normal_u64_affine(const double *z, unsigned long long *dst, long n,
+                             unsigned long long loc, double scaled);
+
+/**
+ * @brief Apply the uniform `low + (uint64)(width * u)` affine on the GPU.
+ *
+ * Reads `[0, 1)` doubles from @p u (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and writes
+ * `dst[i] = low + (uint64_t)(widthd * u[i])`. The width is a `double`
+ * because the cast `(double)(high - low)` happens once on the host —
+ * widths past 2^53 lose the same precision the CPU filler does
+ * (documented invariant). The unsigned add wraps modulo 2^64. Used by
+ * `NDArray_Uniform` to keep the u64 GPU path VRAM-direct.
+ *
+ * @param[in]  u      Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  low    Lower bound (uint64).
+ * @param[in]  widthd `(double)(high - low)`.
+ */
+void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
+                              unsigned long long low, double widthd);
+
 //Doubles
 void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements);
 

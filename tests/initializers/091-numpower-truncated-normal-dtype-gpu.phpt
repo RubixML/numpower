@@ -94,8 +94,11 @@ echo 'fp128_gpu: gpu=', ($g->isGPU() ? 1 : 0),
 $g = NumPower::truncatedNormal([16], 0, 1000, 'int64', NUMPOWER_CUDA);
 check_window_gpu($g, 0.0, 1000.0, 'window_gpu_i64', 1.0);
 
-/* GPU uint64 — host fill + TypedH2D. Still bounded to [loc-2σ, loc+2σ]. */
-$g = NumPower::truncatedNormal([16], '1000000', '100', 'uint64', NUMPOWER_CUDA);
+/* GPU uint64 — VRAM-direct via cuda_truncated_normal_f64 +
+   cuda_normal_u64_affine (no host staging of the result). Still bounded
+   to [loc-2σ, loc+2σ] = [999800, 1000200]. Larger n raises the chance
+   any rejection-sampling gap surfaces as out-of-window. */
+$g = NumPower::truncatedNormal([1024], '1000000', '100', 'uint64', NUMPOWER_CUDA);
 $arr = $g->cpu()->toArray();
 $bad = 0;
 foreach ($arr as $v) {

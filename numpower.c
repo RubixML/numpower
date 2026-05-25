@@ -1930,6 +1930,108 @@ ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
 }
 
 /**
+ * @brief Initialise an `NDArrayUniformSpec` with U([0, 1)) defaults that
+ *        match @p type's arithmetic kind.
+ *
+ * Parallel of `ndarray_normal_spec_defaults`: the kind comes from
+ * `NDArray_UniformKindFor`; the matching union arm is set to `low = 0`
+ * and `high = 1` in that kind's native precision (`fp128` zero / one
+ * for FP128, native `uint64_t` 0 / 1 for UINT64, `double` 0.0 / 1.0 for
+ * DOUBLE). The defaults match numpy's `random.uniform` defaults; callers
+ * that want non-default bounds (the `NumPower::uniform` PHP entry point)
+ * then call `ndarray_uniform_spec_overlay` to pull values from
+ * user-supplied zvals.
+ *
+ * @param[out] spec Spec to initialise; `kind` and the active union arm are set.
+ * @param[in]  type Canonical dtype string (selects the kind).
+ */
+static void
+ndarray_uniform_spec_defaults(NDArrayUniformSpec *spec, const char *type) {
+    spec->kind = NDArray_UniformKindFor(type);
+    switch (spec->kind) {
+        case NDARRAY_UNIFORM_KIND_FP128:
+            spec->v.f128.low  = NDARRAY_FP128_ZERO();
+            spec->v.f128.high = NDARRAY_FP128_FROM_I64(1);
+            break;
+        case NDARRAY_UNIFORM_KIND_UINT64:
+            spec->v.u64.low  = 0;
+            spec->v.u64.high = 1;
+            break;
+        case NDARRAY_UNIFORM_KIND_DOUBLE:
+        default:
+            spec->kind        = NDARRAY_UNIFORM_KIND_DOUBLE;
+            spec->v.d.low     = 0.0;
+            spec->v.d.high    = 1.0;
+            break;
+    }
+}
+
+/**
+ * @brief Overlay user-supplied @p low_zv / @p high_zv onto a spec whose
+ *        defaults were initialised by `ndarray_uniform_spec_defaults`.
+ *
+ * Parallel of `ndarray_normal_spec_overlay`: each non-NULL zval is
+ * coerced into the active kind's native scalar type via the matching
+ * `coerce_zval_to_*` helper. A failed coercion leaves a catchable
+ * `Error` in flight and returns 0; the caller is expected to release
+ * any shape buffer it allocated and return.
+ *
+ * @param[in,out] spec     Spec carrying the dtype-aware defaults; the
+ *                         active union arm is overwritten on success.
+ * @param[in]     op       Method name prefix used in error messages
+ *                         (e.g. "uniform").
+ * @param[in]     low_zv   Optional user-supplied low (NULL keeps the
+ *                         default).
+ * @param[in]     high_zv  Optional user-supplied high (NULL keeps the
+ *                         default).
+ * @return 1 on success, 0 on type rejection (Error in flight).
+ */
+static int
+ndarray_uniform_spec_overlay(NDArrayUniformSpec *spec, const char *op,
+                              zval *low_zv, zval *high_zv) {
+    switch (spec->kind) {
+        case NDARRAY_UNIFORM_KIND_FP128:
+            if (low_zv != NULL &&
+                !coerce_zval_to_fp128(low_zv, op, "low",
+                                       &spec->v.f128.low)) {
+                return 0;
+            }
+            if (high_zv != NULL &&
+                !coerce_zval_to_fp128(high_zv, op, "high",
+                                       &spec->v.f128.high)) {
+                return 0;
+            }
+            break;
+        case NDARRAY_UNIFORM_KIND_UINT64:
+            if (low_zv != NULL &&
+                !coerce_zval_to_uint64(low_zv, op, "low",
+                                        &spec->v.u64.low)) {
+                return 0;
+            }
+            if (high_zv != NULL &&
+                !coerce_zval_to_uint64(high_zv, op, "high",
+                                        &spec->v.u64.high)) {
+                return 0;
+            }
+            break;
+        case NDARRAY_UNIFORM_KIND_DOUBLE:
+        default:
+            if (low_zv != NULL &&
+                !coerce_zval_to_double(low_zv, op, "low",
+                                        &spec->v.d.low)) {
+                return 0;
+            }
+            if (high_zv != NULL &&
+                !coerce_zval_to_double(high_zv, op, "high",
+                                        &spec->v.d.high)) {
+                return 0;
+            }
+            break;
+    }
+    return 1;
+}
+
+/**
  * @brief `NumPower::normal(shape, loc = 0.0, scale = 1.0, dtype = "float32", device = 0): NDArray`.
  *
  * Generates an NDArray of the requested shape filled with samples drawn
@@ -2233,38 +2335,90 @@ PHP_METHOD(NumPower, poisson) {
 }
 
 /**
- * NumPower::uniform
+ * @brief `NumPower::uniform(shape, low = 0.0, high = 1.0, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Generates an NDArray of the requested shape filled with samples drawn
+ * from the continuous uniform distribution `U([low, high))`. The result
+ * dtype and residency device are caller-selectable; on `device == 1`
+ * (GPU) the buffer is allocated directly in VRAM (via `NDArray_Empty`)
+ * and populated by cuRAND (`curandGenerateUniform` /
+ * `curandGenerateUniformDouble`) plus `cuda_cast_*` quantisation for
+ * non-fp32/fp64 dtypes — no full-size host staging of the result. For
+ * `dtype == float128` on GPU the values are computed in true
+ * double-double arithmetic on device via a custom
+ * `cuda_uniform_dd_affine` kernel so the user's fp128 low/high are
+ * preserved bit-for-bit through the (hi, lo) DD layout.
+ *
+ * `low` and `high` accept `int | float | string`. The string form is
+ * the only precision-loss-free route for the wide dtypes:
+ * `float128` strings parse via `strtoflt128` (or the DD fallback),
+ * `uint64` strings via `strtoull`. Every other dtype is coerced through
+ * `double`, which represents each smaller dtype's range exactly.
+ *
+ * The result range is `[low, high)` — closed at @c low, open at
+ * @c high. cuRAND's native uniform output is `(0, 1]`, so the GPU
+ * affine reflects via `1 - u` before scaling so the closed endpoint
+ * lands at @c low (matches numpy's contract).
+ *
+ * `device` is `0` for CPU (default) or `1` for GPU. The same
+ * `NUMPOWER_CPU` / `NUMPOWER_CUDA` constants the rest of the API uses.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_uniform, 0, 0, 1)
-ZEND_ARG_INFO(0, size)
-ZEND_ARG_INFO(0, low)
-ZEND_ARG_INFO(0, high)
+    ZEND_ARG_INFO(0, shape)
+    ZEND_ARG_INFO(0, low)
+    ZEND_ARG_INFO(0, high)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, uniform) {
-    NDArray *rtn = NULL;
-    int *shape;
-    zval* size;
-    double low = 0.0, high = 1.0;
-    ZEND_PARSE_PARAMETERS_START(1, 3)
-    Z_PARAM_ZVAL(size)
+    zval *shape_zval;
+    zval *low_zv  = NULL;
+    zval *high_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(1, 5)
+        Z_PARAM_ZVAL(shape_zval)
     Z_PARAM_OPTIONAL
-    Z_PARAM_DOUBLE(low)
-    Z_PARAM_DOUBLE(high)
+        Z_PARAM_ZVAL(low_zv)
+        Z_PARAM_ZVAL(high_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(size);
-    if (nda == NULL) {
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
-    shape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        shape[i] = (int) NDArray_F32DATA(nda)[i];
+
+    /* Defaults are dtype-aware: `low = 0` / `high = 1` are encoded in
+       the same precision as any explicit arg so the three dispatch
+       paths stay symmetric. `ndarray_uniform_spec_overlay` then merges
+       any user-supplied low/high onto those defaults. */
+    NDArrayUniformSpec spec;
+    ndarray_uniform_spec_defaults(&spec, ndarrayDataType);
+    if (!ndarray_uniform_spec_overlay(&spec, "uniform", low_zv, high_zv)) {
+        efree(shape);
+        return;
     }
-    rtn = NDArray_Uniform(low, high, shape, NDArray_NUMELEMENTS(nda));
-    NDArray_FREE(nda);
-    ndarray_init_new_object(rtn, return_value);
+
+    NDArray *rtn = NDArray_Uniform(&spec, shape, ndim, ndarrayDataType,
+                                    parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Hand back an NDArray even for a 0-D shape — matches every other
+       typed factory and preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**

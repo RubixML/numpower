@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   # =========================================================================
-  # Linux matrix: Ubuntu (22.04 / 26.04) × PHP (8.1–8.5) × CPU / CUDA
+  # Linux matrix: Ubuntu (22.04 / 24.04) × PHP (8.1–8.5) × CPU / CUDA
   # 20 combinations.
   # =========================================================================
   test:
@@ -24,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:   [ubuntu-22.04, ubuntu-24.04, ubuntu-26.04]
+        os:   [ubuntu-22.04, ubuntu-24.04]
         php:  ['8.1', '8.2', '8.3', '8.4', '8.5']
         cuda: [false, true]
 

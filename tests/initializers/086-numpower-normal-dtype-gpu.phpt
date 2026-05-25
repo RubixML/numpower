@@ -101,6 +101,20 @@ echo 'int64_gpu_basic: ', ($ok ? 'OK' : 'BAD'), "\n";
 $g = NumPower::normal([16], '18446744073709551000', '10', 'uint64', NUMPOWER_CUDA);
 $ok = $g->isGPU() && $g->shape() === [16];
 echo 'uint64_gpu_wide: ', ($ok ? 'OK' : 'BAD'), "\n";
+
+/* GPU uint64 — VRAM-direct via cuda_normal_u64_affine (no host
+   staging of the result). With loc=1e9, scale=1000 every sample
+   should land within ~±6σ = [999994000, 1000006000] in practice. */
+$g = NumPower::normal([1024], '1000000000', '1000', 'uint64', NUMPOWER_CUDA);
+$arr = $g->cpu()->toArray();
+$min = PHP_INT_MAX; $max = 0;
+foreach ($arr as $v) {
+    $iv = (int)$v;
+    if ($iv < $min) $min = $iv;
+    if ($iv > $max) $max = $iv;
+}
+$range_ok = ($min > 999990000) && ($max < 1000010000);
+echo 'uint64_gpu_dist_range: ', ($range_ok ? 'OK' : "BAD($min..$max)"), "\n";
 ?>
 --EXPECT--
 float4: gpu=1 shape=OK cpu_back_shape=OK
@@ -124,3 +138,4 @@ multidim_gpu: shape=16x64 device=gpu
 fp128_gpu_basic: OK
 int64_gpu_basic: OK
 uint64_gpu_wide: OK
+uint64_gpu_dist_range: OK

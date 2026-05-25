@@ -3028,4 +3028,218 @@ void cuda_normal_dd_affine(const double *z, double *dst, long n,
                                                       scale_hi, scale_lo);
 }
 
+/* ───────────────── Uniform sampler ─────────────────────────────────────── */
+
+/**
+ * @brief Per-thread affine for the float32 uniform path.
+ *
+ * cuRAND's `curandGenerateUniform` returns values in `(0, 1]`. To match
+ * numpy's `[low, high)` contract we reflect with `1 - u`, mapping to
+ * `[0, 1)`, then evaluate `low + (1 - u) * (high - low)` so the closed
+ * endpoint sits at `low` (and the open endpoint at `high`). All math is
+ * done in single precision to keep the float32 path's quantisation
+ * deterministic.
+ *
+ * @param[in,out] data Length-@p n buffer of `(0, 1]` samples on entry; on
+ *                     return each slot holds `low + (1 - u_in) * (high - low)`.
+ * @param[in]     n    Element count.
+ * @param[in]     low  Lower bound (inclusive).
+ * @param[in]     high Upper bound (exclusive).
+ */
+__global__ void cuda_uniform_affine_kernel_f32(float *data, long n,
+                                                 float low, float high) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        data[i] = low + (1.0f - data[i]) * (high - low);
+    }
+}
+
+/**
+ * @brief Float64 companion of `cuda_uniform_affine_kernel_f32`.
+ *
+ * Identical reflection / affine, evaluated in double precision so the
+ * fp64 path keeps full 53-bit mantissa precision across the whole
+ * `[low, high)` range.
+ *
+ * @param[in,out] data Length-@p n buffer of `(0, 1]` samples on entry.
+ * @param[in]     n    Element count.
+ * @param[in]     low  Lower bound (inclusive).
+ * @param[in]     high Upper bound (exclusive).
+ */
+__global__ void cuda_uniform_affine_kernel_f64(double *data, long n,
+                                                 double low, double high) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        data[i] = low + (1.0 - data[i]) * (high - low);
+    }
+}
+
+void cuda_uniform_f32(float *d_data, long n, float low, float high) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    /* `curandGenerateUniform` has no parity restriction (unlike
+       `curandGenerateNormal`) so a single in-place call into the
+       destination is enough; no pad buffer needed. */
+    cuda_normal_check(curandGenerateUniform(gen, d_data, (size_t)n));
+    curandDestroyGenerator(gen);
+
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_affine_kernel_f32<<<blocks, block>>>(d_data, n, low, high);
+}
+
+void cuda_uniform_f64(double *d_data, long n, double low, double high) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    cuda_normal_check(curandGenerateUniformDouble(gen, d_data, (size_t)n));
+    curandDestroyGenerator(gen);
+
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_affine_kernel_f64<<<blocks, block>>>(d_data, n, low, high);
+}
+
+/**
+ * @brief Per-thread DD affine kernel for the float128 uniform GPU path.
+ *
+ * Reads one `[0, 1)` double `u[i]` (the reflection from `(0, 1]` is
+ * applied upstream by `cuda_uniform_f64` with `low=0, high=1`), and
+ * computes `low + u * range` in true double-double arithmetic on
+ * device. `range = high - low` is supplied as a DD pair computed on
+ * the host so the kernel itself does not need to perform a DD
+ * subtraction. The result is stored at `dst[2i..2i+1]`. The only
+ * precision loss along the pipeline is the underlying uniform sample,
+ * which is inherently 53-bit (cuRAND's `curandGenerateUniformDouble`).
+ *
+ * @param[in]  u         Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  low_hi    DD high word of the lower bound.
+ * @param[in]  low_lo    DD low word of the lower bound.
+ * @param[in]  range_hi  DD high word of `(high - low)`.
+ * @param[in]  range_lo  DD low word of `(high - low)`.
+ */
+__global__ void cuda_uniform_dd_affine_kernel(const double *u, double *dst,
+                                                long n,
+                                                double low_hi, double low_lo,
+                                                double range_hi, double range_lo) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dd_real udd    = dd_make(u[i], 0.0);
+        dd_real range  = dd_make(range_hi, range_lo);
+        dd_real low    = dd_make(low_hi, low_lo);
+        dd_real prod   = dd_mul(udd, range);
+        dd_real result = dd_add(low, prod);
+        dst[2*i]     = result.hi;
+        dst[2*i + 1] = result.lo;
+    }
+}
+
+void cuda_uniform_dd_affine(const double *u, double *dst, long n,
+                             double low_hi, double low_lo,
+                             double range_hi, double range_lo) {
+    if (u == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_dd_affine_kernel<<<blocks, block>>>(u, dst, n,
+                                                       low_hi, low_lo,
+                                                       range_hi, range_lo);
+}
+
+/* ───────────────── uint64 affine kernels ──────────────────────────────── */
+
+/**
+ * @brief Per-thread normal/truncated-normal affine kernel for the uint64
+ *        GPU path.
+ *
+ * Reads one (possibly truncated) standard-normal double `z[i]`,
+ * evaluates `delta_s = (int64_t)(scaled * z[i])` (signed so negative-z
+ * samples subtract from `loc`), and writes `loc + (uint64_t)delta_s` to
+ * `dst[i]`. The signed→unsigned cast wraps modulo 2^64 — well-defined
+ * in C/C++ for unsigned destinations and matches the CPU filler's
+ * arithmetic. Used for both `NDArray_Normal` and `NDArray_TruncatedNormal`
+ * (the caller picks the source distribution by which cuRAND fill
+ * populates @p z).
+ *
+ * @param[in]  z      Length-@p n GPU buffer of standard-normal (or
+ *                    truncated standard-normal) doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  loc    Distribution mean (uint64).
+ * @param[in]  scaled Distribution stddev coerced to double.
+ */
+__global__ void cuda_normal_u64_affine_kernel(const double *z,
+                                                unsigned long long *dst,
+                                                long n,
+                                                unsigned long long loc,
+                                                double scaled) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long delta_s = (long long)(scaled * z[i]);
+        dst[i] = loc + (unsigned long long)delta_s;
+    }
+}
+
+void cuda_normal_u64_affine(const double *z, unsigned long long *dst, long n,
+                             unsigned long long loc, double scaled) {
+    if (z == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_normal_u64_affine_kernel<<<blocks, block>>>(z, dst, n, loc, scaled);
+}
+
+/**
+ * @brief Per-thread uniform affine kernel for the uint64 GPU path.
+ *
+ * Reads one `[0, 1)` double `u[i]` (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and writes
+ * `low + (uint64_t)(widthd * u[i])` to `dst[i]`. The width is supplied
+ * as a `double` because the cast `(double)(high - low)` happens once on
+ * the host — for widths past 2^53 this is the same precision floor
+ * the CPU filler hits (documented invariant). The unsigned add wraps
+ * modulo 2^64.
+ *
+ * @param[in]  u      Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  low    Lower bound (uint64).
+ * @param[in]  widthd `(double)(high - low)`.
+ */
+__global__ void cuda_uniform_u64_affine_kernel(const double *u,
+                                                 unsigned long long *dst,
+                                                 long n,
+                                                 unsigned long long low,
+                                                 double widthd) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = low + (unsigned long long)(widthd * u[i]);
+    }
+}
+
+void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
+                              unsigned long long low, double widthd) {
+    if (u == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_u64_affine_kernel<<<blocks, block>>>(u, dst, n, low, widthd);
+}
+
 }
