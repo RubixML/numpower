@@ -3242,4 +3242,59 @@ void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
     cuda_uniform_u64_affine_kernel<<<blocks, block>>>(u, dst, n, low, widthd);
 }
 
+/* ───────────────── Poisson sampler ─────────────────────────────────────── */
+
+int cuda_poisson_u32(unsigned int *d_data, long n, double lam) {
+    if (d_data == NULL || n <= 0) return 1;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return 0;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    /* `curandGeneratePoisson` writes `n` uint32 samples directly into
+       @p d_data — no parity restriction, no scratch buffer required.
+       Internally cuRAND picks between rejection-from-normal and PTRS
+       depending on @p lam. cuRAND returns `CURAND_STATUS_OUT_OF_RANGE`
+       (or a different non-success code) when @p lam exceeds the
+       generator's supported range; we surface that failure to the
+       caller so a clear error can be raised at the PHP boundary
+       instead of returning a silently-zero buffer. */
+    int ok = cuda_normal_check(curandGeneratePoisson(gen, d_data,
+                                                      (size_t)n, lam));
+    curandDestroyGenerator(gen);
+    return ok;
+}
+
+/**
+ * @brief Per-thread widening kernel: write each u32 sample as a DD pair
+ *        with `lo = 0.0`.
+ *
+ * The destination layout is the interleaved (hi, lo) format the rest of
+ * the fp128 GPU pipeline uses: `dst[2i] = (double)src[i]`,
+ * `dst[2i + 1] = 0.0`. Every uint32 fits exactly in fp64's 53-bit
+ * mantissa, so the high word carries the integer count without loss
+ * and the low word is identically zero.
+ *
+ * @param[in]  src Length-@p n GPU buffer of uint32 Poisson samples.
+ * @param[out] dst Length-`2*n` GPU buffer of (hi, lo) DD pairs.
+ * @param[in]  n   Element count.
+ */
+__global__ void cuda_cast_u32_to_dd_kernel(const unsigned int *src,
+                                             double *dst, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[2*i]     = (double)src[i];
+        dst[2*i + 1] = 0.0;
+    }
+}
+
+void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n) {
+    if (src == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_cast_u32_to_dd_kernel<<<blocks, block>>>(src, dst, n);
+}
+
 }

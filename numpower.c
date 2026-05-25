@@ -2283,55 +2283,93 @@ PHP_METHOD(NumPower, standardNormal) {
 }
 
 /**
- * NumPower::poisson
+ * @brief `NumPower::poisson(shape, lam = 1.0, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Generates an NDArray of the requested shape filled with samples drawn
+ * from a Poisson distribution with rate parameter @p lam. The result
+ * dtype and residency device are caller-selectable; on `device == 1`
+ * (GPU) the buffer is allocated directly in VRAM (via `NDArray_Empty`)
+ * and populated by cuRAND (`curandGeneratePoisson`) + `cuda_cast_*`
+ * quantisation for non-uint32 dtypes — no full-size host staging of
+ * the result.
+ *
+ * `lam` accepts `int | float | string`. The string form is the
+ * precision-loss-free parser path consistent with the rest of the
+ * random-family entry points; for Poisson the rate is internally a
+ * `double` (the algorithm's numerical core is fp64 on both CPU and
+ * GPU), so wide-range strings funnel through `strtod` and are limited
+ * to fp64 precision.
+ *
+ * CPU sampling uses Knuth's multiplicative method for `lam < 30` and
+ * Hörmann's PTRS rejection algorithm for `lam ≥ 30` — same threshold
+ * as numpy's `random_poisson`, so the per-sample cost stays bounded
+ * regardless of the rate. The legacy implementation used `expf(-lam)`
+ * which underflowed to `0` for `lam ≥ 88` and caused the inner loop
+ * to spin forever — that bug is fixed.
+ *
+ * `device` is `0` for CPU (default) or `1` for GPU. The same
+ * `NUMPOWER_CPU` / `NUMPOWER_CUDA` constants the rest of the API uses.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_poisson, 0, 0, 1)
-    ZEND_ARG_ARRAY_INFO(0, shape, 0)
-    ZEND_ARG_TYPE_INFO(0, lam, IS_DOUBLE, 0)
+    ZEND_ARG_INFO(0, shape)
+    ZEND_ARG_INFO(0, lam)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, poisson) {
-    NDArray *rtn = NULL;
-    zval* shape;
-    HashTable *shape_ht;
-    zend_string *key;
-    zend_ulong idx;
-    zval *val;
-    double lam = 1.0;
+    zval *shape_zval;
+    zval *lam_zv = NULL;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
 
-    ZEND_PARSE_PARAMETERS_START(1, 2)
-        Z_PARAM_ARRAY(shape)
+    ZEND_PARSE_PARAMETERS_START(1, 4)
+        Z_PARAM_ZVAL(shape_zval)
     Z_PARAM_OPTIONAL
-        Z_PARAM_DOUBLE(lam)
+        Z_PARAM_ZVAL(lam_zv)
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 
-    shape_ht = Z_ARRVAL_P(shape);
-
-    ZEND_HASH_FOREACH_KEY_VAL(shape_ht, idx, key, val) {
-        if (Z_TYPE_P(val) != IS_LONG) {
-            zend_throw_error(NULL, "Invalid parameter: Shape elements must be integers.");
-            return;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    NDArray *nda = ZVAL_TO_NDARRAY(shape);
-
-    if (nda == NULL) {
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
 
-    if (NDArray_NUMELEMENTS(nda) == 0) {
-        NDArray_FREE(nda);
-        zend_throw_error(NULL, "Invalid parameter: Expected a non-empty array.");
+    /* Poisson's rate is always a `double` internally; the int|float|string
+       coercion path matches every other random-family entry point. */
+    double lam = 1.0;
+    if (lam_zv != NULL && !coerce_zval_to_double(lam_zv, "poisson", "lam",
+                                                  &lam)) {
+        efree(shape);
+        return;
+    }
+    if (!(lam >= 0.0)) {
+        /* `!(lam >= 0.0)` catches negative values *and* NaN — the
+           algorithm constants (`exp(-lam)`, `sqrt(lam)`) would otherwise
+           produce silent NaN propagation. */
+        efree(shape);
+        zend_throw_error(NULL,
+            "poisson: lam must be a non-negative real number");
         return;
     }
 
-    rtn = NDArray_Poisson(lam, NDArray_ToIntVector(nda), NDArray_NUMELEMENTS(nda));
-
-    NDArray_FREE(nda);
-    ndarray_init_new_object(rtn, return_value);
+    NDArray *rtn = NDArray_Poisson(lam, shape, ndim, ndarrayDataType,
+                                    parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Hand back an NDArray even for a 0-D shape — matches every other
+       typed factory and preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**

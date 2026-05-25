@@ -1351,32 +1351,397 @@ NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape, int ndim,
     return NULL;
 }
 
+/* ───────────────── Poisson sampler ─────────────────────────────────────── */
+
 /**
- * Random samples from a Poisson distribution.
+ * @brief Cached per-call constants for the CPU Poisson sampler.
  *
- * @param size
- * @return
+ * Selected once at the top of every `NDArray_Poisson` CPU branch and
+ * reused across every element so the per-sample work is `O(1)` for
+ * PTRS and `O(λ)` only for the Knuth branch where it's unavoidable.
+ * Hoisting the constants out of the per-element loop is also the fix
+ * for the legacy bug where `L = expf(-lam)` was recomputed in every
+ * inner-loop iteration.
+ */
+typedef struct {
+    double lam;
+    int    use_ptrs;
+    /* Knuth-multiplicative path (lam < 30): pre-exponential. */
+    double L;
+    /* PTRS path (Hörmann 1993, lam >= 30): rejection-region constants. */
+    double smu;
+    double b;
+    double a;
+    double inv_alpha;
+    double v_r;
+} ndarray_poisson_ctx;
+
+/**
+ * @brief Choose Knuth vs PTRS and precompute the per-call constants.
+ *
+ * Threshold: `lam < 30` keeps Knuth (expected `λ + 1` PRNG draws per
+ * sample, cache-friendly). Beyond that, Knuth becomes wasteful and
+ * `exp(-lam)` starts to lose precision; PTRS (Patchwork Rejection from
+ * Triangular and Symmetric region — Hörmann 1993) takes a constant
+ * `~1.3` PRNG draws per sample and stays numerically stable up to
+ * lam ≈ 10^9. The threshold matches numpy's `random_poisson` switch
+ * point (`distributions.c`).
+ *
+ * @param[out] ctx Receives the chosen branch + precomputed constants.
+ * @param[in]  lam Distribution rate (λ); must be ≥ 0. lam = 0 is
+ *                 special-cased by callers (always returns 0).
+ */
+static void ndarray_poisson_ctx_init(ndarray_poisson_ctx *ctx, double lam) {
+    ctx->lam = lam;
+    if (lam < 30.0) {
+        ctx->use_ptrs = 0;
+        ctx->L = exp(-lam);
+    } else {
+        ctx->use_ptrs  = 1;
+        ctx->smu       = sqrt(lam);
+        ctx->b         = 0.931 + 2.53 * ctx->smu;
+        ctx->a         = -0.059 + 0.02483 * ctx->b;
+        ctx->inv_alpha = 1.1239 + 1.1328 / (ctx->b - 3.4);
+        ctx->v_r       = 0.9277 - 3.6224 / (ctx->b - 2.0);
+    }
+}
+
+/**
+ * @brief Knuth's multiplicative method for small λ.
+ *
+ * Draws k uniform `[0, 1)` samples and counts until the running
+ * product drops below `L = exp(-λ)`. Expected runtime is `λ + 1`
+ * PRNG calls per sample, so this branch is reserved for `λ < 30`.
+ *
+ * The uniform draw uses `rand() / (RAND_MAX + 1.0)` — the canonical
+ * formulation that never yields 1.0 exactly (the legacy
+ * `rand() / RAND_MAX` could, which was harmless here but inconsistent
+ * with the rest of the rng plumbing).
+ *
+ * @param[in] L Precomputed `exp(-λ)`.
+ * @return One Poisson sample (a non-negative integer as a double).
+ */
+static double ndarray_poisson_sample_knuth(double L) {
+    double p = 1.0;
+    int    k = 0;
+    do {
+        k++;
+        double u = (double)rand() / ((double)RAND_MAX + 1.0);
+        p *= u;
+    } while (p > L);
+    return (double)(k - 1);
+}
+
+/**
+ * @brief Hörmann's PTRS rejection sampler for large λ.
+ *
+ * Reference: W. Hörmann, "The transformed rejection method for
+ * generating Poisson random variables" (Insurance: Math. & Econ. 12,
+ * 1993, p. 41). Same constants and dispatch as numpy's
+ * `random_poisson_ptrs`. Per-call: 2 uniforms + `log` + `lgamma`; the
+ * accept rate is `~78%`, so a sample averages ~1.3 PRNG draws regardless
+ * of λ. Numerically stable from `λ = 30` up to `λ ≈ 10^9`.
+ *
+ * @param[in] ctx Initialised context (PTRS branch).
+ * @return One Poisson sample (a non-negative integer as a double).
+ */
+static double ndarray_poisson_sample_ptrs(const ndarray_poisson_ctx *ctx) {
+    double lam       = ctx->lam;
+    double b         = ctx->b;
+    double a         = ctx->a;
+    double inv_alpha = ctx->inv_alpha;
+    double v_r       = ctx->v_r;
+    for (;;) {
+        double u  = ((double)rand() / ((double)RAND_MAX + 1.0)) - 0.5;
+        double v  = (double)rand() / ((double)RAND_MAX + 1.0);
+        double us = 0.5 - fabs(u);
+        double k  = floor((2.0 * a / us + b) * u + lam + 0.43);
+        if (k < 0.0) continue;
+        if (us >= 0.07 && v <= v_r) return k;
+        if (us < 0.013 && v > us)   continue;
+        if (log(v) + log(inv_alpha) - log(a / (us * us) + b) <=
+            -lam + k * log(lam) - lgamma(k + 1.0)) {
+            return k;
+        }
+    }
+}
+
+/**
+ * @brief Draw one Poisson(λ) sample on the CPU.
+ *
+ * Dispatches to Knuth or PTRS via the cached context. For `λ == 0` the
+ * sample is identically 0 (degenerate Poisson). Negative λ is rejected
+ * upstream by the PHP entry point so this helper trusts its input.
+ *
+ * @param[in] ctx Initialised context.
+ * @return One Poisson sample (a non-negative integer as a double).
+ */
+static double ndarray_poisson_sample(const ndarray_poisson_ctx *ctx) {
+    if (ctx->lam <= 0.0) return 0.0;
+    if (ctx->use_ptrs)   return ndarray_poisson_sample_ptrs(ctx);
+    return ndarray_poisson_sample_knuth(ctx->L);
+}
+
+/**
+ * @brief CPU fill: write @p n Poisson(@p lam) samples into @p data of @p type.
+ *
+ * Generates each sample as a `double` via `ndarray_poisson_sample` and
+ * stores it through `ndarray_set_from_double` so every dtype gets its
+ * dtype-correct quantisation. Covers every dtype except float128 (DD
+ * widening) and uint64 (full 64-bit range) — both have dedicated
+ * fillers below.
+ *
+ * @param[out] data Destination host buffer; ≥ `n * get_type_size(type)` bytes.
+ * @param[in]  n    Element count.
+ * @param[in]  type Canonical dtype string.
+ * @param[in]  lam  Distribution rate (λ); ≥ 0.
+ */
+static void poisson_fill_cpu_double(char *data, long n, const char *type,
+                                      double lam) {
+    ndarray_poisson_ctx ctx;
+    ndarray_poisson_ctx_init(&ctx, lam);
+    for (long i = 0; i < n; i++) {
+        double v = ndarray_poisson_sample(&ctx);
+        ndarray_set_from_double(type, data, (size_t)i, v);
+    }
+}
+
+/**
+ * @brief CPU fill for the float128 dtype.
+ *
+ * Each Poisson sample is an integer (≤ ~10^9 in practice), so widening
+ * to fp128 via `NDARRAY_FP128_FROM_D` is exact — the high word carries
+ * the integer count, the low word is zero.
+ *
+ * @param[out] data Destination host buffer of `n * NDARRAY_FP128_SIZE` bytes.
+ * @param[in]  n    Element count.
+ * @param[in]  lam  Distribution rate (λ); ≥ 0.
+ */
+static void poisson_fill_cpu_fp128(char *data, long n, double lam) {
+    ndarray_poisson_ctx ctx;
+    ndarray_poisson_ctx_init(&ctx, lam);
+    ndarray_fp128_t *p = (ndarray_fp128_t *)data;
+    for (long i = 0; i < n; i++) {
+        double v = ndarray_poisson_sample(&ctx);
+        p[i] = NDARRAY_FP128_FROM_D(v);
+    }
+}
+
+/**
+ * @brief CPU fill for the uint64 dtype.
+ *
+ * Each Poisson sample is a non-negative integer (≤ ~10^9 in practice
+ * — well inside the int64 range, so the conversion is exact). Stores
+ * via a single `(uint64_t)` cast.
+ *
+ * @param[out] data Destination host buffer of `n * sizeof(uint64_t)` bytes.
+ * @param[in]  n    Element count.
+ * @param[in]  lam  Distribution rate (λ); ≥ 0.
+ */
+static void poisson_fill_cpu_uint64(char *data, long n, double lam) {
+    ndarray_poisson_ctx ctx;
+    ndarray_poisson_ctx_init(&ctx, lam);
+    uint64_t *p = (uint64_t *)data;
+    for (long i = 0; i < n; i++) {
+        double v = ndarray_poisson_sample(&ctx);
+        p[i] = (uint64_t)v;
+    }
+}
+
+/**
+ * @brief Build a Poisson-sample NDArray of the requested shape / dtype / device.
+ *
+ * For `device == NDARRAY_DEVICE_GPU` the destination buffer is allocated
+ * directly in VRAM via `NDArray_Empty` (no host-side staging of the
+ * result):
+ *
+ *  - `dtype == uint32`: `cuda_poisson_u32` writes directly into the
+ *    destination. cuRAND's native Poisson output is `unsigned int`,
+ *    so this is the cheapest path.
+ *  - Other DOUBLE-kind dtypes: a transient GPU `uint32` scratch is
+ *    allocated via `vmalloc`, filled by `cuda_poisson_u32`, and then
+ *    `cuda_cast_u32_to_<dst>` quantises into the destination. Every
+ *    Poisson sample is ≤ ~10^9 (cuRAND's documented bound on λ), so
+ *    casting through u32 is precision-preserving for every dtype with
+ *    a ≥ 32-bit mantissa; for narrower dtypes the cast saturates the
+ *    same way numpy's `astype` does.
+ *  - `dtype == float4` / `float8`: u32 → f32 → fp4 / fp8 (two-stage
+ *    cast — the small-fp casts only have an f32 source on GPU).
+ *  - `dtype == float128`: `cuda_cast_u32_to_dd` writes each integer
+ *    sample as a `(double, 0.0)` DD pair, keeping the (hi, lo) layout
+ *    bit-correct.
+ *  - `dtype == uint64`: `cuda_cast_u32_to_u64` widens the u32 scratch
+ *    to u64 (zero-extension) — no host stage, kernel writes directly
+ *    into the VRAM destination.
+ *
+ * For `device == NDARRAY_DEVICE_CPU` every kind writes straight into
+ * the destination host buffer via the per-kind fillers above.
+ *
+ * Pre-existing bugs fixed (legacy `NDArray_Poisson` was a single
+ * `NDArray_Zeros + Knuth-loop-with-expf`):
+ *  - **`expf(-lam)` underflowed to 0 for `lam ≥ 88`** → the Knuth
+ *    inner loop never exited (`p > 0` always); first sample hung the
+ *    process. Replaced with `exp(-lam)` (precise up to lam ≈ 700) and
+ *    swapped to PTRS for `lam ≥ 30` so very large rates also work.
+ *  - **`L = exp(-lam)` was recomputed in every inner-loop iteration**.
+ *    Hoisted into the per-call context.
+ *  - **`(float)rand() / (float)RAND_MAX` could return exactly 1.0** —
+ *    harmless for Poisson (`p * 1.0 = p`) but inconsistent with the
+ *    rest of the project's PRNG plumbing. Replaced with
+ *    `rand() / (RAND_MAX + 1.0)`.
+ *  - **Hardcoded float32 / CPU** — dtype and device were ignored.
+ *  - **No GPU path at all** in the legacy implementation.
+ *  - **`NDArray_Zeros` then immediately overwritten** — wasted memset;
+ *    new path uses `NDArray_Empty` for uninitialised allocation.
+ *
+ * @param[in] lam    Distribution rate (λ); must be ≥ 0 (validated by
+ *                   the PHP entry point).
+ * @param[in] shape  Newly-allocated `int[ndim]`; ownership transfers
+ *                   into the returned NDArray's `dimensions`.
+ * @param[in] ndim   Number of dimensions; 0 yields a 0-D scalar.
+ * @param[in] type   Canonical NDArray dtype string.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray on success, NULL on failure (Error in flight).
  */
 NDArray*
-NDArray_Poisson(double lam, int* shape, int ndim) {
-    NDArray *rtn;
-    rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-
-    // Generate random samples from the Poisson distribution
-    for (int i = 0; i < NDArray_NUMELEMENTS(rtn); i++) {
-        float L = expf((float)-lam);
-        float p = 1.0f;
-        int k = 0;
-
-        do {
-            k++;
-            float u = (float)rand() / (float)RAND_MAX;
-            p *= u;
-        } while (p > L);
-        NDArray_F32DATA(rtn)[i] = (float)k - 1.0f;
+NDArray_Poisson(double lam, int *shape, int ndim,
+                 const char *type, int device) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) efree(shape);
+        return NULL;
     }
 
+    NDArray *rtn = NDArray_Empty(shape, ndim, type, device);
+    if (rtn == NULL) {
+        return NULL;
+    }
+    long n = (long) NDArray_NUMELEMENTS(rtn);
+    if (n <= 0) {
+        return rtn;
+    }
+
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS before requesting
+           GPU. If they didn't, fail loudly instead of returning an
+           NDArray with uninitialised on-device storage. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        if (!strcmp(type, "float128")) {
+            poisson_fill_cpu_fp128((char *)rtn->data, n, lam);
+        } else if (!strcmp(type, "uint64")) {
+            poisson_fill_cpu_uint64((char *)rtn->data, n, lam);
+        } else {
+            poisson_fill_cpu_double((char *)rtn->data, n, type, lam);
+        }
+        return rtn;
+    }
+
+#ifdef HAVE_CUBLAS
+    /* device == NDARRAY_DEVICE_GPU. Destination buffer is already in
+       VRAM (NDArray_Empty allocated it via vmalloc/cudaMalloc). Each
+       branch below writes into it without copying the result through
+       host memory. */
+
+    /* lam == 0 is degenerate (every sample is identically 0), and
+       cuRAND's curandGeneratePoisson rejects lam=0 with a non-success
+       status. Short-circuit with a single cudaMemset — every typed
+       zero encoding is the all-bytes-zero pattern, so this works for
+       every dtype including the (hi, lo) DD layout. */
+    if (lam == 0.0) {
+        cudaMemset(rtn->data, 0, (size_t)n * (size_t)elsize);
+        return rtn;
+    }
+
+    if (!strcmp(type, "uint32")) {
+        if (!cuda_poisson_u32((unsigned int *)rtn->data, n, lam)) {
+            NDArray_FREE(rtn);
+            zend_throw_error(NULL,
+                "poisson: cuRAND rejected lam=%g on the GPU (lambda "
+                "exceeds the generator's internal precision bound). "
+                "Use the CPU device for very large lambda.", lam);
+            return NULL;
+        }
+        return rtn;
+    }
+
+    /* All other dtypes: allocate a u32 scratch, fill via cuRAND, then
+       cast into the destination. Scratch is freed before return. */
+    unsigned int *scratch = NULL;
+    vmalloc((void **)&scratch, (unsigned int)((size_t)n * sizeof(unsigned int)));
+    if (scratch == NULL) {
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+    if (!cuda_poisson_u32(scratch, n, lam)) {
+        vfree(scratch);
+        NDArray_FREE(rtn);
+        zend_throw_error(NULL,
+            "poisson: cuRAND rejected lam=%g on the GPU (lambda "
+            "exceeds the generator's internal precision bound). "
+            "Use the CPU device for very large lambda.", lam);
+        return NULL;
+    }
+
+    if (!strcmp(type, "int8")) {
+        cuda_cast_u32_to_i8(scratch, (int8_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "uint8")) {
+        cuda_cast_u32_to_u8(scratch, (uint8_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "int16")) {
+        cuda_cast_u32_to_i16(scratch, (int16_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "uint16")) {
+        cuda_cast_u32_to_u16(scratch, (uint16_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "int32")) {
+        cuda_cast_u32_to_i32(scratch, (int32_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "int64")) {
+        cuda_cast_u32_to_i64(scratch, (int64_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "uint64")) {
+        cuda_cast_u32_to_u64(scratch, (uint64_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "float16")) {
+        cuda_cast_u32_to_f16(scratch, (uint16_t *)rtn->data, (int)n);
+    } else if (!strcmp(type, "float32")) {
+        cuda_cast_u32_to_f32(scratch, (float *)rtn->data, (int)n);
+    } else if (!strcmp(type, "float64")) {
+        cuda_cast_u32_to_f64(scratch, (double *)rtn->data, (int)n);
+    } else if (!strcmp(type, "float128")) {
+        cuda_cast_u32_to_dd(scratch, (double *)rtn->data, n);
+    } else if (!strcmp(type, "float4") || !strcmp(type, "float8")) {
+        /* fp4 / fp8 casts only have an f32 source on the GPU side, so
+           we take a two-stage path: u32 → f32 scratch → fp4 / fp8. */
+        float *scratch_f = NULL;
+        vmalloc((void **)&scratch_f,
+                (unsigned int)((size_t)n * sizeof(float)));
+        if (scratch_f == NULL) {
+            vfree(scratch);
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        cuda_cast_u32_to_f32(scratch, scratch_f, (int)n);
+        if (!strcmp(type, "float4")) {
+            cuda_cast_f32_to_fp4(scratch_f, (uint8_t *)rtn->data, (int)n);
+        } else {
+            cuda_cast_f32_to_fp8(scratch_f, (uint8_t *)rtn->data, (int)n);
+        }
+        vfree(scratch_f);
+    } else {
+        /* Unreachable: every supported dtype is covered above. */
+        vfree(scratch);
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+    vfree(scratch);
     return rtn;
+#endif
+
+    /* Defensive: every reachable (device, kind) combination is handled
+       above. If we get here something is mis-wired — free and bail. */
+    NDArray_FREE(rtn);
+    return NULL;
 }
 
 /* ───────────────── Uniform sampler ─────────────────────────────────────── */

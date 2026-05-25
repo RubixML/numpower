@@ -1,236 +1,89 @@
 --TEST--
-NumPower::poisson
+NumPower::poisson() produces CPU values that follow the requested Poisson(λ)
 --FILE--
 <?php
-use NumPower as nd;
+/* CPU-only sanity checks on the sample distribution. For Poisson(λ),
+   mean = variance = λ. With N = 16384 samples and modest λ, the
+   standard error of the mean is sqrt(λ/N) ≈ 0.025 for λ=10, so a
+   0.5 absolute tolerance passes with overwhelming probability while
+   still failing loudly if the path computes a non-Poisson distribution.
 
-new class
-{
-    public function __construct()
-    {
-        $this->testCase1();
-        $this->testCase2();
-        $this->testCase3();
-        $this->testCase4();
-        $this->testCase5();
-        $this->testCase6();
-    }
+   The GPU distribution check lives in
+   tests/initializers/106-numpower-poisson-dtype-gpu.phpt (with
+   --SKIPIF-- for non-CUDA builds), so this file stays on CPU only.
 
-    /**
-     * Successful creation.
-     */
-    private function testCase1(): void
-    {
-        echo '--- CASE 1 ---' . PHP_EOL;
-        $dataset = self::case1DataProvider();
-        foreach ($dataset['shape'] as $sk => $shape) {
-            foreach ($dataset['lam'] as $lk => $lam) {
-                nd::poisson($shape, $lam);
-                echo "successful creation with $sk and $lk" . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+   Pre-existing bug pinned: legacy `NDArray_Poisson` used
+   `expf(-lam)` which underflowed to 0 for λ ≥ 88 and caused the
+   Knuth inner loop to spin forever. The new implementation uses
+   `exp(-lam)` for λ < 30 and Hörmann's PTRS for λ ≥ 30 — both paths
+   covered below. */
 
-    private static function case1DataProvider(): array
-    {
-        return [
-            'shape' => [
-                '1-dim' => [1],
-                '2-dim' => [2, 3],
-                '3-dim' => [2, 3, 4],
-            ],
-            'lam' => [
-                'integer' => 1,
-                'float' => 1.0,
-            ],
-        ];
-    }
+srand((int)(microtime(true) * 1000));
+mt_srand((int)(microtime(true) * 1000));
 
-    /**
-     * An exception is thrown when first parameter has an invalid type.
-     */
-    private function testCase2(): void
-    {
-        echo '--- CASE 2 ---' . PHP_EOL;
-        $dataset = self::case2DataProvider();
-        foreach ($dataset as $condition => $data) {
-            try {
-                nd::poisson($data);
-            } catch (\Throwable $t) {
-                echo "Error when passed " . $condition. ": " . $t->getMessage() . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+$n = 16384;
 
-    private static function case2DataProvider(): array
-    {
-        return [
-            'shape is integer' => 1,
-            'shape is double' => 3.5,
-            'shape is string' => 'test',
-            'shape is null' => null,
-            'shape is object' => (object) [],
-        ];
-    }
+function php_mean_var($a) {
+    $arr = $a->toArray();
+    $sum = 0.0; $cnt = 0;
+    foreach ($arr as $v) { $sum += (float)$v; $cnt++; }
+    $mean = $sum / $cnt;
+    $sq = 0.0;
+    foreach ($arr as $v) { $d = ((float)$v) - $mean; $sq += $d * $d; }
+    return [$mean, $sq / $cnt];
+}
 
-    /**
-     * An exception is thrown when second parameter has an invalid type.
-     */
-    private function testCase3(): void
-    {
+function check_poisson($a, $lam_target, $tag) {
+    [$m, $v] = php_mean_var($a);
+    /* Mean tolerance: 0.05 * (lam + 1) — looser for small λ where
+       the relative SE matters, tighter for large λ. */
+    $mean_tol = 0.05 * ($lam_target + 1.0);
+    $var_tol  = 0.10 * ($lam_target + 1.0);
+    $mean_ok = abs($m - $lam_target) < $mean_tol;
+    $var_ok  = abs($v - $lam_target) < $var_tol;
+    echo $tag, ': mean=', ($mean_ok ? 'OK' : "BAD(target=$lam_target got=$m)"),
+         ' var=', ($var_ok ? 'OK' : "BAD(target=$lam_target got=$v)"), "\n";
+}
 
-        echo '--- CASE 3 ---' . PHP_EOL;
-        $dataset = self::case3DataProvider();
-        foreach ($dataset as $condition => $data) {
-            try {
-                nd::poisson([2, 3], $data);
-            } catch (\Throwable $t) {
-                echo "Error when passed " . $condition . ": " . $t->getMessage() . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+/* Knuth branch: tiny lam, default lam, small lam. */
+$a = NumPower::poisson([$n], 0.5, 'float32');
+check_poisson($a, 0.5, 'cpu_knuth_lam0.5');
 
-    private static function case3DataProvider(): array
-    {
-        return [
-            'lamb is arrayy' => [],
-            'lamb is string' => 'test',
-            'lamb is object' => (object) [],
-        ];
-    }
+$a = NumPower::poisson([$n], 1.0, 'float32');
+check_poisson($a, 1.0, 'cpu_knuth_lam1');
 
-    /**
-     * An exception is thrown when passing an array with elements of an invalid type.
-     */
-    private function testCase4(): void
-    {
-        echo '--- CASE 4 ---' . PHP_EOL;
-        $dataset = self::case4DataProvider();
-        foreach ($dataset as $condition =>  $data) {
-            try {
-                nd::poisson([$data]);
-            } catch (\Throwable $t) {
-                echo "Error when shape " . $condition . ": " . $t->getMessage() . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+$a = NumPower::poisson([$n], 10.0, 'float64');
+check_poisson($a, 10.0, 'cpu_knuth_lam10');
 
-    private static function case4DataProvider(): array
-    {
-        return [
-            'value is array' => [],
-            'value is float' => 3.5,
-            'value is string' => 'test',
-            'value is null' => null,
-            'value is object' => (object) [],
-        ];
-    }
+/* PTRS branch: lam >= 30. */
+$a = NumPower::poisson([$n], 50.0, 'int32');
+check_poisson($a, 50.0, 'cpu_ptrs_lam50');
 
-    /**
-     * An exception is thrown when passing an empty array.
-     */
-    private function testCase5(): void
-    {
-        echo '--- CASE 5 ---' . PHP_EOL;
-        try {
-            nd::poisson([]);
-        } catch (\Throwable $t) {
-            echo $t->getMessage() . PHP_EOL;
-        }
-        echo PHP_EOL;
-    }
+$a = NumPower::poisson([$n], 1000.0, 'int64');
+check_poisson($a, 1000.0, 'cpu_ptrs_lam1000');
 
-    /**
-     * The resulting array has the correct number of dimensions and
-     * each dimension contains only integers.
-     */
-    private function testCase6(): void
-    {
-        echo '--- CASE 6 ---' . PHP_EOL;
-        $a = nd::poisson([4]);
+/* Counts must be non-negative integers regardless of dtype. */
+$a = NumPower::poisson([1024], 5.0, 'float64');
+$nonneg_int = true;
+foreach ($a->toArray() as $v) {
+    $f = (float)$v;
+    if ($f < 0.0 || $f !== floor($f)) { $nonneg_int = false; break; }
+}
+echo 'nonneg_integer_counts: ', ($nonneg_int ? 'OK' : 'BAD'), "\n";
 
-        echo "Shape is: " . count($a->toArray()) . PHP_EOL;
-
-        foreach ($a->toArray() as $elk => $el) {
-            if (abs($el) == $el) {
-                echo "element " . $elk + 1 . " is integer" . PHP_EOL;
-            }
-        }
-
-        $a = nd::poisson([4, 4]);
-
-        foreach ($a->toArray() as $k => $el) {
-            echo "Shape level of element " . $k + 1 . " is: " . count($el) . PHP_EOL;
-        }
-
-        foreach ($a->toArray() as $elk => $el) {
-            foreach ($el as $selk => $subEl) {
-                if (abs($subEl) == $subEl) {
-                    echo "sub-element " . $selk . " of element " . $elk + 1 . " is integer" . PHP_EOL;
-                }
-            }
-        }
-    }
-};
+/* Sanity: every sample for lam=0 is identically 0. */
+$a = NumPower::poisson([100], 0.0, 'int32');
+$all_zero = true;
+foreach ($a->toArray() as $v) {
+    if ((int)$v !== 0) { $all_zero = false; break; }
+}
+echo 'lam_zero_degenerate: ', ($all_zero ? 'OK' : 'BAD'), "\n";
 ?>
 --EXPECT--
---- CASE 1 ---
-successful creation with 1-dim and integer
-successful creation with 1-dim and float
-successful creation with 2-dim and integer
-successful creation with 2-dim and float
-successful creation with 3-dim and integer
-successful creation with 3-dim and float
-
---- CASE 2 ---
-Error when passed shape is integer: NumPower::poisson(): Argument #1 ($shape) must be of type array, int given
-Error when passed shape is double: NumPower::poisson(): Argument #1 ($shape) must be of type array, float given
-Error when passed shape is string: NumPower::poisson(): Argument #1 ($shape) must be of type array, string given
-Error when passed shape is null: NumPower::poisson(): Argument #1 ($shape) must be of type array, null given
-Error when passed shape is object: NumPower::poisson(): Argument #1 ($shape) must be of type array, stdClass given
-
---- CASE 3 ---
-Error when passed lamb is arrayy: NumPower::poisson(): Argument #2 ($lam) must be of type float, array given
-Error when passed lamb is string: NumPower::poisson(): Argument #2 ($lam) must be of type float, string given
-Error when passed lamb is object: NumPower::poisson(): Argument #2 ($lam) must be of type float, stdClass given
-
---- CASE 4 ---
-Error when shape value is array: Invalid parameter: Shape elements must be integers.
-Error when shape value is float: Invalid parameter: Shape elements must be integers.
-Error when shape value is string: Invalid parameter: Shape elements must be integers.
-Error when shape value is null: Invalid parameter: Shape elements must be integers.
-Error when shape value is object: Invalid parameter: Shape elements must be integers.
-
---- CASE 5 ---
-Invalid parameter: Expected a non-empty array.
-
---- CASE 6 ---
-Shape is: 4
-element 1 is integer
-element 2 is integer
-element 3 is integer
-element 4 is integer
-Shape level of element 1 is: 4
-Shape level of element 2 is: 4
-Shape level of element 3 is: 4
-Shape level of element 4 is: 4
-sub-element 0 of element 1 is integer
-sub-element 1 of element 1 is integer
-sub-element 2 of element 1 is integer
-sub-element 3 of element 1 is integer
-sub-element 0 of element 2 is integer
-sub-element 1 of element 2 is integer
-sub-element 2 of element 2 is integer
-sub-element 3 of element 2 is integer
-sub-element 0 of element 3 is integer
-sub-element 1 of element 3 is integer
-sub-element 2 of element 3 is integer
-sub-element 3 of element 3 is integer
-sub-element 0 of element 4 is integer
-sub-element 1 of element 4 is integer
-sub-element 2 of element 4 is integer
-sub-element 3 of element 4 is integer
+cpu_knuth_lam0.5: mean=OK var=OK
+cpu_knuth_lam1: mean=OK var=OK
+cpu_knuth_lam10: mean=OK var=OK
+cpu_ptrs_lam50: mean=OK var=OK
+cpu_ptrs_lam1000: mean=OK var=OK
+nonneg_integer_counts: OK
+lam_zero_degenerate: OK

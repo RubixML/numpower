@@ -267,6 +267,46 @@ void cuda_normal_u64_affine(const double *z, unsigned long long *dst, long n,
 void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
                               unsigned long long low, double widthd);
 
+/**
+ * @brief Fill a GPU uint32 buffer with Poisson(@p lam) samples.
+ *
+ * Wraps `curandGeneratePoisson`. cuRAND picks an internal algorithm
+ * (rejection-from-normal or PTRS) based on @p lam. The library has an
+ * undocumented internal precision limit (empirically ~4 × 10^5 on the
+ * default XORWOW generator) beyond which the call returns a non-success
+ * status; we propagate that as a boolean so callers can raise a clear
+ * PHP error instead of returning a silently-zero buffer.
+ *
+ * There is no parity restriction (unlike the Normal generator), so the
+ * call is single-pass into the destination with no pad buffer. The
+ * seed is fresh per call (`cuda_normal_next_seed`) so successive calls
+ * in the same process produce independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n unsigned ints.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  lam    Distribution rate (λ); must be ≥ 0.
+ * @return 1 on success, 0 if cuRAND rejected the request (typically
+ *         due to @p lam exceeding the generator's internal precision
+ *         bound; the destination buffer is left untouched).
+ */
+int cuda_poisson_u32(unsigned int *d_data, long n, double lam);
+
+/**
+ * @brief Widen a GPU uint32 stream into the on-device DD layout.
+ *
+ * Used by `NDArray_Poisson` for the float128 GPU path: each Poisson
+ * sample (a non-negative integer up to ~10^9) is written as a DD pair
+ * with `hi = (double)src[i]` and `lo = 0.0`. uint32 ≤ 2^32 fits exactly
+ * in fp64's 53-bit mantissa, so the high word is byte-correct and the
+ * low word carries no residue. Used to keep the fp128 Poisson GPU
+ * path VRAM-direct — no host transit of the result.
+ *
+ * @param[in]  src Length-@p n GPU buffer of uint32 Poisson samples.
+ * @param[out] dst Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n   Element count.
+ */
+void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n);
+
 //Doubles
 void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements);
 
