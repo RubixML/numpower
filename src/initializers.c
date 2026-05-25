@@ -671,8 +671,9 @@ NDArray_Identity(int size, const char *type, int device) {
 /* The truncated-normal sampler shares the (loc, scale) coercion plumbing
    and the per-dtype dispatch with `NDArray_Normal` — every helper below
    reuses the same `NDArrayNormalSpec` discriminator. The full
-   per-element fillers are defined further down, alongside the standard
-   sampler; the truncated variant just adds a rejection guard on top. */
+   per-element fillers are defined further down, next to the unbounded
+   `NDArray_Normal` path; the truncated variant just adds a rejection
+   guard on top. */
 
 /**
  * @brief Sample one standard-normal `double` z ~ N(0, 1).
@@ -1031,27 +1032,6 @@ NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
        above. If we get here something is mis-wired — free and bail. */
     NDArray_FREE(rtn);
     return NULL;
-}
-
-/**
- * @brief Convenience wrapper: `NDArray_Normal` with loc=0, scale=1, float32, CPU.
- *
- * Preserves the legacy `standardNormal()` PHP entry point's behaviour
- * exactly (float32 / CPU result) while routing through the new
- * dispatcher.
- *
- * @param[in] shape Newly-allocated int[ndim]; ownership transfers.
- * @param[in] ndim  Number of dimensions.
- * @return New 0-mean, unit-stddev NDArray, or NULL on failure.
- */
-NDArray*
-NDArray_StandardNormal(int* shape, int ndim) {
-    NDArrayNormalSpec spec;
-    spec.kind        = NDARRAY_NORMAL_KIND_DOUBLE;
-    spec.v.d.loc     = 0.0;
-    spec.v.d.scale   = 1.0;
-    return NDArray_Normal(&spec, shape, ndim, NDARRAY_TYPE_FLOAT32,
-                          NDARRAY_DEVICE_CPU);
 }
 
 /**

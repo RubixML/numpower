@@ -12,9 +12,9 @@
 
 // NDArrayFactory_CreateFromZval, Create_NDArray_FromZval, NDArray_CreateFromLongScalar, NDArray_CreateFromDoubleScalar
 // NDArray_Zeros,                 NDArray_FillFloat,       NDArray_Identity,             NDArray_Normal,
-// NDArray_TruncatedNormal,       NDArray_Binomial,        NDArray_StandardNormal,       NDArray_Poisson,
-// NDArray_Uniform,               NDArray_Diag,            NDArray_Full,                 NDArray_Ones,
-// NDArray_Arange,                NDArray_Copy,            
+// NDArray_TruncatedNormal,       NDArray_Binomial,        NDArray_Poisson,              NDArray_Uniform,
+// NDArray_Diag,                  NDArray_Full,            NDArray_Ones,                 NDArray_Arange,
+// NDArray_Copy,
 #include "src/initializers.h"
 
 // add_to_buffer, buffer_get, buffer_ndarray_free, buffer_init, buffer_free
@@ -1830,6 +1830,106 @@ static int coerce_zval_to_fp128(zval *z, const char *op, const char *name,
                                 ndarray_fp128_t *out_dst);
 
 /**
+ * @brief Initialise an `NDArrayNormalSpec` with the N(0, 1) defaults that
+ *        match @p type's arithmetic kind.
+ *
+ * The kind comes from `NDArray_NormalKindFor`; the matching union arm is
+ * set to loc=0 and scale=1 in that kind's native precision (`fp128` zero
+ * and `fp128` one for FP128, native `uint64_t` 0 and 1 for UINT64,
+ * `double` 0.0 and 1.0 for DOUBLE). Callers that want non-default
+ * loc/scale (`normal`, `truncatedNormal`) follow up with
+ * `ndarray_normal_spec_overlay` to pull values from user-supplied zvals;
+ * the `standardNormal` entry point uses the defaults as-is.
+ *
+ * @param[out] spec Spec to initialise; `kind` and the active union arm are set.
+ * @param[in]  type Canonical dtype string (selects the kind).
+ */
+static void
+ndarray_normal_spec_defaults(NDArrayNormalSpec *spec, const char *type) {
+    spec->kind = NDArray_NormalKindFor(type);
+    switch (spec->kind) {
+        case NDARRAY_NORMAL_KIND_FP128:
+            spec->v.f128.loc   = NDARRAY_FP128_ZERO();
+            spec->v.f128.scale = NDARRAY_FP128_FROM_I64(1);
+            break;
+        case NDARRAY_NORMAL_KIND_UINT64:
+            spec->v.u64.loc   = 0;
+            spec->v.u64.scale = 1;
+            break;
+        case NDARRAY_NORMAL_KIND_DOUBLE:
+        default:
+            spec->kind       = NDARRAY_NORMAL_KIND_DOUBLE;
+            spec->v.d.loc    = 0.0;
+            spec->v.d.scale  = 1.0;
+            break;
+    }
+}
+
+/**
+ * @brief Overlay user-supplied @p loc_zv / @p scale_zv onto a spec whose
+ *        defaults were initialised by `ndarray_normal_spec_defaults`.
+ *
+ * Each non-NULL zval is coerced into the active kind's native scalar
+ * type via the matching `coerce_zval_to_*` helper. A failed coercion
+ * leaves a catchable `Error` in flight and returns 0; the caller is
+ * expected to release any shape buffer it allocated and return.
+ *
+ * @param[in,out] spec      Spec carrying the dtype-aware defaults; the
+ *                          active union arm is overwritten on success.
+ * @param[in]     op        Method name prefix used in error messages
+ *                          (e.g. "normal", "truncatedNormal").
+ * @param[in]     loc_zv    Optional user-supplied loc (NULL keeps the
+ *                          default).
+ * @param[in]     scale_zv  Optional user-supplied scale (NULL keeps the
+ *                          default).
+ * @return 1 on success, 0 on type rejection (Error in flight).
+ */
+static int
+ndarray_normal_spec_overlay(NDArrayNormalSpec *spec, const char *op,
+                            zval *loc_zv, zval *scale_zv) {
+    switch (spec->kind) {
+        case NDARRAY_NORMAL_KIND_FP128:
+            if (loc_zv != NULL &&
+                !coerce_zval_to_fp128(loc_zv, op, "loc",
+                                       &spec->v.f128.loc)) {
+                return 0;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_fp128(scale_zv, op, "scale",
+                                       &spec->v.f128.scale)) {
+                return 0;
+            }
+            break;
+        case NDARRAY_NORMAL_KIND_UINT64:
+            if (loc_zv != NULL &&
+                !coerce_zval_to_uint64(loc_zv, op, "loc",
+                                        &spec->v.u64.loc)) {
+                return 0;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_uint64(scale_zv, op, "scale",
+                                        &spec->v.u64.scale)) {
+                return 0;
+            }
+            break;
+        case NDARRAY_NORMAL_KIND_DOUBLE:
+        default:
+            if (loc_zv != NULL &&
+                !coerce_zval_to_double(loc_zv, op, "loc",
+                                        &spec->v.d.loc)) {
+                return 0;
+            }
+            if (scale_zv != NULL &&
+                !coerce_zval_to_double(scale_zv, op, "scale",
+                                        &spec->v.d.scale)) {
+                return 0;
+            }
+            break;
+    }
+    return 1;
+}
+
+/**
  * @brief `NumPower::normal(shape, loc = 0.0, scale = 1.0, dtype = "float32", device = 0): NDArray`.
  *
  * Generates an NDArray of the requested shape filled with samples drawn
@@ -1889,60 +1989,15 @@ PHP_METHOD(NumPower, normal) {
         return;
     }
 
-    /* Defaults are dtype-aware: `loc = 0` and `scale = 1` are encoded
-       in the same precision as any explicit arg so the three dispatch
-       paths stay symmetric. */
+    /* Defaults are dtype-aware: `loc = 0` / `scale = 1` are encoded in
+       the same precision as any explicit arg so the three dispatch paths
+       stay symmetric. `ndarray_normal_spec_overlay` then merges any
+       user-supplied loc/scale onto those defaults. */
     NDArrayNormalSpec spec;
-    spec.kind = NDArray_NormalKindFor(ndarrayDataType);
-
-    switch (spec.kind) {
-        case NDARRAY_NORMAL_KIND_FP128: {
-            spec.v.f128.loc   = NDARRAY_FP128_ZERO();
-            spec.v.f128.scale = NDARRAY_FP128_FROM_I64(1);
-            if (loc_zv != NULL &&
-                !coerce_zval_to_fp128(loc_zv, "normal", "loc",
-                                       &spec.v.f128.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_fp128(scale_zv, "normal", "scale",
-                                       &spec.v.f128.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
-        case NDARRAY_NORMAL_KIND_UINT64: {
-            spec.v.u64.loc   = 0;
-            spec.v.u64.scale = 1;
-            if (loc_zv != NULL &&
-                !coerce_zval_to_uint64(loc_zv, "normal", "loc",
-                                        &spec.v.u64.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_uint64(scale_zv, "normal", "scale",
-                                        &spec.v.u64.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
-        case NDARRAY_NORMAL_KIND_DOUBLE:
-        default: {
-            spec.kind        = NDARRAY_NORMAL_KIND_DOUBLE;
-            spec.v.d.loc     = 0.0;
-            spec.v.d.scale   = 1.0;
-            if (loc_zv != NULL &&
-                !coerce_zval_to_double(loc_zv, "normal", "loc",
-                                        &spec.v.d.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_double(scale_zv, "normal", "scale",
-                                        &spec.v.d.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
+    ndarray_normal_spec_defaults(&spec, ndarrayDataType);
+    if (!ndarray_normal_spec_overlay(&spec, "normal", loc_zv, scale_zv)) {
+        efree(shape);
+        return;
     }
 
     NDArray *rtn = NDArray_Normal(&spec, shape, ndim, ndarrayDataType,
@@ -2013,56 +2068,11 @@ PHP_METHOD(NumPower, truncatedNormal) {
     }
 
     NDArrayNormalSpec spec;
-    spec.kind = NDArray_NormalKindFor(ndarrayDataType);
-
-    switch (spec.kind) {
-        case NDARRAY_NORMAL_KIND_FP128: {
-            spec.v.f128.loc   = NDARRAY_FP128_ZERO();
-            spec.v.f128.scale = NDARRAY_FP128_FROM_I64(1);
-            if (loc_zv != NULL &&
-                !coerce_zval_to_fp128(loc_zv, "truncatedNormal", "loc",
-                                       &spec.v.f128.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_fp128(scale_zv, "truncatedNormal", "scale",
-                                       &spec.v.f128.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
-        case NDARRAY_NORMAL_KIND_UINT64: {
-            spec.v.u64.loc   = 0;
-            spec.v.u64.scale = 1;
-            if (loc_zv != NULL &&
-                !coerce_zval_to_uint64(loc_zv, "truncatedNormal", "loc",
-                                        &spec.v.u64.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_uint64(scale_zv, "truncatedNormal", "scale",
-                                        &spec.v.u64.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
-        case NDARRAY_NORMAL_KIND_DOUBLE:
-        default: {
-            spec.kind        = NDARRAY_NORMAL_KIND_DOUBLE;
-            spec.v.d.loc     = 0.0;
-            spec.v.d.scale   = 1.0;
-            if (loc_zv != NULL &&
-                !coerce_zval_to_double(loc_zv, "truncatedNormal", "loc",
-                                        &spec.v.d.loc)) {
-                efree(shape); return;
-            }
-            if (scale_zv != NULL &&
-                !coerce_zval_to_double(scale_zv, "truncatedNormal", "scale",
-                                        &spec.v.d.scale)) {
-                efree(shape); return;
-            }
-            break;
-        }
+    ndarray_normal_spec_defaults(&spec, ndarrayDataType);
+    if (!ndarray_normal_spec_overlay(&spec, "truncatedNormal",
+                                      loc_zv, scale_zv)) {
+        efree(shape);
+        return;
     }
 
     NDArray *rtn = NDArray_TruncatedNormal(&spec, shape, ndim, ndarrayDataType,
@@ -2108,51 +2118,66 @@ PHP_METHOD(NumPower, randomBinomial) {
 }
 
 /**
- * NumPower::standardNormal
+ * @brief `NumPower::standardNormal(shape, dtype = "float32", device = 0): NDArray`.
  *
- * @param shape
+ * Convenience entry point for the standard normal distribution N(0, 1):
+ * a fixed `loc = 0`, `scale = 1` pair routed through the same
+ * `NDArray_Normal` dispatcher that powers `NumPower::normal()`. Every
+ * supported dtype is honoured — for `float128` and `uint64` the defaults
+ * are encoded in their native precision via `ndarray_normal_spec_defaults`
+ * so loc/scale survive bit-for-bit into the dtype-aware fill path.
+ *
+ * For `device == 1` (GPU) the destination buffer is allocated directly
+ * in VRAM (`NDArray_Empty` → `vmalloc` → `cudaMalloc`) and populated by
+ * cuRAND (`curandGenerateNormal` / `curandGenerateNormalDouble`) plus
+ * `cuda_cast_*` quantisation for non-fp32/fp64 dtypes — there is no
+ * full-size host staging of the result. For `dtype == 'float128'` on GPU
+ * the values flow through a custom `cuda_normal_dd_affine` kernel that
+ * performs the affine in true double-double arithmetic so the (hi, lo)
+ * DD layout is preserved.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
-ZEND_BEGIN_ARG_INFO(arginfo_ndarray_standard_normal, 1)
-    ZEND_ARG_ARRAY_INFO(0, shape, 0)
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_standard_normal, 0, 0, 1)
+    ZEND_ARG_INFO(0, shape)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
-
 PHP_METHOD(NumPower, standardNormal) {
-    NDArray *rtn = NULL;
-    zval* shape;
-    HashTable *shape_ht;
-    zend_string *key;
-    zend_ulong idx;
-    zval *val;
+    zval *shape_zval;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
 
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ARRAY(shape)
+    ZEND_PARSE_PARAMETERS_START(1, 3)
+        Z_PARAM_ZVAL(shape_zval)
+    Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
 
-    shape_ht = Z_ARRVAL_P(shape);
-
-    ZEND_HASH_FOREACH_KEY_VAL(shape_ht, idx, key, val) {
-        if (Z_TYPE_P(val) != IS_LONG) {
-            zend_throw_error(NULL, "Invalid parameter: Shape elements must be integers.");
-            return;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    NDArray *nda = ZVAL_TO_NDARRAY(shape);
-
-    if (nda == NULL) {
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
         return;
     }
 
-    if (NDArray_NUMELEMENTS(nda) == 0) {
-        NDArray_FREE(nda);
-        zend_throw_error(NULL, "Invalid parameter: Expected a non-empty array.");
+    NDArrayNormalSpec spec;
+    ndarray_normal_spec_defaults(&spec, ndarrayDataType);
+
+    NDArray *rtn = NDArray_Normal(&spec, shape, ndim, ndarrayDataType,
+                                  parsed_device);
+    if (rtn == NULL) {
         return;
     }
-
-    rtn = NDArray_StandardNormal(NDArray_ToIntVector(nda), NDArray_NUMELEMENTS(nda));
-    NDArray_FREE(nda);
-
-    ndarray_init_new_object(rtn, return_value);
+    /* Hand back an NDArray even for a 0-D shape — matches every other
+       typed factory and preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
