@@ -67,7 +67,11 @@ echo 'dist_gpu_f32_lam100: mean_ok=', ($mean_ok ? 'OK' : "BAD($mean)"),
 $g = NumPower::poisson([$n], 10000.0, 'int32', NUMPOWER_CUDA);
 [$mean, $var] = php_mean_var_gpu($g);
 $mean_ok = abs($mean - 10000.0) < 20.0;
-$var_ok  = abs($var  - 10000.0) < 200.0;
+/* Variance of the sample variance is ~2σ⁴/N. For σ²=10000 and N=8192
+   that's stddev ≈ 156; allow a ~4σ window so the test passes
+   essentially always while still catching a path that produces a
+   wildly different distribution. */
+$var_ok  = abs($var  - 10000.0) < 600.0;
 echo 'dist_gpu_lam10000: mean_ok=', ($mean_ok ? 'OK' : "BAD($mean)"),
      ' var_ok=', ($var_ok ? 'OK' : "BAD($var)"), "\n";
 

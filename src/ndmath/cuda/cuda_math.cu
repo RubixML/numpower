@@ -3297,4 +3297,55 @@ void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n) {
     cuda_cast_u32_to_dd_kernel<<<blocks, block>>>(src, dst, n);
 }
 
+/* ───────────────── Binomial sampler ────────────────────────────────────── */
+
+/**
+ * @brief Per-thread direct-Bernoulli kernel for the Binomial sampler.
+ *
+ * Each thread owns one output slot, initialises its own cuRAND state
+ * from `(seed, idx)`, runs @p n independent Bernoulli trials with
+ * success probability @p p, and writes the success count as a uint32.
+ * `curand_uniform` returns `(0, 1]`; we reflect to `[0, 1)` via
+ * `1 - u` so the comparison `u < p` honours the closed-open convention
+ * (matches the CPU sampler).
+ *
+ * Cost is `O(n)` per element — fine for small to moderate @p n
+ * (< ~10^4); for very large @p n the call is still correct but a more
+ * sophisticated algorithm (BTPE) would be faster. The legacy CPU
+ * implementation also used this direct method.
+ *
+ * @param[out] dst  Destination GPU buffer of @p total uint32s.
+ * @param[in]  total Element count.
+ * @param[in]  n     Number of Bernoulli trials per sample.
+ * @param[in]  p     Per-trial success probability in `[0, 1]`.
+ * @param[in]  seed  Per-call seed (`cuda_normal_next_seed`).
+ */
+__global__ void cuda_binomial_kernel(unsigned int *dst, long total,
+                                       int n, float p,
+                                       unsigned long long seed) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    curandState_t state;
+    curand_init(seed, (unsigned long long)idx, 0, &state);
+    unsigned int successes = 0;
+    for (int j = 0; j < n; j++) {
+        float u = 1.0f - curand_uniform(&state);  /* (0, 1] → [0, 1) */
+        if (u < p) successes++;
+    }
+    dst[idx] = successes;
+}
+
+void cuda_binomial_u32(unsigned int *d_data, long total, int n, float p) {
+    if (d_data == NULL || total <= 0) return;
+    /* n == 0 is degenerate (every sample is 0); the kernel handles it
+       correctly (the per-thread loop is empty) but the upstream
+       dispatcher short-circuits with cudaMemset before reaching us. */
+    int block = 256;
+    long blocks_ll = (total + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_binomial_kernel<<<blocks, block>>>(d_data, total, n, p,
+                                              cuda_normal_next_seed());
+}
+
 }

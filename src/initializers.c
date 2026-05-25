@@ -2903,28 +2903,275 @@ NDArray_Arange(const NDArrayArangeSpec *spec, const char *type, int device) {
     return rtn;
 }
 
+/* ───────────────── Binomial sampler ────────────────────────────────────── */
+
+/**
+ * @brief Draw one Binomial(@p n, @p p) sample on the CPU.
+ *
+ * Direct Bernoulli method: count successes across @p n independent
+ * trials with success probability @p p. Each uniform draw uses
+ * `rand() / (RAND_MAX + 1.0)` so values land strictly in `[0, 1)`
+ * (the legacy `(float)rand() / (float)RAND_MAX` could yield 1.0,
+ * which would cause a `p = 1.0` request to miss a success).
+ *
+ * Cost is `O(n)` per call — same complexity as the cuRAND-based GPU
+ * kernel. For very large @p n a BTPE-style algorithm would scale
+ * better; the direct method stays numerically exact regardless, so
+ * the distribution contract holds for any `n`.
+ *
+ * @param[in] n Number of Bernoulli trials.
+ * @param[in] p Per-trial success probability in `[0, 1]`.
+ * @return One Binomial sample (a non-negative integer as a double).
+ */
+static double ndarray_binomial_sample(int n, double p) {
+    int successes = 0;
+    for (int j = 0; j < n; j++) {
+        double u = (double)rand() / ((double)RAND_MAX + 1.0);
+        if (u < p) successes++;
+    }
+    return (double)successes;
+}
+
+/**
+ * @brief CPU fill: write @p total Binomial(@p n, @p p) samples into @p data.
+ *
+ * Generates each sample via `ndarray_binomial_sample` and stores it
+ * through `ndarray_set_from_double` so every dtype gets its
+ * dtype-correct quantisation. Covers every dtype except float128 (DD
+ * widening) and uint64 (full 64-bit range) — both have dedicated
+ * fillers below.
+ *
+ * @param[out] data  Destination host buffer; ≥ `total * get_type_size(type)` bytes.
+ * @param[in]  total Element count.
+ * @param[in]  type  Canonical dtype string.
+ * @param[in]  n     Trial count.
+ * @param[in]  p     Success probability.
+ */
+static void binomial_fill_cpu_double(char *data, long total,
+                                       const char *type, int n, double p) {
+    for (long i = 0; i < total; i++) {
+        double v = ndarray_binomial_sample(n, p);
+        ndarray_set_from_double(type, data, (size_t)i, v);
+    }
+}
+
+/**
+ * @brief CPU fill for the float128 dtype.
+ *
+ * Each Binomial sample is an integer in `[0, n]` (so ≤ `INT_MAX`),
+ * which widens to fp128 via `NDARRAY_FP128_FROM_D` losslessly.
+ *
+ * @param[out] data  Destination host buffer of `total * NDARRAY_FP128_SIZE` bytes.
+ * @param[in]  total Element count.
+ * @param[in]  n     Trial count.
+ * @param[in]  p     Success probability.
+ */
+static void binomial_fill_cpu_fp128(char *data, long total, int n, double p) {
+    ndarray_fp128_t *ptr = (ndarray_fp128_t *)data;
+    for (long i = 0; i < total; i++) {
+        double v = ndarray_binomial_sample(n, p);
+        ptr[i] = NDARRAY_FP128_FROM_D(v);
+    }
+}
+
+/**
+ * @brief CPU fill for the uint64 dtype.
+ *
+ * Each Binomial sample is a non-negative integer in `[0, n]`. Stores
+ * via a single `(uint64_t)` cast.
+ *
+ * @param[out] data  Destination host buffer of `total * sizeof(uint64_t)` bytes.
+ * @param[in]  total Element count.
+ * @param[in]  n     Trial count.
+ * @param[in]  p     Success probability.
+ */
+static void binomial_fill_cpu_uint64(char *data, long total, int n, double p) {
+    uint64_t *ptr = (uint64_t *)data;
+    for (long i = 0; i < total; i++) {
+        double v = ndarray_binomial_sample(n, p);
+        ptr[i] = (uint64_t)v;
+    }
+}
+
+/**
+ * @brief Build a Binomial-sample NDArray of the requested shape / dtype / device.
+ *
+ * For `device == NDARRAY_DEVICE_GPU` the destination buffer is allocated
+ * directly in VRAM via `NDArray_Empty` (no host-side staging of the
+ * result):
+ *
+ *  - `dtype == uint32`: `cuda_binomial_u32` writes directly into the
+ *    destination. The per-thread cuRAND state generates @p n uniforms
+ *    per output slot and counts the successes.
+ *  - Other dtypes: a transient GPU `uint32` scratch is allocated via
+ *    `vmalloc`, filled by `cuda_binomial_u32`, and then
+ *    `cuda_cast_u32_to_<dst>` quantises into the destination. Same
+ *    plumbing as `NDArray_Poisson`.
+ *  - `dtype == float128`: scratch → `cuda_cast_u32_to_dd` widens each
+ *    count into a `(double, 0.0)` DD pair, keeping the (hi, lo)
+ *    layout bit-correct.
+ *  - `dtype == float4` / `float8`: u32 → f32 → fp4 / fp8 (two-stage —
+ *    the small-fp casts only have an f32 source on GPU).
+ *
+ * For `device == NDARRAY_DEVICE_CPU` every dtype writes straight into
+ * the destination via the per-kind fillers above.
+ *
+ * `n == 0` is degenerate (every sample is identically 0). The
+ * dispatcher short-circuits with `cudaMemset(0)` (GPU) or a typed
+ * `memset(0)` is implicit through `ndarray_set_from_double(..., 0.0)`
+ * (CPU) — both yield the all-bytes-zero pattern which is the typed
+ * encoding of 0 for every supported dtype.
+ *
+ * Pre-existing bugs fixed (legacy `NDArray_Binomial`):
+ *  - **Hardcoded float32 / CPU** — dtype/device args were absent
+ *    entirely.
+ *  - **`(float)rand() / (float)RAND_MAX` could return exactly 1.0**,
+ *    which under the `random_value < p` test missed a success when
+ *    `p == 1.0`. Fixed: `rand() / (RAND_MAX + 1.0)` for strict `[0, 1)`.
+ *  - **`NDArray_Zeros` then immediately overwritten** — wasted memset;
+ *    new path uses `NDArray_Empty` for uninitialised allocation.
+ *  - **No GPU path at all** in the legacy implementation.
+ *  - **No `n < 0` / `p ∉ [0, 1]` validation** — the algorithm produced
+ *    silent garbage for out-of-range inputs. Validated at the PHP
+ *    entry point.
+ *  - **`total_elements` was `int`** — overflowed for shapes whose
+ *    product exceeded `INT_MAX`. The new dispatcher routes through
+ *    `NDArray_Empty` whose element count is `long`.
+ *
+ * @param[in] shape  Newly-allocated `int[ndim]`; ownership transfers
+ *                   into the returned NDArray's `dimensions`.
+ * @param[in] ndim   Number of dimensions; 0 yields a 0-D scalar.
+ * @param[in] n      Number of Bernoulli trials per sample; ≥ 0.
+ * @param[in] p      Per-trial success probability in `[0, 1]`.
+ * @param[in] type   Canonical NDArray dtype string.
+ * @param[in] device NDARRAY_DEVICE_CPU or NDARRAY_DEVICE_GPU.
+ * @return New NDArray on success, NULL on failure (Error in flight).
+ */
 NDArray*
-NDArray_Binomial(int *shape, int ndim, int n, float p) {
-    // Calculate the total number of elements in the output array
-    int total_elements = 1;
-    for (int i = 0; i < ndim; i++) {
-        total_elements *= shape[i];
+NDArray_Binomial(int *shape, int ndim, int n, float p,
+                  const char *type, int device) {
+    int elsize = get_type_size(type);
+    if (elsize == 0) {
+        if (shape != NULL) efree(shape);
+        return NULL;
     }
 
-    NDArray *rtn = NDArray_Zeros(shape, ndim, NDARRAY_TYPE_FLOAT32, NDARRAY_DEVICE_CPU);
-    // Generate random binomial numbers
-    for (int i = 0; i < total_elements; i++) {
-        int successes = 0;
-        for (int j = 0; j < n; j++) {
-            // Generate a random number between 0 and 1
-            float random_value = (float)rand() / (float)RAND_MAX;
-            if (random_value < p) {
-                successes++;
-            }
-        }
-        NDArray_F32DATA(rtn)[i] = (float)successes;
+    NDArray *rtn = NDArray_Empty(shape, ndim, type, device);
+    if (rtn == NULL) {
+        return NULL;
     }
+    long total = (long) NDArray_NUMELEMENTS(rtn);
+    if (total <= 0) {
+        return rtn;
+    }
+
+#ifndef HAVE_CUBLAS
+    if (device == NDARRAY_DEVICE_GPU) {
+        /* Defensive: callers must gate on HAVE_CUBLAS before requesting
+           GPU. If they didn't, fail loudly instead of returning an
+           NDArray with uninitialised on-device storage. */
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+#endif
+
+    if (device == NDARRAY_DEVICE_CPU) {
+        if (!strcmp(type, "float128")) {
+            binomial_fill_cpu_fp128((char *)rtn->data, total, n, (double)p);
+        } else if (!strcmp(type, "uint64")) {
+            binomial_fill_cpu_uint64((char *)rtn->data, total, n, (double)p);
+        } else {
+            binomial_fill_cpu_double((char *)rtn->data, total, type, n,
+                                       (double)p);
+        }
+        return rtn;
+    }
+
+#ifdef HAVE_CUBLAS
+    /* device == NDARRAY_DEVICE_GPU. Destination buffer is already in
+       VRAM (NDArray_Empty allocated it via vmalloc/cudaMalloc). Each
+       branch below writes into it without copying the result through
+       host memory. */
+
+    /* n == 0 (or p == 0) — every sample is identically 0. Short-circuit
+       with cudaMemset so we skip the per-thread cuRAND init for the
+       degenerate case. The zero-byte pattern is the typed encoding of
+       0 for every supported dtype, including the DD layout. */
+    if (n == 0 || p == 0.0f) {
+        cudaMemset(rtn->data, 0, (size_t)total * (size_t)elsize);
+        return rtn;
+    }
+
+    if (!strcmp(type, "uint32")) {
+        cuda_binomial_u32((unsigned int *)rtn->data, total, n, p);
+        return rtn;
+    }
+
+    /* All other dtypes: allocate a u32 scratch, fill via the per-thread
+       Bernoulli kernel, then cast into the destination. */
+    unsigned int *scratch = NULL;
+    vmalloc((void **)&scratch,
+            (unsigned int)((size_t)total * sizeof(unsigned int)));
+    if (scratch == NULL) {
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+    cuda_binomial_u32(scratch, total, n, p);
+
+    if (!strcmp(type, "int8")) {
+        cuda_cast_u32_to_i8(scratch, (int8_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "uint8")) {
+        cuda_cast_u32_to_u8(scratch, (uint8_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "int16")) {
+        cuda_cast_u32_to_i16(scratch, (int16_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "uint16")) {
+        cuda_cast_u32_to_u16(scratch, (uint16_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "int32")) {
+        cuda_cast_u32_to_i32(scratch, (int32_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "int64")) {
+        cuda_cast_u32_to_i64(scratch, (int64_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "uint64")) {
+        cuda_cast_u32_to_u64(scratch, (uint64_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "float16")) {
+        cuda_cast_u32_to_f16(scratch, (uint16_t *)rtn->data, (int)total);
+    } else if (!strcmp(type, "float32")) {
+        cuda_cast_u32_to_f32(scratch, (float *)rtn->data, (int)total);
+    } else if (!strcmp(type, "float64")) {
+        cuda_cast_u32_to_f64(scratch, (double *)rtn->data, (int)total);
+    } else if (!strcmp(type, "float128")) {
+        cuda_cast_u32_to_dd(scratch, (double *)rtn->data, total);
+    } else if (!strcmp(type, "float4") || !strcmp(type, "float8")) {
+        /* fp4 / fp8 casts only have an f32 source on the GPU side, so
+           we take a two-stage path: u32 → f32 scratch → fp4 / fp8. */
+        float *scratch_f = NULL;
+        vmalloc((void **)&scratch_f,
+                (unsigned int)((size_t)total * sizeof(float)));
+        if (scratch_f == NULL) {
+            vfree(scratch);
+            NDArray_FREE(rtn);
+            return NULL;
+        }
+        cuda_cast_u32_to_f32(scratch, scratch_f, (int)total);
+        if (!strcmp(type, "float4")) {
+            cuda_cast_f32_to_fp4(scratch_f, (uint8_t *)rtn->data, (int)total);
+        } else {
+            cuda_cast_f32_to_fp8(scratch_f, (uint8_t *)rtn->data, (int)total);
+        }
+        vfree(scratch_f);
+    } else {
+        /* Unreachable: every supported dtype is covered above. */
+        vfree(scratch);
+        NDArray_FREE(rtn);
+        return NULL;
+    }
+    vfree(scratch);
     return rtn;
+#endif
+
+    /* Defensive: every reachable (device, kind) combination is handled
+       above. If we get here something is mis-wired — free and bail. */
+    NDArray_FREE(rtn);
+    return NULL;
 }
 
 NDArray* NDArrayFactory_CreateFromDoubleScalar(double scalar) {

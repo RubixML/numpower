@@ -307,6 +307,28 @@ int cuda_poisson_u32(unsigned int *d_data, long n, double lam);
  */
 void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n);
 
+/**
+ * @brief Fill a GPU uint32 buffer with Binomial(@p n, @p p) samples.
+ *
+ * Direct Bernoulli method: each output slot owns its own per-thread
+ * cuRAND state seeded from `(seed, idx)`, runs @p n trials with
+ * success probability @p p, and writes the success count as a uint32.
+ * Cost is `O(n)` per output element — practical for `n` up to a few
+ * thousand. For very large `n` a BTPE-style algorithm would scale
+ * better, but the direct method stays numerically exact (the same
+ * algorithm as the CPU path), so the distribution contract holds for
+ * any `n`.
+ *
+ * The seed is fresh per call (`cuda_normal_next_seed`) so successive
+ * calls in the same process produce statistically-independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p total unsigned ints.
+ * @param[in]  total  Element count; ≥ 0.
+ * @param[in]  n      Number of Bernoulli trials per sample.
+ * @param[in]  p      Per-trial success probability in `[0, 1]`.
+ */
+void cuda_binomial_u32(unsigned int *d_data, long total, int n, float p);
+
 //Doubles
 void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements);
 

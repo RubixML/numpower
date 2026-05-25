@@ -152,7 +152,8 @@ NDArray* NDArray_Arange(const NDArrayArangeSpec *spec,
  * @return one of NDARRAY_ARANGE_KIND_*.
  */
 NDArrayArangeKind NDArray_ArangeKindFor(const char *type);
-NDArray* NDArray_Binomial(int *shape, int ndim, int n, float p);
+NDArray* NDArray_Binomial(int *shape, int ndim, int n, float p,
+                          const char *type, int device);
 NDArray* NDArray_EmptyLike(NDArray *a);
 NDArray* NDArray_FromNDArrayBase(NDArray *target, char *data_ptr, int* shape, int* strides, const int ndim);
 

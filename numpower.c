@@ -1068,17 +1068,50 @@ void RETURN_3NDARRAY(NDArray* array1, NDArray* array2, NDArray* array3, zval* re
     RETURN_ZVAL(return_value, 0, 0);
 }
 
+/**
+ * @brief Intercept the built-in `print_r` to make NDArray-aware output
+ *        available transparently.
+ *
+ * Locates the global `print_r` function entry, repoints its internal
+ * handler at our `ZEND_FN(print_r_)` implementation, and renames the
+ * entry to `print_r_` so users can still reach the original behaviour
+ * through that name. Called from `PHP_RINIT_FUNCTION(ndarray)`; the
+ * rename persists for the process lifetime (subsequent RINITs find
+ * no `print_r` to rename and exit early).
+ *
+ * Ownership of the new function-name string transfers to the
+ * function-table entry. The engine's `zend_internal_function_dtor`
+ * runs at MSHUTDOWN and releases `function_name` exactly once — so
+ * the new `zend_string` is created with `refcount = 1` and **no extra
+ * `zend_string_addref` is performed**. The legacy implementation
+ * called `addref` after the assignment, leaving `refcount = 2`; the
+ * engine's single release at shutdown then dropped it to `1` and the
+ * 40-byte string was never freed (a once-per-process leak).
+ *
+ * The lookup-key `functionToRename` is allocated with `persistent = 0`
+ * because it lives only inside this function call; it is released at
+ * the end. Releasing the *original* `print_r` `function_name` is safe
+ * even with `persistent = 0` because that string is engine-interned
+ * (`ZSTR_IS_INTERNED` short-circuits the release).
+ */
 void
 bypass_printr() {
-    zend_string* functionToRename = zend_string_init("print_r", strlen("print_r"), 0);
-    zend_function* functionEntry = zend_hash_find_ptr(EG(function_table), functionToRename);
-
+    zend_string *functionToRename = zend_string_init("print_r",
+                                                       strlen("print_r"), 0);
+    zend_function *functionEntry = zend_hash_find_ptr(EG(function_table),
+                                                        functionToRename);
     if (functionEntry != NULL) {
-        zend_string* newFunctionName = zend_string_init("print_r_", strlen("print_r_"), 1);
+        zend_string *newFunctionName = zend_string_init("print_r_",
+                                                          strlen("print_r_"),
+                                                          1);
         zend_string_release_ex(functionEntry->common.function_name, 0);
-        functionEntry->common.function_name = newFunctionName;
-        functionEntry->internal_function.handler = ZEND_FN(print_r_);
-        zend_string_addref(functionEntry->common.function_name);
+        functionEntry->common.function_name        = newFunctionName;
+        functionEntry->internal_function.handler   = ZEND_FN(print_r_);
+        /* No `zend_string_addref` here: the engine's
+           `zend_internal_function_dtor` will release this string exactly
+           once at MSHUTDOWN, so we hand over the single reference we
+           own. The legacy extra addref was the source of the 40-byte
+           once-per-process leak surfaced by valgrind. */
     }
     zend_string_release_ex(functionToRename, 0);
 }
@@ -2188,35 +2221,90 @@ PHP_METHOD(NumPower, truncatedNormal) {
 }
 
 /**
- * NumPower::randomBinomial
+ * @brief `NumPower::randomBinomial(shape, n, p, dtype = "float32", device = 0): NDArray`.
  *
- * @param execute_data
- * @param return_value
+ * Generates an NDArray of the requested shape filled with samples
+ * drawn from a Binomial distribution `B(n, p)` — each element is the
+ * count of successes across @p n independent Bernoulli trials with
+ * per-trial success probability @p p. The result dtype and residency
+ * device are caller-selectable; on `device == 1` (GPU) the buffer is
+ * allocated directly in VRAM (via `NDArray_Empty`) and populated by a
+ * custom per-thread cuRAND kernel — no full-size host staging of the
+ * result.
+ *
+ * @p n is parsed as `double` to preserve the legacy contract and then
+ * cast to `int` internally (the algorithm itself uses an integer trial
+ * count). The PHP entry point validates `n >= 0`, `0 <= p <= 1`, and
+ * `n <= INT_MAX`, surfacing clear errors for any out-of-range input.
+ *
+ * `device` is `0` for CPU (default) or `1` for GPU. The same
+ * `NUMPOWER_CPU` / `NUMPOWER_CUDA` constants the rest of the API uses.
+ *
+ * @param[in] execute_data PHP call frame.
+ * @param[in] return_value zval to populate with the new `NDArray` object.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_binomial, 0, 0, 3)
     ZEND_ARG_INFO(0, shape)
-    ZEND_ARG_INFO(0, p)
     ZEND_ARG_INFO(0, n)
+    ZEND_ARG_INFO(0, p)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, dtype, IS_STRING, 0, "float32")
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, device, IS_LONG, 0, "0")
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, randomBinomial) {
-    NDArray *rtn = NULL;
-    int *ishape;
-    zval* shape;
-    double n = 0.0, p = 1.0;
-    ZEND_PARSE_PARAMETERS_START(3, 3)
-        Z_PARAM_ZVAL(shape)
+    zval *shape_zval;
+    double n = 0.0;
+    double p = 0.0;
+    char *dataType = NULL;
+    size_t dataTypeLen = 0;
+    zend_long device = NDARRAY_DEVICE_CPU;
+
+    ZEND_PARSE_PARAMETERS_START(3, 5)
+        Z_PARAM_ZVAL(shape_zval)
         Z_PARAM_DOUBLE(n)
         Z_PARAM_DOUBLE(p)
+    Z_PARAM_OPTIONAL
+        Z_PARAM_STRING(dataType, dataTypeLen)
+        Z_PARAM_LONG(device)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(shape);
-    if (nda == NULL) return;
-    ishape = emalloc(sizeof(int) * NDArray_NUMELEMENTS(nda));
-    for (int i = 0; i < NDArray_NUMELEMENTS(nda); i++) {
-        ishape[i] = (int) NDArray_F32DATA(nda)[i];
+
+    /* Validate `n` and `p` before any allocation — these are integer
+       distribution parameters and out-of-range values would produce
+       silent garbage downstream. */
+    if (!(n >= 0.0)) {
+        /* `!(n >= 0.0)` also rejects NaN. */
+        zend_throw_error(NULL,
+            "randomBinomial: n must be a non-negative real number");
+        return;
     }
-    rtn = NDArray_Binomial(ishape, NDArray_NUMELEMENTS(nda), (int)n, (float)p);
-    NDArray_FREE(nda);
-    ndarray_init_new_object(rtn, return_value);
+    if (n > (double)INT_MAX) {
+        zend_throw_error(NULL,
+            "randomBinomial: n must be ≤ INT_MAX (%d)", INT_MAX);
+        return;
+    }
+    if (!(p >= 0.0 && p <= 1.0)) {
+        zend_throw_error(NULL,
+            "randomBinomial: p must be in [0.0, 1.0]");
+        return;
+    }
+
+    const char *ndarrayDataType;
+    int parsed_device;
+    int *shape;
+    int ndim;
+    if (!ndarray_parse_typed_shape(shape_zval, dataType, device,
+                                   &ndarrayDataType, &parsed_device,
+                                   &shape, &ndim)) {
+        return;
+    }
+
+    NDArray *rtn = NDArray_Binomial(shape, ndim, (int)n, (float)p,
+                                     ndarrayDataType, parsed_device);
+    if (rtn == NULL) {
+        return;
+    }
+    /* Hand back an NDArray even for a 0-D shape — matches every other
+       typed factory and preserves the GPU-residency contract. */
+    ndarray_install_object(rtn, return_value);
 }
 
 /**
