@@ -25,6 +25,29 @@ double NDArray_Reduce_Prod(NDArray *a);
 double NDArray_Reduce_Min(NDArray *a);
 double NDArray_Reduce_Max(NDArray *a);
 double NDArray_Reduce_Mean(NDArray *a);
+
+/* ── Reduction-as-NDArray (preserves dtype) ─────────────────────────────────
+   Return the no-axis reduction as a 0-D NDArray whose dtype matches @p a's.
+   Routes through `NDArray_Reduce_*` for the actual computation and stores
+   the resulting double into an output buffer of the correct dtype via
+   `ndarray_set_from_double`. Used by the sum/prod PHP entry points so the
+   caller can dispatch to `NDArray_ScalarToZval` and return the dtype-aware
+   PHP scalar (`string` for `float128`/`uint64`, `int`/`float` otherwise). */
+NDArray *NDArray_Reduce_Sum_AsNDArray(NDArray *a);
+NDArray *NDArray_Reduce_Prod_AsNDArray(NDArray *a);
+
+/* ── Axis-based reductions ─────────────────────────────────────────────────
+   Reduce along a single axis @p axis (must be in range [0, ndim)). The
+   output dtype matches @p a's, and the device is preserved (CPU input
+   → CPU output; GPU input → GPU output, no host staging). The output
+   shape is @p a's shape with @p axis removed; for a 1-D input the output
+   is a 0-D NDArray. */
+enum ndarray_reduce_axis_op {
+    ND_AXIS_RED_SUM,
+    ND_AXIS_RED_PROD
+};
+NDArray *NDArray_Reduce_Axis(NDArray *a, int axis,
+                              enum ndarray_reduce_axis_op op);
 float NDArray_Mean_Float_Axis(NDArray* a, NDArray *b);
 NDArray* NDArray_Abs(NDArray *nda);
 float NDArray_Median_Float(NDArray* a);
@@ -52,6 +75,14 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b);
    kernel for every native dtype. Returns a new GPU NDArray. opcode is one
    of the ZEND_ADD/SUB/MUL/DIV/POW/MOD constants. */
 NDArray* NDArray_TypedBinOp_GPU(int opcode, NDArray* a, NDArray* b);
+
+/* Native int64 / uint64 CPU binary op. Avoids the float64 round-trip used
+   by the generic arithmetic dispatcher so values past 2^53 survive end-to-
+   end. Both operands must be on CPU and share the dtype (`int64` or
+   `uint64`). One operand may be a 0-D scalar. opcode is ZEND_ADD/SUB/MUL/
+   MOD/POW; ZEND_DIV is promoted to float64 upstream by ndarray_div_promote
+   and never reaches this entry point. */
+NDArray* NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray* a, NDArray* b);
 
 NDArray* NDArray_Add(NDArray* a, NDArray* b);
 

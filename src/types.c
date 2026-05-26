@@ -154,17 +154,19 @@ const char *promote_dtype(const char *a, const char *b)
 
 const char *compute_dtype_for_arithmetic(const char *result_dtype)
 {
-    /* Map any dtype to a float compute type. The arithmetic kernels are only
-       implemented for float32 / float64 / float128, so non-float dtypes are
-       upcast and the dispatcher casts the result back to result_dtype.
-       Cast-back is value-preserving for all integer values that fit in the
-       chosen compute type's mantissa (53 bits for float64); int64/uint64
-       values above 2^53 round, matching PyTorch behavior when forced through
-       a 64-bit float. */
+    /* Map any dtype to a compute type. Float compute kernels exist for
+       float32 / float64 / float128, and a native-int64 / uint64 CPU kernel
+       lives in arithmetics.c (with matching GPU kernels via TypedBinOp_GPU).
+       Other integer dtypes (int8..int32, uint8..uint32) fit losslessly in
+       float64's 53-bit mantissa so they keep their float64 promotion. The
+       caller casts the result back to result_dtype after the op runs. */
     if (!strcmp(result_dtype, "float128")) return "float128";
     if (!strcmp(result_dtype, "float64"))  return "float64";
-    if (!strcmp(result_dtype, "int32")  || !strcmp(result_dtype, "uint32") ||
-        !strcmp(result_dtype, "int64")  || !strcmp(result_dtype, "uint64")) {
+    /* int64 / uint64 use native CPU + GPU kernels so wide values past 2^53
+       survive end-to-end (the prior float64 promotion silently rounded). */
+    if (!strcmp(result_dtype, "int64"))    return "int64";
+    if (!strcmp(result_dtype, "uint64"))   return "uint64";
+    if (!strcmp(result_dtype, "int32")  || !strcmp(result_dtype, "uint32")) {
         return "float64";
     }
     /* float4, float8, float16, float32, int8, uint8, int16, uint16 → float32 */

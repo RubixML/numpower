@@ -116,17 +116,33 @@ NDArray_Transpose(NDArray *a, NDArray_Dims *permute) {
     }
     NDArray_enableFlags(ret, NDARRAY_ARRAY_F_CONTIGUOUS);
 
-    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU || (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU && NDArray_NDIM(a) != 2)) {
-        NDArray * contiguous_ret;
-        contiguous_ret = NDArray_ToContiguous(ret);
+    /* GPU 2-D float32 has a tiled-coalesced specialisation; every other case
+       (CPU, GPU >2-D, or any non-float32 GPU dtype) goes through the dtype-
+       agnostic strided D2D copy in `NDArray_ToContiguous`. The float32 fast
+       path was the only one wired to a dtype-specific kernel — re-using it
+       for `int64` / `uint64` / `float64` etc. would reinterpret the bytes
+       as float32 and silently corrupt the result, which broke `NDArray_
+       Rollaxis` (and therefore axis-based `sum` / `prod`) for every
+       non-float32 GPU 2-D array. */
+    int use_f32_path = (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU)
+                       && (NDArray_NDIM(a) == 2)
+                       && (strcmp(NDArray_TYPE(a), "float32") == 0);
+    if (!use_f32_path) {
+        NDArray *contiguous_ret = NDArray_ToContiguous(ret);
         NDArray_FREE(ret);
         return contiguous_ret;
-    } else {
-#ifdef HAVE_CUBLAS
-        cuda_float_transpose(32, 8, NDArray_F32DATA(ret), NDArray_F32DATA(ret), NDArray_SHAPE(a)[1], NDArray_SHAPE(a)[0]);
-        return ret;
-#endif
     }
+#ifdef HAVE_CUBLAS
+    cuda_float_transpose(32, 8, NDArray_F32DATA(ret), NDArray_F32DATA(ret),
+                         NDArray_SHAPE(a)[1], NDArray_SHAPE(a)[0]);
+    return ret;
+#else
+    /* Unreachable: use_f32_path requires HAVE_CUBLAS via the GPU device
+       check above, but be defensive in case the macro layout changes. */
+    NDArray *contiguous_ret = NDArray_ToContiguous(ret);
+    NDArray_FREE(ret);
+    return contiguous_ret;
+#endif
 }
 
 /**
