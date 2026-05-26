@@ -673,14 +673,31 @@ static int ndarray_arith_dispatch(zend_uchar opcode, zval *op1, zval *op2,
             return FAILURE;
         }
     } else {
-        /* Either both NDArrays or neither — fall through to the generic
-           resolver with no peer anchor (string scalars then throw). */
-        nda = ndarray_arith_resolve_operand(op1, NULL, &nda_owned);
-        if (nda == NULL) return FAILURE;
-        ndb = ndarray_arith_resolve_operand(op2, nda, &ndb_owned);
-        if (ndb == NULL) {
-            if (nda_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
-            return FAILURE;
+        /* Either both NDArrays or neither. For both-scalar (or both-array,
+           or one-array-one-array) the order matters only when exactly one
+           operand is `IS_STRING`: the string needs a peer NDArray to
+           anchor its dtype against. Resolve the non-string side first when
+           the asymmetry shows up, then anchor the string against it; this
+           keeps `add('1.5', 2)` and `add(2, '1.5')` symmetrical instead of
+           letting the first form throw while the second succeeds. */
+        int op1_is_str = Z_TYPE_P(op1) == IS_STRING;
+        int op2_is_str = Z_TYPE_P(op2) == IS_STRING;
+        if (op1_is_str && !op2_is_str) {
+            ndb = ndarray_arith_resolve_operand(op2, NULL, &ndb_owned);
+            if (ndb == NULL) return FAILURE;
+            nda = ndarray_arith_resolve_operand(op1, ndb, &nda_owned);
+            if (nda == NULL) {
+                if (ndb_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
+                return FAILURE;
+            }
+        } else {
+            nda = ndarray_arith_resolve_operand(op1, NULL, &nda_owned);
+            if (nda == NULL) return FAILURE;
+            ndb = ndarray_arith_resolve_operand(op2, nda, &ndb_owned);
+            if (ndb == NULL) {
+                if (nda_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+                return FAILURE;
+            }
         }
     }
 
@@ -894,13 +911,21 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
     NDArray *b = ndb_cast ? ndb_cast : ndb;
     int use_double   = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
     int use_float128 = is_type(comp_type, NDARRAY_TYPE_FLOAT128);
-    int use_int64    = is_type(comp_type, "int64") || is_type(comp_type, "uint64");
+    int use_int_native =
+        is_type(comp_type, "int8")  || is_type(comp_type, "uint8")  ||
+        is_type(comp_type, "int16") || is_type(comp_type, "uint16") ||
+        is_type(comp_type, "int32") || is_type(comp_type, "uint32") ||
+        is_type(comp_type, "int64") || is_type(comp_type, "uint64");
 
     NDArray *rtn = NULL;
-    if (use_int64) {
-        /* Native int64 / uint64 CPU kernel — preserves full precision past
-           2^53 (the prior float64 compute path silently rounded). */
-        rtn = NDArray_TypedBinOp_CPU_Int64(opcode, a, b);
+    if (use_int_native) {
+        /* Native integer CPU kernel — keeps every integer dtype native so
+           PyTorch's modular wrap-around survives end-to-end. The legacy
+           float64 round-trip silently rounded `int32 * int32` past 2^53
+           (e.g. `(2^28+1)^2` returned 536870912 instead of 536870913)
+           and the matching `cuda_cast_f64_to_i32` saturated rather than
+           wrapping, so CPU and GPU diverged on the same input. */
+        rtn = NDArray_TypedBinOp_CPU_Int(opcode, a, b);
     } else {
         switch (opcode) {
         case ZEND_ADD:

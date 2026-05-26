@@ -154,21 +154,35 @@ const char *promote_dtype(const char *a, const char *b)
 
 const char *compute_dtype_for_arithmetic(const char *result_dtype)
 {
-    /* Map any dtype to a compute type. Float compute kernels exist for
-       float32 / float64 / float128, and a native-int64 / uint64 CPU kernel
-       lives in arithmetics.c (with matching GPU kernels via TypedBinOp_GPU).
-       Other integer dtypes (int8..int32, uint8..uint32) fit losslessly in
-       float64's 53-bit mantissa so they keep their float64 promotion. The
-       caller casts the result back to result_dtype after the op runs. */
+    /* Map any dtype to a compute type. The available compute kernels are:
+       - float32 / float64 / float128 (the legacy float kernels), and
+       - every native integer dtype (int8..int64, uint8..uint64) routed
+         through `NDArray_TypedBinOp_CPU_Int` on CPU and the per-dtype
+         `cuda_<op>_<tag>` kernels on GPU.
+
+       Integer dtypes now keep their native compute type so PyTorch's
+       modular wrap-around semantics survive end-to-end. The prior
+       implementation promoted narrow ints to float32 and 32/64-bit ints
+       to float64; once an intermediate exceeded the float mantissa
+       (24 bits for narrow ints — still safe for int8..int16 — or 53 bits
+       for the wider ints) the result silently rounded, and the cast back
+       to the narrow target diverged between CPU (double round-trip wraps)
+       and GPU (`cuda_cast_f64_to_i32` saturates). Native int compute
+       eliminates both issues.
+
+       Caller (`ndarray_promote_and_op`) casts the result back to
+       result_dtype after the op runs whenever comp_type and result_type
+       differ (e.g. for division which promotes to float). */
     if (!strcmp(result_dtype, "float128")) return "float128";
     if (!strcmp(result_dtype, "float64"))  return "float64";
-    /* int64 / uint64 use native CPU + GPU kernels so wide values past 2^53
-       survive end-to-end (the prior float64 promotion silently rounded). */
-    if (!strcmp(result_dtype, "int64"))    return "int64";
-    if (!strcmp(result_dtype, "uint64"))   return "uint64";
-    if (!strcmp(result_dtype, "int32")  || !strcmp(result_dtype, "uint32")) {
-        return "float64";
+    if (!strcmp(result_dtype, "int8")    || !strcmp(result_dtype, "uint8")  ||
+        !strcmp(result_dtype, "int16")   || !strcmp(result_dtype, "uint16") ||
+        !strcmp(result_dtype, "int32")   || !strcmp(result_dtype, "uint32") ||
+        !strcmp(result_dtype, "int64")   || !strcmp(result_dtype, "uint64")) {
+        return result_dtype;
     }
-    /* float4, float8, float16, float32, int8, uint8, int16, uint16 → float32 */
+    /* float4, float8, float16, float32 → float32 (narrow floats route
+       through the float32 kernel and the result casts back to the
+       caller's dtype). */
     return "float32";
 }

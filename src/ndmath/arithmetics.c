@@ -895,67 +895,12 @@ NDArray_Reduce_Axis(NDArray *a, int axis, enum ndarray_reduce_axis_op op) {
     int n_slice_i        = (int)n_per_slice;
     size_t slice_bytes   = (size_t)n_per_slice * (size_t)elsize;
 
-    /* fp4 / fp8 widened dtype is still themselves (float family kept as-is);
-       no native binop, so stage through float16. */
-    if (!strcmp(out_dt, "float4") || !strcmp(out_dt, "float8")) {
-        int *cast_shape = emalloc(sizeof(int) * (out_ndim > 0 ? out_ndim : 1));
-        if (out_ndim > 0) {
-            memcpy(cast_shape, out_shape, sizeof(int) * out_ndim);
-        } else {
-            cast_shape[0] = 1;
-        }
-        NDArray *out_f16 = NDArray_Empty(cast_shape, out_ndim, "float16",
-                                          NDARRAY_DEVICE_GPU);
-        if (out_f16 == NULL) {
-            if (a_rolled != a_widened) NDArray_FREE(a_rolled);
-            if (a_widened != a) NDArray_FREE(a_widened);
-            NDArray_FREE(out);
-            return NULL;
-        }
-        int *src_shape = emalloc(sizeof(int));
-        src_shape[0] = (int)n_per_slice;
-        NDArray *slice_f16 = NDArray_Empty(src_shape, 1, "float16",
-                                            NDARRAY_DEVICE_GPU);
-        if (slice_f16 == NULL) {
-            if (a_rolled != a_widened) NDArray_FREE(a_rolled);
-            if (a_widened != a) NDArray_FREE(a_widened);
-            NDArray_FREE(out_f16);
-            NDArray_FREE(out);
-            return NULL;
-        }
-        for (long k = 0; k < s_axis; k++) {
-            const uint8_t *src_k = (const uint8_t *)(src_data + (size_t)k * slice_bytes);
-            if (!strcmp(out_dt, "float4")) {
-                cuda_cast_fp4_to_f16((uint8_t *)src_k,
-                                     (uint16_t *)NDArray_DATA(slice_f16), n_slice_i);
-            } else {
-                cuda_cast_fp8_to_f16((uint8_t *)src_k,
-                                     (uint16_t *)NDArray_DATA(slice_f16), n_slice_i);
-            }
-            if (k == 0) {
-                cudaMemcpy(NDArray_DATA(out_f16), NDArray_DATA(slice_f16),
-                           (size_t)n_per_slice * sizeof(uint16_t),
-                           cudaMemcpyDeviceToDevice);
-            } else {
-                gpu_axis_inplace_op("float16", NDArray_DATA(out_f16),
-                                    NDArray_DATA(slice_f16), n_slice_i, op);
-            }
-        }
-        NDArray_FREE(slice_f16);
-        if (!strcmp(out_dt, "float4")) {
-            cuda_cast_f16_to_fp4((uint16_t *)NDArray_DATA(out_f16),
-                                 (uint8_t *)out_data, (int)n_per_slice);
-        } else {
-            cuda_cast_f16_to_fp8((uint16_t *)NDArray_DATA(out_f16),
-                                 (uint8_t *)out_data, (int)n_per_slice);
-        }
-        NDArray_FREE(out_f16);
-        if (a_rolled != a_widened) NDArray_FREE(a_rolled);
-        if (a_widened != a) NDArray_FREE(a_widened);
-        return out;
-    }
-
-    /* Native-kernel dtypes. */
+    /* `out_dt` is the widened dtype produced by `ndarray_reduce_result_dtype`
+       — narrow floats (fp4 / fp8 / fp16) have already been widened to
+       float32 by the `NDArray_AsType(a, out_dt)` cast above, so the GPU
+       loop below only ever sees the native-kernel dtypes (int8..int64,
+       uint8..uint64, float32, float64, float128 via dd). No fp4 / fp8
+       branch is needed here. */
     cudaError_t cerr = cudaMemcpy(out_data, src_data, slice_bytes,
                                    cudaMemcpyDeviceToDevice);
     if (cerr != cudaSuccess) {
@@ -2656,76 +2601,206 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
-   Native int64 / uint64 CPU arithmetic kernels. The default arithmetic
-   dispatch promotes both `int64` and `uint64` inputs to `float64` for the
-   computation; that round-trip through a 53-bit mantissa loses precision
-   for any value past 2⁵³ (and silently overflows on inverse cast when the
-   intermediate exceeds the dtype's range). The kernels below operate
-   directly on the native integer storage so wide values survive end-to-end.
+   Native integer CPU arithmetic kernels covering every one of the eight
+   integer dtypes: `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`,
+   `int64`, `uint64`.
 
-   Identical broadcast / 0-D scalar / shape-mismatch handling as the
-   float kernels. `b_temp` / `a_temp` track scalar-broadcast NDArrays so
-   the cleanup path can free them exactly once.
+   The legacy dispatch promoted every integer dtype to `float32` (narrow
+   ints) or `float64` (int32 / uint32 / int64 / uint64) before computing,
+   then cast the result back. That round-trip:
+    1. Loses precision once the intermediate exceeds the float mantissa
+       (24 bits for narrow ints — still safe for int8..int16 products —
+       53 bits for int32 / uint32 / int64 / uint64; int32 * int32 with
+       products past 2⁵³ silently rounds; int64 / uint64 past 2⁵³ rounds
+       in every binary op).
+    2. Diverges from PyTorch which always computes natively in the input
+       dtype with C-style modular wrap.
+    3. Diverges between CPU (double rounds, then narrow cast wraps) and
+       GPU (`cuda_cast_f64_to_i32` saturates on out-of-range doubles —
+       different result on the same inputs).
+
+   The kernels below operate directly on the native integer storage so
+   the result matches PyTorch's modular semantics on both CPU and GPU.
+   Identical broadcast / 0-D scalar / shape handling as the float kernels.
    ────────────────────────────────────────────────────────────────────────── */
 
 /**
- * @brief Body of `NDArray_TypedBinOp_CPU_Int64` / `_UInt64` — shared by both
- *        wraps to avoid duplicating the broadcast / alloc plumbing.
+ * @brief Broadcast a 0-D scalar to @p other's shape on CPU, preserving its
+ *        dtype.
  *
- * @param[in] a, b     Caller-validated operands of the same dtype (`int64`
- *                     or `uint64`) on CPU. One operand may be 0-D.
- * @param[in] opcode   ZEND_ADD / SUB / MUL / MOD / POW (DIV routes to float).
- * @param[in] is_signed Non-zero when both operands are `int64` (controls
- *                     mod / pow behaviour for negative bases / negative
- *                     exponents).
- * @return Freshly-allocated NDArray on success (caller owns), NULL on
- *         validation error (PHP exception in flight).
+ * Shared by the integer-binop path so the scalar+array case can fall into
+ * the same per-element loop as the array+array case. The caller frees the
+ * returned NDArray.
+ *
+ * @param[in] scalar 0-D NDArray (dtype must match @p other's).
+ * @param[in] other  Peer NDArray whose shape drives the broadcast.
+ * @return Caller-owned broadcast NDArray on success, NULL on allocation
+ *         failure (PHP exception in flight).
  */
 static NDArray *
-ndarray_int64_binop_cpu(NDArray *a, NDArray *b, int opcode, int is_signed) {
+ndarray_int_broadcast_scalar_cpu(NDArray *scalar, NDArray *other) {
+    int ndim = NDArray_NDIM(other);
+    int *n_shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
+    if (ndim > 0) {
+        memcpy(n_shape, NDArray_SHAPE(other), sizeof(int) * ndim);
+    } else {
+        n_shape[0] = 1;
+    }
+    NDArray *r = NDArray_Empty(n_shape, ndim, NDArray_TYPE(other),
+                                NDARRAY_DEVICE_CPU);
+    if (r == NULL) return NULL;
+    long n = NDArray_NUMELEMENTS(r);
+    int elsize = NDArray_ELSIZE(other);
+    const char *src = (const char *)NDArray_DATA(scalar);
+    char *dst = (char *)NDArray_DATA(r);
+    for (long i = 0; i < n; i++) {
+        memcpy(dst + (size_t)i * (size_t)elsize, src, (size_t)elsize);
+    }
+    return r;
+}
+
+/**
+ * @brief Compile a single per-dtype native-int binop body.
+ *
+ * The macro takes a C type (signed) and an unsigned-twin type for the
+ * arithmetic ops that need defined wrap-around semantics (signed integer
+ * overflow is undefined behaviour in C, so add/sub/mul/pow go through the
+ * unsigned twin and round-trip back; div/mod use the signed type so the
+ * sign-of-dividend remainder is what falls out).
+ *
+ * @param T     Signed integer C type (e.g. `int32_t`).
+ * @param UT    Unsigned-twin C type of the same width (e.g. `uint32_t`).
+ *
+ * For unsigned target dtypes (`uint8` etc.) we pass the unsigned type as
+ * both T and UT — the casts then collapse to no-ops, and `%` on unsigned
+ * is already well-defined.
+ *
+ * The generated body assumes `n` elements, `ap` / `bp` source pointers
+ * of type `T *`, and `rp` destination pointer of type `T *`.
+ */
+#define NDARRAY_INT_BINOP_BODY(T, UT)                                                \
+    do {                                                                              \
+        switch (opcode) {                                                             \
+            case ZEND_ADD:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] + (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_SUB:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] - (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_MUL:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] * (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_MOD:                                                            \
+                /* Divisor==0 → 0 to avoid SIGFPE; matches the float */               \
+                /* kernels' NaN convention. C11 `%` on signed values is */            \
+                /* truncated (sign of dividend), matching PyTorch's */                \
+                /* `torch.remainder` semantics for integer dtypes. */                 \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (bp[i] == 0) ? 0 : (T)(ap[i] % bp[i]);                    \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_POW: {                                                          \
+                /* Binary exponentiation in unsigned width — base / r */              \
+                /* round-trip through UT so signed overflow stays UB-free. */         \
+                /* Negative exponents on signed types yield 0 (integer */             \
+                /* truncation of a fractional reciprocal), matching */                \
+                /* PyTorch's int-pow contract. */                                     \
+                for (long i = 0; i < n; i++) {                                        \
+                    T base = ap[i], exp = bp[i];                                      \
+                    if (exp < 0) { rp[i] = 0; continue; }                             \
+                    UT r = 1u;                                                        \
+                    UT b_acc = (UT)base;                                              \
+                    while (exp > 0) {                                                 \
+                        if (exp & 1) r = (UT)(r * b_acc);                             \
+                        b_acc = (UT)(b_acc * b_acc);                                  \
+                        exp >>= 1;                                                    \
+                    }                                                                 \
+                    rp[i] = (T)r;                                                     \
+                }                                                                     \
+                break;                                                                \
+            }                                                                         \
+            default:                                                                  \
+                zend_throw_error(NULL,                                                \
+                    "Unsupported opcode for native int CPU binop.");                  \
+                return -1;                                                            \
+        }                                                                             \
+    } while (0)
+
+/**
+ * @brief Run the per-dtype native-int binop body for @p dt against the
+ *        already-broadcast @p ap / @p bp / @p rp buffers.
+ *
+ * Centralises the dtype dispatch so the broadcast / alloc plumbing in
+ * `ndarray_int_binop_cpu` doesn't have to repeat the 8-way switch.
+ *
+ * @param[in]  dt     Canonical dtype string (one of `int8`..`uint64`).
+ * @param[in]  n      Element count.
+ * @param[in]  ap, bp Operand pointers; must be of `dt`'s native width.
+ * @param[out] rp     Destination pointer; same width as @p ap / @p bp.
+ * @param[in]  opcode ZEND_ADD / SUB / MUL / MOD / POW.
+ * @return 0 on success, -1 on dispatch error (PHP exception in flight).
+ */
+static int
+ndarray_run_int_binop_typed(const char *dt, long n,
+                             const void *ap_v, const void *bp_v, void *rp_v,
+                             int opcode) {
+#define DISPATCH_INT_TYPED(STR, T, UT)                                                \
+    if (!strcmp(dt, STR)) {                                                           \
+        const T *ap = (const T *)ap_v;                                                \
+        const T *bp = (const T *)bp_v;                                                \
+        T       *rp = (T       *)rp_v;                                                \
+        NDARRAY_INT_BINOP_BODY(T, UT);                                                \
+        return 0;                                                                     \
+    }
+    DISPATCH_INT_TYPED("int8",   int8_t,   uint8_t)
+    DISPATCH_INT_TYPED("uint8",  uint8_t,  uint8_t)
+    DISPATCH_INT_TYPED("int16",  int16_t,  uint16_t)
+    DISPATCH_INT_TYPED("uint16", uint16_t, uint16_t)
+    DISPATCH_INT_TYPED("int32",  int32_t,  uint32_t)
+    DISPATCH_INT_TYPED("uint32", uint32_t, uint32_t)
+    DISPATCH_INT_TYPED("int64",  int64_t,  uint64_t)
+    DISPATCH_INT_TYPED("uint64", uint64_t, uint64_t)
+#undef DISPATCH_INT_TYPED
+    zend_throw_error(NULL,
+        "Native CPU int binop: unsupported dtype \"%s\".", dt);
+    return -1;
+}
+
+/**
+ * @brief Broadcast / alloc / dispatch plumbing for native int CPU binops.
+ *
+ * Handles the 0-D scalar promotion, NumPy-style shape broadcasting,
+ * result allocation, and per-dtype kernel dispatch shared by every
+ * integer dtype. Inputs must already share the same dtype — the caller
+ * (`ndarray_promote_and_op` via `NDArray_TypedBinOp_CPU_Int`) is
+ * responsible for casting.
+ *
+ * @param[in] a, b    Same-dtype CPU operands; one may be 0-D.
+ * @param[in] opcode  ZEND_ADD / SUB / MUL / MOD / POW.
+ * @return Result NDArray on success (caller owns), NULL on validation /
+ *         allocation failure (PHP exception in flight).
+ */
+static NDArray *
+ndarray_int_binop_cpu(NDArray *a, NDArray *b, int opcode) {
     NDArray *a_temp = NULL, *b_temp = NULL, *broadcasted = NULL;
     const char *out_dt = NDArray_TYPE(a);
 
-    /* 0-D scalar broadcast — fill a temporary buffer of `other`'s shape with
-       the scalar's single element. The scalar may be int64 or uint64; we
-       compare dtypes only via the canonical string. */
+    /* 0-D scalar broadcast — fill a buffer of the peer's shape with the
+       scalar's single element. */
     if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
         a_temp = a;
-        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(b));
-        memcpy(n_shape, NDArray_SHAPE(b), sizeof(int) * NDArray_NDIM(b));
-        a = NDArray_Empty(n_shape, NDArray_NDIM(b), out_dt, NDARRAY_DEVICE_CPU);
+        a = ndarray_int_broadcast_scalar_cpu(a_temp, b);
         if (a == NULL) return NULL;
-        if (is_signed) {
-            int64_t v;
-            memcpy(&v, NDArray_DATA(a_temp), sizeof(int64_t));
-            int64_t *dst = (int64_t *)NDArray_DATA(a);
-            for (long i = 0; i < NDArray_NUMELEMENTS(a); i++) dst[i] = v;
-        } else {
-            uint64_t v;
-            memcpy(&v, NDArray_DATA(a_temp), sizeof(uint64_t));
-            uint64_t *dst = (uint64_t *)NDArray_DATA(a);
-            for (long i = 0; i < NDArray_NUMELEMENTS(a); i++) dst[i] = v;
-        }
     } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
         b_temp = b;
-        int *n_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
-        memcpy(n_shape, NDArray_SHAPE(a), sizeof(int) * NDArray_NDIM(a));
-        b = NDArray_Empty(n_shape, NDArray_NDIM(a), out_dt, NDARRAY_DEVICE_CPU);
-        if (b == NULL) {
-            if (a_temp) NDArray_FREE(a);
-            return NULL;
-        }
-        if (is_signed) {
-            int64_t v;
-            memcpy(&v, NDArray_DATA(b_temp), sizeof(int64_t));
-            int64_t *dst = (int64_t *)NDArray_DATA(b);
-            for (long i = 0; i < NDArray_NUMELEMENTS(b); i++) dst[i] = v;
-        } else {
-            uint64_t v;
-            memcpy(&v, NDArray_DATA(b_temp), sizeof(uint64_t));
-            uint64_t *dst = (uint64_t *)NDArray_DATA(b);
-            for (long i = 0; i < NDArray_NUMELEMENTS(b); i++) dst[i] = v;
-        }
+        b = ndarray_int_broadcast_scalar_cpu(b_temp, a);
+        if (b == NULL) return NULL;
     }
 
     NDArray *a_broad = NULL, *b_broad = NULL;
@@ -2768,79 +2843,16 @@ ndarray_int64_binop_cpu(NDArray *a, NDArray *b, int opcode, int is_signed) {
     }
 
     long n = NDArray_NUMELEMENTS(a_broad);
-    if (is_signed) {
-        int64_t *ap = (int64_t *)NDArray_DATA(a_broad);
-        int64_t *bp = (int64_t *)NDArray_DATA(b_broad);
-        int64_t *rp = (int64_t *)NDArray_DATA(result);
-        switch (opcode) {
-            case ZEND_ADD: for (long i = 0; i < n; i++) rp[i] = (int64_t)((uint64_t)ap[i] + (uint64_t)bp[i]); break;
-            case ZEND_SUB: for (long i = 0; i < n; i++) rp[i] = (int64_t)((uint64_t)ap[i] - (uint64_t)bp[i]); break;
-            case ZEND_MUL: for (long i = 0; i < n; i++) rp[i] = (int64_t)((uint64_t)ap[i] * (uint64_t)bp[i]); break;
-            case ZEND_MOD:
-                for (long i = 0; i < n; i++) {
-                    /* C99 `%` on signed: implementation-defined for negative
-                       operands pre-C11. We rely on C11 truncated semantics
-                       (result has sign of dividend), which matches PyTorch's
-                       `torch.remainder` for ints. Divide-by-zero → 0 to
-                       avoid SIGFPE; matches the float kernels' NaN convention
-                       in spirit. */
-                    rp[i] = (bp[i] == 0) ? 0 : (ap[i] % bp[i]);
-                }
-                break;
-            case ZEND_POW:
-                for (long i = 0; i < n; i++) {
-                    int64_t base = ap[i], exp = bp[i];
-                    if (exp < 0) { rp[i] = 0; continue; }
-                    int64_t r = 1;
-                    while (exp > 0) {
-                        if (exp & 1) r = (int64_t)((uint64_t)r * (uint64_t)base);
-                        base = (int64_t)((uint64_t)base * (uint64_t)base);
-                        exp >>= 1;
-                    }
-                    rp[i] = r;
-                }
-                break;
-            default:
-                zend_throw_error(NULL, "Unsupported opcode for int64 CPU binop.");
-                NDArray_FREE(result);
-                if (a_temp) NDArray_FREE(a);
-                if (b_temp) NDArray_FREE(b);
-                if (broadcasted) NDArray_FREE(broadcasted);
-                return NULL;
-        }
-    } else {
-        uint64_t *ap = (uint64_t *)NDArray_DATA(a_broad);
-        uint64_t *bp = (uint64_t *)NDArray_DATA(b_broad);
-        uint64_t *rp = (uint64_t *)NDArray_DATA(result);
-        switch (opcode) {
-            case ZEND_ADD: for (long i = 0; i < n; i++) rp[i] = ap[i] + bp[i]; break;
-            case ZEND_SUB: for (long i = 0; i < n; i++) rp[i] = ap[i] - bp[i]; break;
-            case ZEND_MUL: for (long i = 0; i < n; i++) rp[i] = ap[i] * bp[i]; break;
-            case ZEND_MOD:
-                for (long i = 0; i < n; i++) {
-                    rp[i] = (bp[i] == 0) ? 0 : (ap[i] % bp[i]);
-                }
-                break;
-            case ZEND_POW:
-                for (long i = 0; i < n; i++) {
-                    uint64_t base = ap[i], exp = bp[i];
-                    uint64_t r = 1;
-                    while (exp > 0) {
-                        if (exp & 1) r *= base;
-                        base *= base;
-                        exp >>= 1;
-                    }
-                    rp[i] = r;
-                }
-                break;
-            default:
-                zend_throw_error(NULL, "Unsupported opcode for uint64 CPU binop.");
-                NDArray_FREE(result);
-                if (a_temp) NDArray_FREE(a);
-                if (b_temp) NDArray_FREE(b);
-                if (broadcasted) NDArray_FREE(broadcasted);
-                return NULL;
-        }
+    if (ndarray_run_int_binop_typed(out_dt, n,
+                                     NDArray_DATA(a_broad),
+                                     NDArray_DATA(b_broad),
+                                     NDArray_DATA(result),
+                                     opcode) < 0) {
+        NDArray_FREE(result);
+        if (a_temp) NDArray_FREE(a);
+        if (b_temp) NDArray_FREE(b);
+        if (broadcasted) NDArray_FREE(broadcasted);
+        return NULL;
     }
 
     if (a_temp) NDArray_FREE(a);
@@ -2850,42 +2862,70 @@ ndarray_int64_binop_cpu(NDArray *a, NDArray *b, int opcode, int is_signed) {
 }
 
 /**
- * @brief CPU binary-op dispatcher for `int64` / `uint64`.
+ * @brief CPU binary-op dispatcher for every native integer dtype.
  *
- * Routes the supported opcodes to the native-int kernel above so wide
- * values stay loss-free. Falls back to NULL with a PHP error for opcodes
- * outside the supported set — the caller (`ndarray_promote_and_op`) only
- * funnels +, -, *, %, ** here; / is already promoted to float by
- * `ndarray_div_promote`.
+ * Routes the supported opcodes to the native-int kernel above so:
+ *  - PyTorch's modular wrap-around semantics are honoured exactly,
+ *  - precision past 2⁵³ survives for `int64` / `uint64`,
+ *  - the result matches the GPU path's native-int kernels bit-for-bit.
+ *
+ * The previous implementation handled only `int64` / `uint64`; narrower
+ * ints still went through float promotion, which silently diverged from
+ * PyTorch for `int32 * int32` once the intermediate exceeded the float64
+ * mantissa.
+ *
+ * Both operands must already share the same dtype — the calling
+ * dispatcher (`ndarray_promote_and_op`) handles the cast through
+ * `NDArray_AsType` before reaching this entry point. Falls back to
+ * NULL with a PHP error for opcodes outside the supported set; `/` is
+ * already promoted to a float dtype by `ndarray_div_promote` and never
+ * reaches here.
  *
  * @param[in] opcode ZEND_ADD / SUB / MUL / MOD / POW.
- * @param[in] a, b   Same-dtype operands (`int64` or `uint64`), CPU resident.
+ * @param[in] a, b   Same-dtype operands on CPU; one may be 0-D.
  * @return Result NDArray on success, NULL on error.
  */
 NDArray *
-NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray *a, NDArray *b) {
+NDArray_TypedBinOp_CPU_Int(int opcode, NDArray *a, NDArray *b) {
     if (NDArray_DEVICE(a) != NDARRAY_DEVICE_CPU
         || NDArray_DEVICE(b) != NDARRAY_DEVICE_CPU) {
         zend_throw_error(NULL,
-            "NDArray_TypedBinOp_CPU_Int64: both operands must be on CPU.");
+            "NDArray_TypedBinOp_CPU_Int: both operands must be on CPU.");
         return NULL;
     }
     if (strcmp(NDArray_TYPE(a), NDArray_TYPE(b)) != 0) {
         zend_throw_error(NULL,
-            "NDArray_TypedBinOp_CPU_Int64: dtype mismatch (%s vs %s).",
+            "NDArray_TypedBinOp_CPU_Int: dtype mismatch (%s vs %s).",
             NDArray_TYPE(a), NDArray_TYPE(b));
         return NULL;
     }
-    int is_signed;
-    if (!strcmp(NDArray_TYPE(a), "int64"))  is_signed = 1;
-    else if (!strcmp(NDArray_TYPE(a), "uint64")) is_signed = 0;
-    else {
+    const char *dt = NDArray_TYPE(a);
+    int is_int = (!strcmp(dt, "int8")  || !strcmp(dt, "uint8")  ||
+                  !strcmp(dt, "int16") || !strcmp(dt, "uint16") ||
+                  !strcmp(dt, "int32") || !strcmp(dt, "uint32") ||
+                  !strcmp(dt, "int64") || !strcmp(dt, "uint64"));
+    if (!is_int) {
         zend_throw_error(NULL,
-            "NDArray_TypedBinOp_CPU_Int64: unsupported dtype \"%s\".",
-            NDArray_TYPE(a));
+            "NDArray_TypedBinOp_CPU_Int: unsupported dtype \"%s\".", dt);
         return NULL;
     }
-    return ndarray_int64_binop_cpu(a, b, opcode, is_signed);
+    return ndarray_int_binop_cpu(a, b, opcode);
+}
+
+/**
+ * @brief Backward-compatible alias of `NDArray_TypedBinOp_CPU_Int` for the
+ *        previous int64-only entry point.
+ *
+ * Kept so any external caller (header-included helper, test harness) built
+ * against the prior name keeps linking. The body just forwards.
+ *
+ * @param[in] opcode ZEND_ADD / SUB / MUL / MOD / POW.
+ * @param[in] a, b   Same-dtype `int64` / `uint64` operands on CPU.
+ * @return Same return contract as `NDArray_TypedBinOp_CPU_Int`.
+ */
+NDArray *
+NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray *a, NDArray *b) {
+    return NDArray_TypedBinOp_CPU_Int(opcode, a, b);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

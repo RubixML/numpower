@@ -952,6 +952,35 @@ NDArray_SwapAxes(NDArray *a, int axis1, int axis2)
     return NDArray_Transpose(a, &new_axes);
 }
 
+/**
+ * @brief Roll @p axis backward so it lands at position @p start.
+ *
+ * Matches numpy's `np.rollaxis`. After the call, the source axis
+ * `axis` becomes axis `start` in the returned NDArray; the remaining
+ * axes keep their relative order. Negative @p axis / @p start values
+ * count from the end (`-1` == `n - 1` for axis, `n` for start).
+ *
+ * **Pre-existing bug fixed**:
+ *  - The bounds check `!(0 <= start < n + 1)` used a C chained-
+ *    comparison that always evaluated to `false` (binding as
+ *    `(0 <= start) < (n + 1)`), so an out-of-range @p start went
+ *    through silently.
+ *  - The shift loop `for (i = n; i > start; i--) axes[i] = axes[i-1];`
+ *    wrote one element past the allocated @c axes buffer (axes[n] is
+ *    OOB) and also shifted axes outside the [start..axis] range,
+ *    producing an axes vector with a repeated index (e.g.
+ *    `[1, 0, 1]` for a 3-D rollaxis(a, 1, 0) instead of `[1, 0, 2]`).
+ *    `NDArray_Transpose` then threw "repeated axis in transpose".
+ *    Both fixes here: proper inclusive bound and shift only
+ *    `[start..axis-1]` right by one to make room at `start`.
+ *
+ * @param[in] a     Source NDArray.
+ * @param[in] axis  Axis index to move (negative counts from the end).
+ * @param[in] start Target position in `[0, n]` (n is the valid
+ *                  "insert past last axis" position).
+ * @return Newly-allocated NDArray with rolled axes; NULL on error
+ *         (PHP exception in flight).
+ */
 NDArray*
 NDArray_Rollaxis(NDArray *a, int axis, int start)
 {
@@ -964,11 +993,15 @@ NDArray_Rollaxis(NDArray *a, int axis, int start)
 
     if (start < 0) start += n;
 
-    if (!(0 <= start < n + 1)) {
-        zend_throw_error(NULL, "'%s' arg requires %d <= %s < %d, but %d was passed in", "start", -n, "start", n+1, start);
+    if (start < 0 || start > n) {
+        zend_throw_error(NULL,
+            "'start' arg requires %d <= start <= %d, but %d was passed in",
+            -n, n, start);
         return NULL;
     }
 
+    /* numpy semantic: when start > axis, the destination index after the
+       shift is start - 1 (the axis "passes through" itself). */
     if (axis < start) start -= 1;
 
     if (axis == start) {
@@ -980,8 +1013,23 @@ NDArray_Rollaxis(NDArray *a, int axis, int start)
         axes[i] = i;
     }
 
-    for (int i = n; i > start; i--) {
-        axes[i] = axes[i - 1];
+    /* Move source axis to position `start`. There are two cases:
+        - start < axis: shift axes [start..axis-1] one step right
+          (toward the end) to free position `start`; then write
+          `axes[start] = axis`. Loop iterates `i = axis .. start+1`.
+        - start > axis: shift axes [axis+1..start] one step left
+          (toward the front) to free position `start`. Loop iterates
+          `i = axis .. start-1`.
+       Both leave the remaining axes in their original relative order,
+       matching numpy's contract. */
+    if (start < axis) {
+        for (int i = axis; i > start; i--) {
+            axes[i] = axes[i - 1];
+        }
+    } else {
+        for (int i = axis; i < start; i++) {
+            axes[i] = axes[i + 1];
+        }
     }
     axes[start] = axis;
 

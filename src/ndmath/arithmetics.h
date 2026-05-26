@@ -76,12 +76,22 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b);
    of the ZEND_ADD/SUB/MUL/DIV/POW/MOD constants. */
 NDArray* NDArray_TypedBinOp_GPU(int opcode, NDArray* a, NDArray* b);
 
-/* Native int64 / uint64 CPU binary op. Avoids the float64 round-trip used
-   by the generic arithmetic dispatcher so values past 2^53 survive end-to-
-   end. Both operands must be on CPU and share the dtype (`int64` or
-   `uint64`). One operand may be a 0-D scalar. opcode is ZEND_ADD/SUB/MUL/
-   MOD/POW; ZEND_DIV is promoted to float64 upstream by ndarray_div_promote
-   and never reaches this entry point. */
+/* Native CPU binary op for every integer dtype (`int8`..`int64`,
+   `uint8`..`uint64`). Avoids the float round-trip used by the generic
+   arithmetic dispatcher so:
+    - PyTorch's modular wrap-around semantics survive for every dtype,
+    - `int64` / `uint64` precision past 2^53 is preserved,
+    - the result matches the GPU `cuda_<op>_<tag>` kernels bit-for-bit
+      (the prior float64 → narrow-int double-cast diverged between CPU
+      and GPU once intermediates spilled past 2^53).
+   Both operands must be on CPU and share the dtype. One operand may be
+   a 0-D scalar. opcode is ZEND_ADD/SUB/MUL/MOD/POW; ZEND_DIV is promoted
+   to float upstream by ndarray_div_promote and never reaches here. */
+NDArray* NDArray_TypedBinOp_CPU_Int(int opcode, NDArray* a, NDArray* b);
+
+/* Backward-compatible alias of NDArray_TypedBinOp_CPU_Int — retained
+   so external callers built against the prior int64-only entry point
+   keep linking. Forwards to the dtype-generic helper above. */
 NDArray* NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray* a, NDArray* b);
 
 NDArray* NDArray_Add(NDArray* a, NDArray* b);

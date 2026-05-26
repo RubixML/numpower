@@ -2002,12 +2002,33 @@ NDArray_IsBroadcastable(const NDArray *array1, const NDArray *array2) {
 }
 
 /**
- * Broadcast NDArrays
+ * @brief Broadcast @p a to the shape of @p b, producing a contiguous NDArray.
  *
- * @todo Implement ND broadcast
- * @param a
- * @param b
- * @return
+ * Used by every arithmetic kernel to materialise the smaller operand at
+ * the larger operand's shape before per-element computation. Currently
+ * implements three concrete broadcast patterns (matching NumPy's standard
+ * rules but not the full N-D generality):
+ *  - **scalar → N-D**: 0-D source replicated across every element.
+ *  - **1-D → N-D**: 1-D source matching the last dim of dst replicated
+ *    across leading axes (the standard "row broadcast" pattern).
+ *  - **2-D → 2-D**: column / row broadcast of (R,1), (1,C), or (R,1) → (R,C).
+ *
+ * **Pre-existing bug fixed**: the previous implementation hard-coded
+ * `sizeof(float)` for float32-tagged sources and `sizeof(double)` for
+ * everything else. For `int32` (4 bytes) or `int8` (1 byte) the `else`
+ * branch then copied 8 bytes per element, reading 4–7 bytes past the
+ * source buffer and writing 4–7 bytes past the destination — silent
+ * out-of-bounds reads and writes. Every native int dtype routed through
+ * `NDArray_TypedBinOp_CPU_Int` with broadcast triggered the bug.
+ * The body now uses `NDArray_ELSIZE` throughout so byte counts stay
+ * correct for every dtype.
+ *
+ * @param[in] a Smaller operand to broadcast (CPU or GPU resident).
+ * @param[in] b Larger operand whose shape drives the broadcast.
+ * @return Caller-owned NDArray with @p b's shape and @p a's dtype on
+ *         success; the same pointer @p a when the inputs already share
+ *         shape; NULL with a PHP exception in flight on a shape /
+ *         dtype mismatch.
  */
 NDArray *
 NDArray_Broadcast(NDArray *a, NDArray *b) {
@@ -2037,153 +2058,120 @@ NDArray_Broadcast(NDArray *a, NDArray *b) {
     }
 
     rtn = NDArray_EmptyLike(dst);
-    char *rtn_p = NDArray_DATA(rtn);
+    if (rtn == NULL) return NULL;
+    char *rtn_p   = (char *)NDArray_DATA(rtn);
+    int   elsize  = NDArray_ELSIZE(rtn);
+    long  dst_n   = NDArray_NUMELEMENTS(dst);
+
+    /* Scalar (0-D) source broadcast to N-D destination — replicate the
+       single element across every output slot using `memcpy` for CPU and
+       `vmemcpyd2d` for GPU. Works for any dtype because we copy `elsize`
+       bytes per write. */
     if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
-        for (i = 0; i < NDArray_NUMELEMENTS(b); i++) {
-            if (NDArray_TYPE(rtn) == NDARRAY_TYPE_FLOAT32) {
-                NDArray_F32DATA(rtn)[i] = NDArray_F32DATA(a)[0];
-            } else {
-                NDArray_F64DATA(rtn)[i] = NDArray_F64DATA(a)[0];
+        if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
+            const char *src_p = (const char *)NDArray_DATA(a);
+            for (i = 0; i < dst_n; i++) {
+                memcpy(rtn_p + (size_t)i * (size_t)elsize, src_p, (size_t)elsize);
             }
-
         }
+#ifdef HAVE_CUBLAS
+        else {
+            char *src_p = (char *)NDArray_DATA(a);
+            for (i = 0; i < dst_n; i++) {
+                vmemcpyd2d(src_p, rtn_p + (size_t)i * (size_t)elsize, (unsigned int)elsize);
+            }
+        }
+#endif
+        return rtn;
     }
 
+    /* 1-D source broadcast to N-D destination: when the source length
+       matches `dst`'s last dim, replicate the source `prod(leading_dims)`
+       times back-to-back. Each replication is `last_dim * elsize` bytes,
+       which matches both `src` (= last_dim elements) and one full row of
+       `dst`. */
     if (NDArray_NDIM(src) == 1 && NDArray_NDIM(dst) > 1) {
-        if (NDArray_SHAPE(src)[0] == NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]
-            || NDArray_SHAPE(src)[0] == NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]) {
-            if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
-                for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                    if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                        memcpy(rtn_p, NDArray_F32DATA(src), sizeof(float) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(float) * NDArray_SHAPE(src)[0]);
-                    } else {
-                        memcpy(rtn_p, NDArray_F64DATA(src), sizeof(double) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(double) * NDArray_SHAPE(src)[0]);
+        int   nd_dst   = NDArray_NDIM(dst);
+        int   last_dim = NDArray_SHAPE(dst)[nd_dst - 1];
+        int   src_len  = NDArray_SHAPE(src)[0];
+        long  rows     = dst_n / (long)last_dim;  /* leading-axes product */
 
-                    }
+        if (src_len == last_dim) {
+            size_t row_bytes = (size_t)last_dim * (size_t)elsize;
+            if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
+                const char *src_p = (const char *)NDArray_DATA(src);
+                for (long r = 0; r < rows; r++) {
+                    memcpy(rtn_p + (size_t)r * row_bytes, src_p, row_bytes);
                 }
             }
 #ifdef HAVE_CUBLAS
-            if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_GPU) {
-                for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                    if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                        vmemcpyd2d(NDArray_DATA(src), rtn_p, sizeof(float) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(float) * NDArray_SHAPE(src)[0]);
-                    } else {
-                        vmemcpyd2d(NDArray_DATA(src), rtn_p, sizeof(double) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(double) * NDArray_SHAPE(src)[0]);
-
-                    }
+            else {
+                char *src_p = (char *)NDArray_DATA(src);
+                for (long r = 0; r < rows; r++) {
+                    vmemcpyd2d(src_p, rtn_p + (size_t)r * row_bytes,
+                               (unsigned int)row_bytes);
                 }
             }
 #endif
+            return rtn;
         }
     }
-    int j;
+
+    /* 2-D-to-2-D column or row broadcast. Covers the typical (R,1) →
+       (R,C) "column vector" and the matching cases the legacy code
+       targeted. Implemented as an elsize-aware element-wise copy: for
+       each (i, j) in dst, pick the matching index in src (i if column-
+       broadcast, j if row-broadcast). */
     if (NDArray_NDIM(src) == 2 && NDArray_NDIM(dst) == 2) {
-        if (NDArray_SHAPE(src)[NDArray_NDIM(dst) - 2] == NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]) {
+        int   rows_dst = NDArray_SHAPE(dst)[0];
+        int   cols_dst = NDArray_SHAPE(dst)[1];
+        int   rows_src = NDArray_SHAPE(src)[0];
+        int   cols_src = NDArray_SHAPE(src)[1];
+        const char *src_p = (const char *)NDArray_DATA(src);
+
+        /* Column-broadcast: src is (R, 1), dst is (R, C). Read src[i] for
+           every column j of dst row i. */
+        if (rows_src == rows_dst && cols_src == 1) {
             if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
-                if (NDArray_NUMELEMENTS(src) != 1) {
-                    for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                        for (j = 0; j < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]; j++) {
-                            if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                                NDArray_F32DATA(rtn)[
-                                        (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                        j] = NDArray_F32DATA(src)[i];
-                            } else {
-                                NDArray_F64DATA(rtn)[
-                                        (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                        j] = NDArray_F64DATA(src)[i];
-                            }
-                        }
+                for (i = 0; i < rows_dst; i++) {
+                    for (int j = 0; j < cols_dst; j++) {
+                        memcpy(rtn_p + ((size_t)i * cols_dst + j) * elsize,
+                               src_p + (size_t)i * elsize, (size_t)elsize);
                     }
-                } else {
-                    for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                        for (j = 0; j < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]; j++) {
-                            if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                                NDArray_F32DATA(rtn)[
-                                        (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                        j] = NDArray_F32DATA(src)[0];
-                            } else {
-                                NDArray_F64DATA(rtn)[
-                                        (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                        j] = NDArray_F64DATA(src)[0];
-                            }
-                        }
-                    }
-                    return rtn;
                 }
             }
 #ifdef HAVE_CUBLAS
-            char *tmp_p;
-            if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_GPU) {
-                if (NDArray_NUMELEMENTS(src) != 1) {
-                    for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                        for (j = 0; j < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]; j++) {
-                            if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                                tmp_p = (char *) (NDArray_F32DATA(src) + i);
-                                rtn_p = (char *) (NDArray_F32DATA(rtn) +
-                                                  (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                                  j);
-                                vmemcpyd2d(tmp_p, rtn_p, sizeof(float));
-                            } else {
-                                tmp_p = (char *) (NDArray_F64DATA(src) + i);
-                                rtn_p = (char *) (NDArray_F64DATA(rtn) +
-                                                  (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                                  j);
-                                vmemcpyd2d(tmp_p, rtn_p, sizeof(double));
-                            }
-                        }
+            else {
+                for (i = 0; i < rows_dst; i++) {
+                    for (int j = 0; j < cols_dst; j++) {
+                        vmemcpyd2d((char *)(src_p + (size_t)i * elsize),
+                                   rtn_p + ((size_t)i * cols_dst + j) * elsize,
+                                   (unsigned int)elsize);
                     }
-                } else {
-                    for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                        for (j = 0; j < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]; j++) {
-                            if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                                tmp_p = (char *) (NDArray_F32DATA(src));
-                                rtn_p = (char *) (NDArray_F32DATA(rtn) +
-                                                  (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                                  j);
-                                vmemcpyd2d(tmp_p, rtn_p, sizeof(float));
-                            } else {
-                                tmp_p = (char *) (NDArray_F64DATA(src));
-                                rtn_p = (char *) (NDArray_F64DATA(rtn) +
-                                                  (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) +
-                                                  j);
-                                vmemcpyd2d(tmp_p, rtn_p, sizeof(double));
-                            }
-                        }
-                    }
-                    return rtn;
                 }
             }
 #endif
+            return rtn;
         }
-        if (NDArray_SHAPE(src)[NDArray_NDIM(dst) - 1] == NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]) {
+
+        /* Row-broadcast: src is (1, C), dst is (R, C). Read src[j] for
+           every row i. */
+        if (rows_src == 1 && cols_src == cols_dst) {
+            size_t row_bytes = (size_t)cols_dst * (size_t)elsize;
             if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
-                for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                    if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                        memcpy(rtn_p, NDArray_F32DATA(src), sizeof(float) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(float) * NDArray_SHAPE(src)[NDArray_NDIM(dst) - 1]);
-                    } else {
-                        memcpy(rtn_p, NDArray_F64DATA(src), sizeof(double) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = rtn_p + (sizeof(double) * NDArray_SHAPE(src)[NDArray_NDIM(dst) - 1]);
-                    }
+                for (i = 0; i < rows_dst; i++) {
+                    memcpy(rtn_p + (size_t)i * row_bytes, src_p, row_bytes);
                 }
             }
 #ifdef HAVE_CUBLAS
-            if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_GPU) {
-                for (i = 0; i < NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 2]; i++) {
-                    if (NDArray_TYPE(src) == NDARRAY_TYPE_FLOAT32) {
-                        vmemcpyd2d(NDArray_DATA(src), rtn_p, sizeof(float) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = (char *) (NDArray_F32DATA(rtn) + (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) + j);
-                    } else {
-                        vmemcpyd2d(NDArray_DATA(src), rtn_p, sizeof(double) * NDArray_SHAPE(dst)[NDArray_NDIM(dst) - 1]);
-                        rtn_p = (char *) (NDArray_F64DATA(rtn) + (i * NDArray_STRIDES(rtn)[NDArray_NDIM(rtn) - 2] / NDArray_ELSIZE(rtn)) + j);
-                    }
+            else {
+                for (i = 0; i < rows_dst; i++) {
+                    vmemcpyd2d((char *)src_p, rtn_p + (size_t)i * row_bytes,
+                               (unsigned int)row_bytes);
                 }
             }
 #endif
+            return rtn;
         }
     }
     return rtn;
