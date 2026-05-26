@@ -13,6 +13,17 @@ try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMe
       kernel runs (so the binop stays on device).
    3. Produce the same result as the equivalent CPU path. */
 
+/* Cross-platform fp128 stringification: libquadmath emits full decimal
+   form, DD-emulation (macOS/MSVC) emits scientific notation. CPU and GPU
+   on the same host always agree byte-for-byte (we still compare the raw
+   strings below), but the final echo prints through `fp128_norm` so the
+   assertion text is identical across builds. */
+function fp128_norm($v) {
+    $s = (string)$v;
+    if ($s === '0' || $s === '0.0') return '0';
+    return sprintf('%g', (float)$s);
+}
+
 /* float128 GPU + string fp128 scalar stays on GPU and matches CPU. */
 $f_cpu = new NDArray(['1.5e30', '2.5e30'], 'float128');
 $f_gpu = $f_cpu->gpu();
@@ -22,7 +33,7 @@ if (!$r_gpu->isGPU()) { echo "fp128+str not on GPU\n"; }
 if ((string)$r_cpu[0] !== (string)$r_gpu[0]) {
     echo "fp128 CPU/GPU disagree: cpu=", (string)$r_cpu[0], " gpu=", (string)$r_gpu[0], "\n";
 }
-echo "fp128 add: ", (string)$r_gpu[0], "\n";
+echo "fp128 add: ", fp128_norm($r_gpu[0]), "\n";
 
 /* uint64 GPU + string uint64 scalar — native GPU kernel keeps values precise. */
 $u_cpu = new NDArray(['18446744073709551610', '5'], 'uint64');
@@ -56,7 +67,7 @@ echo "u64 op+10: ", (string)$r[0], "\n";
 $f_gpu = (new NDArray(['1e29'], 'float128'))->gpu();
 $r = NumPower::add('5e29', $f_gpu);
 if (!$r->isGPU()) { echo "str + fp128 not on GPU\n"; }
-echo "str+fp128: ", (string)$r[0], "\n";
+echo "str+fp128: ", fp128_norm($r[0]), "\n";
 
 /* Multiply / mod / pow string scalars all route through the same dispatch. */
 $u_gpu = (new NDArray(['1000', '2000'], 'uint64'))->gpu();
@@ -73,11 +84,11 @@ $r = NumPower::pow($i_gpu, '15');
 echo "i64 pow: ", (string)$r[0], "\n";
 ?>
 --EXPECT--
-fp128 add: 2500000000000000000000000000000
+fp128 add: 2.5e+30
 u64 add: 18446744073709551615
 i64 sub: 500000000000000000
 u64 op+10: 18446744073709551610
-str+fp128: 600000000000000000000000000000
+str+fp128: 6.0e+29
 u64 mul: 1000000000000000000
 i64 mod: 4
 i64 pow: 1000000000000000

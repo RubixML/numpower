@@ -12,11 +12,25 @@ Arithmetic ops accept string scalars and preserve precision for float128 / int64
    Now every binary op handles IS_STRING via NDArray_EncodeZvalToDtype and
    int64 / uint64 compute natively. */
 
+/* Cross-platform fp128 stringification: libquadmath emits full decimal
+   form ("6000000000000000000000000000000"), DD-emulation (macOS / MSVC)
+   falls back to scientific notation ("6e+30"). Both forms encode the same
+   value — funnel through `sprintf('%g', (float)...)` for a portable
+   "<mantissa>e<exp>" comparison. The values exercised below are exactly
+   representable in fp64, so the (float) cast is loss-free for assertion
+   purposes; loss-free fp128 storage is verified separately by the wide-
+   precision dtypes (int64/uint64). */
+function fp128_norm($s) {
+    $s = (string)$s;
+    if ($s === '0' || $s === '0.0') return '0';
+    return sprintf('%g', (float)$s);
+}
+
 /* float128 scalar via string — full-precision parse */
 $f = new NDArray(['1e30', '2e30'], 'float128');
 $r = NumPower::add($f, '5e30');
-echo "f128 add string=", (string)$r[0], "\n";      // 6e30
-echo "f128 add string=", (string)$r[1], "\n";      // 7e30
+echo "f128 add string=", fp128_norm($r[0]), "\n";      // 6.0e+30
+echo "f128 add string=", fp128_norm($r[1]), "\n";      // 7.0e+30
 
 /* uint64 scalar via string — full-precision parse */
 $u = new NDArray(['18446744073709551610'], 'uint64');
@@ -68,8 +82,8 @@ $r = NumPower::multiply($ones, false);
 echo "i32*false: ", (string)$r[0], " ", (string)$r[1], " ", (string)$r[2], "\n";
 ?>
 --EXPECT--
-f128 add string=6000000000000000000000000000000
-f128 add string=7000000000000000000000000000000
+f128 add string=6.0e+30
+f128 add string=7.0e+30
 u64+5='18446744073709551615'
 i64 add: '9223372036854775807'
 u64 op +10: '18446744073709551610'

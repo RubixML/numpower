@@ -89,11 +89,6 @@ NDArray* NDArray_TypedBinOp_GPU(int opcode, NDArray* a, NDArray* b);
    to float upstream by ndarray_div_promote and never reaches here. */
 NDArray* NDArray_TypedBinOp_CPU_Int(int opcode, NDArray* a, NDArray* b);
 
-/* Backward-compatible alias of NDArray_TypedBinOp_CPU_Int — retained
-   so external callers built against the prior int64-only entry point
-   keep linking. Forwards to the dtype-generic helper above. */
-NDArray* NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray* a, NDArray* b);
-
 NDArray* NDArray_Add(NDArray* a, NDArray* b);
 
 #endif //PHPSCI_NDARRAY_ARITHMETICS_H

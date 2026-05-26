@@ -2912,22 +2912,6 @@ NDArray_TypedBinOp_CPU_Int(int opcode, NDArray *a, NDArray *b) {
     return ndarray_int_binop_cpu(a, b, opcode);
 }
 
-/**
- * @brief Backward-compatible alias of `NDArray_TypedBinOp_CPU_Int` for the
- *        previous int64-only entry point.
- *
- * Kept so any external caller (header-included helper, test harness) built
- * against the prior name keeps linking. The body just forwards.
- *
- * @param[in] opcode ZEND_ADD / SUB / MUL / MOD / POW.
- * @param[in] a, b   Same-dtype `int64` / `uint64` operands on CPU.
- * @return Same return contract as `NDArray_TypedBinOp_CPU_Int`.
- */
-NDArray *
-NDArray_TypedBinOp_CPU_Int64(int opcode, NDArray *a, NDArray *b) {
-    return NDArray_TypedBinOp_CPU_Int(opcode, a, b);
-}
-
 /* ──────────────────────────────────────────────────────────────────────────
    GPU typed binary op dispatch — keeps GPU arrays on GPU for every supported
    dtype. Handles scalar(0-dim)+array broadcast natively by filling a typed

@@ -19,6 +19,18 @@ function phptype($v) {
     return gettype($v);
 }
 
+/* Cross-platform fp128 stringification: libquadmath emits full decimal
+   form, DD-emulation (macOS/MSVC) emits scientific notation for large
+   magnitudes. Funnel through `sprintf('%g', (float)...)` for a portable
+   "<mantissa>e<exp>" form; the values exercised here are exactly
+   representable in fp64 so the (float) cast is loss-free for assertion
+   purposes. */
+function fp128_norm($v) {
+    $s = (string)$v;
+    if ($s === '0' || $s === '0.0') return '0';
+    return sprintf('%g', (float)$s);
+}
+
 /* Narrow int widening: int8 prod = 5*5*5*5 = 625 (overflows int8 = -127..127).
    With widening to int64 the result is exact. */
 $i = new NDArray([5, 5, 5, 5], 'int8');
@@ -41,7 +53,7 @@ echo "i64 sum=", NumPower::sum($i), "\n";     /* 9223372036854775807 (INT64_MAX)
 
 /* float128 sum — native fp128 accumulator (DD on macOS / non-GCC). */
 $f = new NDArray(['1e30', '2e30', '3e30'], 'float128');
-echo "f128 sum=", NumPower::sum($f), "\n";    /* 6e30 in fp128 precision */
+echo "f128 sum=", fp128_norm(NumPower::sum($f)), "\n";    /* 6e30 in fp128 precision */
 echo "f128 prod=", NumPower::prod(new NDArray(['1.5', '2', '3'], 'float128')), "\n"; /* 9 */
 
 /* Narrow floats widen to float32 so the sum doesn't saturate at the
@@ -103,7 +115,7 @@ i8 prod=625 type=int
 u8 sum=600 type=string
 u64 sum=9223372036854775811
 i64 sum=9223372036854775807
-f128 sum=6000000000000000000000000000000
+f128 sum=6.0e+30
 f128 prod=9
 f4 sum=14 type=float
 f8 sum=288
