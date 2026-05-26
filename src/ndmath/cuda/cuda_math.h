@@ -84,7 +84,250 @@ NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOpera
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
 void cuda_float_positive(int nblocks, float *d_array);
 void cuda_float_reciprocal(int nblocks, float *d_array);
-void cuda_truncated_normal(float* d_data, int size, double loc, double scale);
+/**
+ * @brief Fill a GPU float32 buffer with truncated-Gaussian samples.
+ *
+ * Per-element value is `loc + scale * z` where `z ~ N(0, 1)` is
+ * rejection-sampled to lie in `[-2, 2]`. Stored values are therefore in
+ * `[loc - 2σ, loc + 2σ]`. Each thread runs its own cuRAND state seeded
+ * from `(seed, idx)` so the streams are independent; the seed itself is
+ * fresh per call via `cuda_normal_next_seed` (was pinned to `1234ULL`
+ * in the previous implementation, producing identical samples on every
+ * call within one process).
+ *
+ * @param[out] d_data Destination GPU buffer of @p n floats.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_truncated_normal_f32(float *d_data, long n, float loc, float scale);
+
+/**
+ * @brief Fill a GPU float64 buffer with truncated-Gaussian samples.
+ *
+ * Companion to `cuda_truncated_normal_f32` for double precision. The
+ * underlying samples carry 53-bit precision before the affine
+ * transform; truncation bounds are evaluated in double too.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n doubles.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_truncated_normal_f64(double *d_data, long n, double loc, double scale);
+
+/**
+ * @brief Fill a GPU float32 buffer with N(@p mean, @p stddev^2) samples.
+ *
+ * Wraps `curandGenerateNormal`. cuRAND's contract requires an even sample
+ * count, so the wrapper transparently uses an internal +1 padding buffer
+ * when @p n is odd. The seed is derived from `time(NULL)` xored with a
+ * monotonically-increasing call counter so successive calls inside the
+ * same second still produce independent streams.
+ *
+ * @param[out] d_data  GPU buffer of @p n floats.
+ * @param[in]  n       Element count; ≥ 0.
+ * @param[in]  mean    Distribution mean (µ).
+ * @param[in]  stddev  Distribution standard deviation (σ); must be > 0
+ *                     for cuRAND to be well-defined.
+ */
+void cuda_normal_f32(float *d_data, long n, float mean, float stddev);
+
+/**
+ * @brief Fill a GPU float64 buffer with N(@p mean, @p stddev^2) samples.
+ *
+ * Companion to `cuda_normal_f32` for double precision. Same odd-size
+ * handling and same per-call seeding policy.
+ *
+ * @param[out] d_data  GPU buffer of @p n doubles.
+ * @param[in]  n       Element count; ≥ 0.
+ * @param[in]  mean    Distribution mean (µ).
+ * @param[in]  stddev  Distribution standard deviation (σ); must be > 0.
+ */
+void cuda_normal_f64(double *d_data, long n, double mean, double stddev);
+
+/**
+ * @brief Widen a GPU float64 normal stream into the on-device DD layout.
+ *
+ * Reads @p z[i] (a standard-normal double), evaluates the affine
+ * transform `value = loc + scale * z[i]` in true double-double
+ * arithmetic on device using the same `dd_add` / `dd_mul` primitives the
+ * arithmetic kernels use, and stores the result at
+ * `dst[2*i]` (hi) and `dst[2*i + 1]` (lo). Used by `NDArray_Normal` to
+ * keep the fp128 GPU path VRAM-direct (no host transit of the result).
+ *
+ * @param[in]  z         Length-@p n GPU buffer of standard-normal doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  loc_hi    DD high word of the distribution mean.
+ * @param[in]  loc_lo    DD low word of the distribution mean.
+ * @param[in]  scale_hi  DD high word of the distribution stddev.
+ * @param[in]  scale_lo  DD low word of the distribution stddev.
+ */
+void cuda_normal_dd_affine(const double *z, double *dst, long n,
+                           double loc_hi, double loc_lo,
+                           double scale_hi, double scale_lo);
+
+/**
+ * @brief Fill a GPU float32 buffer with uniform `[low, high)` samples.
+ *
+ * Wraps `curandGenerateUniform` to produce `(0, 1]` samples directly
+ * into @p d_data, then reflects via `1 - u` and applies the affine
+ * `low + (1 - u) * (high - low)` so the closed endpoint sits at
+ * @p low (matching numpy's `[low, high)` contract). cuRAND's uniform
+ * generator has no parity restriction, so the call is single-pass into
+ * the destination with no pad buffer. The seed is fresh per call
+ * (`cuda_normal_next_seed`) so successive calls in the same process
+ * produce independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n floats.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  low    Lower bound (inclusive).
+ * @param[in]  high   Upper bound (exclusive).
+ */
+void cuda_uniform_f32(float *d_data, long n, float low, float high);
+
+/**
+ * @brief Fill a GPU float64 buffer with uniform `[low, high)` samples.
+ *
+ * Companion to `cuda_uniform_f32` for double precision. Uses
+ * `curandGenerateUniformDouble`; the affine reflection runs in fp64 so
+ * the full 53-bit mantissa range is preserved across `[low, high)`.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n doubles.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  low    Lower bound (inclusive).
+ * @param[in]  high   Upper bound (exclusive).
+ */
+void cuda_uniform_f64(double *d_data, long n, double low, double high);
+
+/**
+ * @brief Widen a GPU float64 uniform stream into the on-device DD layout.
+ *
+ * Reads `[0, 1)` doubles from @p u (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and evaluates
+ * `value = low + u * range` in true double-double arithmetic on
+ * device. `range = high - low` is computed on the host in fp128/DD
+ * precision and passed as a DD pair so the caller's fp128 bounds
+ * survive bit-for-bit into the interleaved (hi, lo) output. Used by
+ * `NDArray_Uniform` to keep the fp128 GPU path VRAM-direct.
+ *
+ * @param[in]  u         Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  low_hi    DD high word of the lower bound.
+ * @param[in]  low_lo    DD low word of the lower bound.
+ * @param[in]  range_hi  DD high word of `(high - low)`.
+ * @param[in]  range_lo  DD low word of `(high - low)`.
+ */
+void cuda_uniform_dd_affine(const double *u, double *dst, long n,
+                             double low_hi, double low_lo,
+                             double range_hi, double range_lo);
+
+/**
+ * @brief Apply the normal/truncated-normal `loc + (int64)(scale * z)`
+ *        affine on the GPU and store the result as uint64.
+ *
+ * Reads (possibly truncated) standard-normal doubles from @p z and
+ * writes `dst[i] = loc + (uint64_t)((int64_t)(scaled * z[i]))`. The
+ * signed→unsigned wrap is intentional — matches numpy's `astype(uint64)`
+ * semantics for negative floats and lets a negative z subtract from
+ * @p loc through modular arithmetic. Used by `NDArray_Normal` and
+ * `NDArray_TruncatedNormal` to keep the u64 GPU path VRAM-direct (no
+ * host staging of the result).
+ *
+ * @param[in]  z      Length-@p n GPU buffer of standard-normal or
+ *                    truncated-standard-normal doubles (caller picks
+ *                    the source by which cuRAND wrapper populated it).
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  loc    Distribution mean (uint64).
+ * @param[in]  scaled Distribution stddev coerced to double.
+ */
+void cuda_normal_u64_affine(const double *z, unsigned long long *dst, long n,
+                             unsigned long long loc, double scaled);
+
+/**
+ * @brief Apply the uniform `low + (uint64)(width * u)` affine on the GPU.
+ *
+ * Reads `[0, 1)` doubles from @p u (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and writes
+ * `dst[i] = low + (uint64_t)(widthd * u[i])`. The width is a `double`
+ * because the cast `(double)(high - low)` happens once on the host —
+ * widths past 2^53 lose the same precision the CPU filler does
+ * (documented invariant). The unsigned add wraps modulo 2^64. Used by
+ * `NDArray_Uniform` to keep the u64 GPU path VRAM-direct.
+ *
+ * @param[in]  u      Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  low    Lower bound (uint64).
+ * @param[in]  widthd `(double)(high - low)`.
+ */
+void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
+                              unsigned long long low, double widthd);
+
+/**
+ * @brief Fill a GPU uint32 buffer with Poisson(@p lam) samples.
+ *
+ * Wraps `curandGeneratePoisson`. cuRAND picks an internal algorithm
+ * (rejection-from-normal or PTRS) based on @p lam. The library has an
+ * undocumented internal precision limit (empirically ~4 × 10^5 on the
+ * default XORWOW generator) beyond which the call returns a non-success
+ * status; we propagate that as a boolean so callers can raise a clear
+ * PHP error instead of returning a silently-zero buffer.
+ *
+ * There is no parity restriction (unlike the Normal generator), so the
+ * call is single-pass into the destination with no pad buffer. The
+ * seed is fresh per call (`cuda_normal_next_seed`) so successive calls
+ * in the same process produce independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p n unsigned ints.
+ * @param[in]  n      Element count; ≥ 0.
+ * @param[in]  lam    Distribution rate (λ); must be ≥ 0.
+ * @return 1 on success, 0 if cuRAND rejected the request (typically
+ *         due to @p lam exceeding the generator's internal precision
+ *         bound; the destination buffer is left untouched).
+ */
+int cuda_poisson_u32(unsigned int *d_data, long n, double lam);
+
+/**
+ * @brief Widen a GPU uint32 stream into the on-device DD layout.
+ *
+ * Used by `NDArray_Poisson` for the float128 GPU path: each Poisson
+ * sample (a non-negative integer up to ~10^9) is written as a DD pair
+ * with `hi = (double)src[i]` and `lo = 0.0`. uint32 ≤ 2^32 fits exactly
+ * in fp64's 53-bit mantissa, so the high word is byte-correct and the
+ * low word carries no residue. Used to keep the fp128 Poisson GPU
+ * path VRAM-direct — no host transit of the result.
+ *
+ * @param[in]  src Length-@p n GPU buffer of uint32 Poisson samples.
+ * @param[out] dst Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n   Element count.
+ */
+void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n);
+
+/**
+ * @brief Fill a GPU uint32 buffer with Binomial(@p n, @p p) samples.
+ *
+ * Direct Bernoulli method: each output slot owns its own per-thread
+ * cuRAND state seeded from `(seed, idx)`, runs @p n trials with
+ * success probability @p p, and writes the success count as a uint32.
+ * Cost is `O(n)` per output element — practical for `n` up to a few
+ * thousand. For very large `n` a BTPE-style algorithm would scale
+ * better, but the direct method stays numerically exact (the same
+ * algorithm as the CPU path), so the distribution contract holds for
+ * any `n`.
+ *
+ * The seed is fresh per call (`cuda_normal_next_seed`) so successive
+ * calls in the same process produce statistically-independent streams.
+ *
+ * @param[out] d_data Destination GPU buffer of @p total unsigned ints.
+ * @param[in]  total  Element count; ≥ 0.
+ * @param[in]  n      Number of Bernoulli trials per sample.
+ * @param[in]  p      Per-trial success probability in `[0, 1]`.
+ */
+void cuda_binomial_u32(unsigned int *d_data, long total, int n, float p);
 
 //Doubles
 void cuda_sum_double(int nblocks, double *a, double *rtn, int nelements);

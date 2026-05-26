@@ -120,9 +120,9 @@ Drop an ini fragment into your PHP's scan directory:
 
 ```bash
 PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-echo "extension=ndarray.so" | sudo tee /etc/php/$PHP_VER/cli/conf.d/40-numpower.ini
+echo "extension=ndarray.so" | sudo tee /etc/php/$PHP_VER/cli/conf.d/numpower.ini
 # Repeat for fpm/apache2 if you use those SAPIs:
-# sudo tee /etc/php/$PHP_VER/fpm/conf.d/40-numpower.ini < /etc/php/$PHP_VER/cli/conf.d/40-numpower.ini
+# sudo tee /etc/php/$PHP_VER/fpm/conf.d/numpower.ini < /etc/php/$PHP_VER/cli/conf.d/numpower.ini
 ```
 
 Done. Verify with `php -m | grep -i RubixNumPower`.
@@ -140,7 +140,7 @@ sudo dnf install -y cuda-toolkit                       # GPU (from NVIDIA's RPM 
 sudo dnf install -y php-gd libjpeg-turbo-devel libpng-devel libwebp-devel   # image bridge
 ```
 
-Then run the same `phpize → ./configure → make -j → sudo make install` as above, and add `extension=ndarray.so` to `/etc/php.d/40-ndarray.ini`.
+Then run the same `phpize → ./configure → make -j → sudo make install` as above, and add `extension=ndarray.so` to `/etc/php.d/ndarray.ini`.
 
 ### Arch Linux / Manjaro
 

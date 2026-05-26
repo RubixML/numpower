@@ -13,11 +13,94 @@ NDArray* NDArray_FromNDArray(NDArray *target, int buffer_offset, int* shape, int
 NDArray* NDArray_Zeros(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Ones(int *shape, int ndim, const char *type, int device);
 NDArray* NDArray_Identity(int size, const char *type, int device);
-NDArray* NDArray_Normal(double loc, double scale, int* shape, int ndim, int accelerator);
-NDArray* NDArray_TruncatedNormal(double loc, double scale, int* shape, int ndim, int accelerator);
-NDArray* NDArray_StandardNormal(int* shape, int ndim);
-NDArray* NDArray_Poisson(double lam, int* shape, int ndim);
-NDArray* NDArray_Uniform(double low, double high, int* shape, int ndim);
+
+/**
+ * @brief Arithmetic kind used to encode the (loc, scale) pair for the
+ *        Gaussian sampler.
+ *
+ * Selected by the requested dtype: `float128` carries loc/scale in fp128
+ * so wide-range parameters keep full 113-bit (or DD-equivalent)
+ * precision; `uint64` uses native unsigned 64-bit arithmetic so means
+ * past 2^53 stay exact; every other dtype uses double, which represents
+ * each smaller dtype's range without loss.
+ */
+typedef enum {
+    NDARRAY_NORMAL_KIND_DOUBLE = 0,
+    NDARRAY_NORMAL_KIND_FP128  = 1,
+    NDARRAY_NORMAL_KIND_UINT64 = 2
+} NDArrayNormalKind;
+
+/**
+ * @brief Discriminated (loc, scale) parameter set for the Gaussian sampler.
+ *
+ * `kind` selects the active union arm; the others are not initialised.
+ * Construction is handled by `PHP_METHOD(NumPower, normal)`.
+ */
+typedef struct {
+    NDArrayNormalKind kind;
+    union {
+        struct { double          loc, scale; } d;
+        struct { ndarray_fp128_t loc, scale; } f128;
+        struct { uint64_t        loc, scale; } u64;
+    } v;
+} NDArrayNormalSpec;
+
+/**
+ * @brief Map a canonical dtype string to its normal-sampler arithmetic kind.
+ *
+ * @param[in] type Canonical dtype string.
+ * @return one of NDARRAY_NORMAL_KIND_*.
+ */
+NDArrayNormalKind NDArray_NormalKindFor(const char *type);
+
+NDArray* NDArray_Normal(const NDArrayNormalSpec *spec, int *shape, int ndim,
+                        const char *type, int device);
+NDArray* NDArray_TruncatedNormal(const NDArrayNormalSpec *spec, int *shape,
+                                 int ndim, const char *type, int device);
+NDArray* NDArray_Poisson(double lam, int *shape, int ndim,
+                         const char *type, int device);
+
+/**
+ * @brief Arithmetic kind used to encode the (low, high) pair for the
+ *        uniform sampler.
+ *
+ * Selected by the requested dtype: `float128` carries low/high in fp128
+ * so wide-range parameters keep full 113-bit (or DD-equivalent)
+ * precision; `uint64` uses native unsigned 64-bit arithmetic so bounds
+ * past 2^53 stay exact; every other dtype uses double, which represents
+ * each smaller dtype's range without loss.
+ */
+typedef enum {
+    NDARRAY_UNIFORM_KIND_DOUBLE = 0,
+    NDARRAY_UNIFORM_KIND_FP128  = 1,
+    NDARRAY_UNIFORM_KIND_UINT64 = 2
+} NDArrayUniformKind;
+
+/**
+ * @brief Discriminated (low, high) parameter set for the uniform sampler.
+ *
+ * `kind` selects the active union arm; the others are not initialised.
+ * Construction is handled by `PHP_METHOD(NumPower, uniform)`.
+ */
+typedef struct {
+    NDArrayUniformKind kind;
+    union {
+        struct { double          low, high; } d;
+        struct { ndarray_fp128_t low, high; } f128;
+        struct { uint64_t        low, high; } u64;
+    } v;
+} NDArrayUniformSpec;
+
+/**
+ * @brief Map a canonical dtype string to its uniform-sampler arithmetic kind.
+ *
+ * @param[in] type Canonical dtype string.
+ * @return one of NDARRAY_UNIFORM_KIND_*.
+ */
+NDArrayUniformKind NDArray_UniformKindFor(const char *type);
+
+NDArray* NDArray_Uniform(const NDArrayUniformSpec *spec, int *shape, int ndim,
+                         const char *type, int device);
 NDArray* NDArray_Diag(NDArray *a, const char *type, int device);
 NDArray* NDArray_FillFloat(NDArray *a, float fill_value);
 NDArray* NDArray_Full(int *shape, int ndim, const char *type, int device,
@@ -69,7 +152,8 @@ NDArray* NDArray_Arange(const NDArrayArangeSpec *spec,
  * @return one of NDARRAY_ARANGE_KIND_*.
  */
 NDArrayArangeKind NDArray_ArangeKindFor(const char *type);
-NDArray* NDArray_Binomial(int *shape, int ndim, int n, float p);
+NDArray* NDArray_Binomial(int *shape, int ndim, int n, float p,
+                          const char *type, int device);
 NDArray* NDArray_EmptyLike(NDArray *a);
 NDArray* NDArray_FromNDArrayBase(NDArray *target, char *data_ptr, int* shape, int* strides, const int ndim);
 

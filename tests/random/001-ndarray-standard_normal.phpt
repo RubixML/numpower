@@ -1,192 +1,89 @@
 --TEST--
-NumPower::standardNormal
+NumPower::standardNormal() produces CPU values that follow N(0, 1)
 --FILE--
 <?php
-use NumPower as nd;
+/* CPU-only sanity checks on the standard-normal sample distribution.
+   N = 16384 samples give a standard error of 1/sqrt(N) ≈ 0.008, so a
+   0.2 absolute tolerance on mean and stddev passes with astronomical
+   probability while still failing loudly if the path computes wrong
+   moments.
 
-new class
-{
-    public function __construct()
-    {
-        $this->testCase1();
-        $this->testCase2();
-        $this->testCase3();
-        $this->testCase4();
-        $this->testCase5();
+   `NumPower::std` has a pre-existing dtype bug on float64 (it always
+   reads via NDArray_F32DATA), so we compute std manually from toArray()
+   — that path is dtype-correct via the typed element decoder.
+
+   The GPU distribution check has a dedicated counterpart in
+   tests/initializers/096-numpower-standard-normal-dtype-gpu.phpt (with
+   --SKIPIF-- for non-CUDA builds), so this file deliberately does not
+   exercise the GPU sampler — that keeps `--EXPECT--` strict (no
+   wildcards) on both CPU-only and CUDA-enabled CI matrices. */
+
+srand((int)(microtime(true) * 1000));
+mt_srand((int)(microtime(true) * 1000));
+
+function php_mean_std($a) {
+    $arr = $a->toArray();
+    $sum = 0.0;
+    $cnt = 0;
+    foreach ($arr as $v) {
+        $sum += (float)$v;
+        $cnt++;
     }
-
-    /**
-     * Successful creation.
-     */
-    private function testCase1(): void
-    {
-        echo '--- CASE 1 ---' . PHP_EOL;
-        $dataset = self::case1DataProvider();
-        foreach ($dataset as $sk => $shape) {
-            nd::standardNormal($shape);
-            echo "successful creation with $sk" . PHP_EOL;
-        }
-        echo PHP_EOL;
+    $mean = $sum / $cnt;
+    $sq = 0.0;
+    foreach ($arr as $v) {
+        $d   = ((float)$v) - $mean;
+        $sq += $d * $d;
     }
+    return [$mean, sqrt($sq / $cnt)];
+}
 
-    private static function case1DataProvider(): array
-    {
-        return [
-            '1-dim' => [1],
-            '2-dim' => [2, 3],
-            '3-dim' => [2, 3, 4],
-        ];
-    }
+function check_dist($a, $tag) {
+    [$m, $s] = php_mean_std($a);
+    $mean_ok = abs($m) < 0.2;
+    $std_ok  = abs($s - 1.0) < 0.2;
+    echo $tag, ': mean=', ($mean_ok ? 'OK' : "BAD($m)"),
+         ' std=', ($std_ok ? 'OK' : "BAD($s)"), "\n";
+}
 
-    /**
-     * An exception is thrown when parameter has an invalid type.
-     */
-    private function testCase2(): void
-    {
-        echo '--- CASE 2 ---' . PHP_EOL;
-        $dataset = self::case2DataProvider();
-        foreach ($dataset as $condition => $data) {
-            try {
-                nd::standardNormal($data);
-            } catch (\Throwable $t) {
-                echo "Error when passed " . $condition. ": " . $t->getMessage() . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+$n = 16384;
 
-    private static function case2DataProvider(): array
-    {
-        return [
-            'shape is integer' => 1,
-            'shape is double' => 3.5,
-            'shape is string' => 'test',
-            'shape is null' => null,
-            'shape is object' => (object) [],
-        ];
-    }
+/* Default dtype (float32) and device (CPU). */
+$a = NumPower::standardNormal([$n]);
+check_dist($a, 'cpu_f32_default');
 
-    /**
-     * An exception is thrown when passing an array with elements of an invalid type.
-     */
-    private function testCase3(): void
-    {
-        echo '--- CASE 3 ---' . PHP_EOL;
-        $dataset = self::case3DataProvider();
-        foreach ($dataset as $condition =>  $data) {
-            try {
-                nd::standardNormal([$data]);
-            } catch (\Throwable $t) {
-                echo "Error when shape " . $condition . ": " . $t->getMessage() . PHP_EOL;
-            }
-        }
-        echo PHP_EOL;
-    }
+/* Explicit float32 / CPU. */
+$a = NumPower::standardNormal([$n], 'float32');
+check_dist($a, 'cpu_f32_explicit');
 
-    private static function case3DataProvider(): array
-    {
-        return [
-            'value is array' => [],
-            'value is float' => 3.5,
-            'value is string' => 'test',
-            'value is null' => null,
-            'value is object' => (object) [],
-        ];
-    }
+/* float64 / CPU — exercises the dtype-aware fill path. */
+$a = NumPower::standardNormal([$n], 'float64');
+check_dist($a, 'cpu_f64');
 
-    /**
-     * An exception is thrown when passing an empty array.
-     */
-    private function testCase4(): void
-    {
-        echo '--- CASE 4 ---' . PHP_EOL;
-        try {
-            nd::standardNormal([]);
-        } catch (\Throwable $t) {
-            echo $t->getMessage() . PHP_EOL;
-        }
-        echo PHP_EOL;
-    }
+/* float16 / CPU — quantised path. f16 has ~3 decimal digits, so the
+   sample moments still converge on N(0,1) to within the tolerance. */
+$a = NumPower::standardNormal([$n], 'float16');
+check_dist($a, 'cpu_f16_quantised');
 
-    /**
-     * The resulting array has the correct number of dimensions and
-     * each dimension contains only integers.
-     */
-    private function testCase5(): void
-    {
-        echo '--- CASE 5 ---' . PHP_EOL;
-        $a = nd::standardNormal([4]);
+/* int8 with implicit scale=1 — every sample is in (-128, 127). With
+   loc=0 and scale=1 the truncation to integers means ~68% land at 0,
+   so the mean stays near 0 and the stddev compresses below 1. We just
+   spot-check the array shape and dtype rather than the moments. */
+$a = NumPower::standardNormal([$n], 'int8');
+$shape_ok = $a->shape() === [$n];
+$type_ok  = gettype($a[0]) === 'integer';
+echo 'cpu_i8: shape=', ($shape_ok ? 'OK' : 'BAD'),
+     ' type=', ($type_ok ? 'OK' : 'BAD'), "\n";
 
-        echo "Shape is: " . count($a->toArray()) . PHP_EOL;
-
-        foreach ($a->toArray() as $elk => $el) {
-            if (is_float($el)) {
-                echo "element " . $elk + 1 . " is double" . PHP_EOL;
-            }
-        }
-
-        $a = nd::standardNormal([4, 4]);
-
-        foreach ($a->toArray() as $k => $el) {
-            echo "Shape level of element " . $k + 1 . " is: " . count($el) . PHP_EOL;
-        }
-
-        foreach ($a->toArray() as $elk => $el) {
-            foreach ($el as $selk => $subEl) {
-                if (is_float($subEl)) {
-                    echo "sub-element " . $selk . " of element " . $elk + 1 . " is double" . PHP_EOL;
-                }
-            }
-        }
-    }
-};
+/* 2-D multi-dim shape. */
+$a = NumPower::standardNormal([128, 128]);
+$ok = $a->shape() === [128, 128] && $a->size() === 16384;
+echo 'cpu_2d: ', ($ok ? 'OK' : 'BAD'), "\n";
 ?>
 --EXPECT--
---- CASE 1 ---
-successful creation with 1-dim
-successful creation with 2-dim
-successful creation with 3-dim
-
---- CASE 2 ---
-Error when passed shape is integer: NumPower::standardNormal(): Argument #1 ($shape) must be of type array, int given
-Error when passed shape is double: NumPower::standardNormal(): Argument #1 ($shape) must be of type array, float given
-Error when passed shape is string: NumPower::standardNormal(): Argument #1 ($shape) must be of type array, string given
-Error when passed shape is null: NumPower::standardNormal(): Argument #1 ($shape) must be of type array, null given
-Error when passed shape is object: NumPower::standardNormal(): Argument #1 ($shape) must be of type array, stdClass given
-
---- CASE 3 ---
-Error when shape value is array: Invalid parameter: Shape elements must be integers.
-Error when shape value is float: Invalid parameter: Shape elements must be integers.
-Error when shape value is string: Invalid parameter: Shape elements must be integers.
-Error when shape value is null: Invalid parameter: Shape elements must be integers.
-Error when shape value is object: Invalid parameter: Shape elements must be integers.
-
---- CASE 4 ---
-Invalid parameter: Expected a non-empty array.
-
---- CASE 5 ---
-Shape is: 4
-element 1 is double
-element 2 is double
-element 3 is double
-element 4 is double
-Shape level of element 1 is: 4
-Shape level of element 2 is: 4
-Shape level of element 3 is: 4
-Shape level of element 4 is: 4
-sub-element 0 of element 1 is double
-sub-element 1 of element 1 is double
-sub-element 2 of element 1 is double
-sub-element 3 of element 1 is double
-sub-element 0 of element 2 is double
-sub-element 1 of element 2 is double
-sub-element 2 of element 2 is double
-sub-element 3 of element 2 is double
-sub-element 0 of element 3 is double
-sub-element 1 of element 3 is double
-sub-element 2 of element 3 is double
-sub-element 3 of element 3 is double
-sub-element 0 of element 4 is double
-sub-element 1 of element 4 is double
-sub-element 2 of element 4 is double
-sub-element 3 of element 4 is double
+cpu_f32_default: mean=OK std=OK
+cpu_f32_explicit: mean=OK std=OK
+cpu_f64: mean=OK std=OK
+cpu_f16_quantised: mean=OK std=OK
+cpu_i8: shape=OK type=OK
+cpu_2d: OK

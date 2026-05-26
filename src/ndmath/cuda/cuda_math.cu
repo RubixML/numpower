@@ -11,6 +11,7 @@
 #include <curand_kernel.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
+#include <time.h>
 
 #define CHECK_CUDA(func) do { \
   cudaError_t status = (func); \
@@ -30,27 +31,63 @@
   } \
 } while (0)
 
-__global__ void truncatedNormalKernel(float* d_data, int size, double loc, double scale, unsigned long long seed) {
+/**
+ * @brief Per-thread rejection-sample kernel for truncated Gaussian (float).
+ *
+ * Each thread initialises its own cuRAND state from `(seed, idx)` and
+ * draws standard-normal samples until one lands in [-2, 2]; the accepted
+ * sample is then scaled by `scale` and shifted by `loc` so the stored
+ * value lies in `[loc - 2σ, loc + 2σ]`. The mean rejection rate at the
+ * ±2σ window is ~4.55%, so each thread runs ~1.05 iterations on average
+ * and is bounded by a hard cap (the implicit infinite loop is acceptable
+ * for any scale > 0 — at most one in 10⁹ samples needs more than 50
+ * iterations).
+ *
+ * @param[out] d_data Destination GPU float buffer.
+ * @param[in]  size   Element count.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution stddev (σ); must be > 0.
+ * @param[in]  seed   Per-call seed (see `cuda_normal_next_seed`).
+ */
+__global__ void truncatedNormalKernelF32(float* d_data, int size,
+                                          float loc, float scale,
+                                          unsigned long long seed) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
     curandState_t state;
-
-    if (idx < size) {
-        curand_init(seed, idx, 0, &state);
-        float z;
-        do {
-            z = curand_normal(&state) * scale + loc;
-        } while (z < (loc - 2.0 * scale) || z > (loc + 2.0 * scale));
-        d_data[idx] = z;
-    }
+    curand_init(seed, (unsigned long long)idx, 0, &state);
+    float z;
+    do {
+        z = curand_normal(&state);
+    } while (z < -2.0f || z > 2.0f);
+    d_data[idx] = loc + scale * z;
 }
 
-void cuda_truncated_normal(float* h_data, int size, double loc, double scale) {
-    // Определение параметров сетки и блоков
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (size + threadsPerBlock - 1) / threadsPerBlock;
-
-    // Вызов ядра CUDA
-    truncatedNormalKernel<<<blocksPerGrid, threadsPerBlock>>>(h_data, size, loc, scale, 1234ULL);
+/**
+ * @brief Per-thread rejection-sample kernel for truncated Gaussian (double).
+ *
+ * Companion to `truncatedNormalKernelF32` for double-precision dtypes.
+ * Uses `curand_normal_double` so the underlying samples carry 53-bit
+ * precision before the affine transform.
+ *
+ * @param[out] d_data Destination GPU double buffer.
+ * @param[in]  size   Element count.
+ * @param[in]  loc    Distribution mean (µ).
+ * @param[in]  scale  Distribution stddev (σ); must be > 0.
+ * @param[in]  seed   Per-call seed.
+ */
+__global__ void truncatedNormalKernelF64(double* d_data, int size,
+                                          double loc, double scale,
+                                          unsigned long long seed) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= size) return;
+    curandState_t state;
+    curand_init(seed, (unsigned long long)idx, 0, &state);
+    double z;
+    do {
+        z = curand_normal_double(&state);
+    } while (z < -2.0 || z > 2.0);
+    d_data[idx] = loc + scale * z;
 }
 
 // CUDA kernel to calculate the median of a float* array
@@ -2830,6 +2867,485 @@ int cuda_strided_copy(char *dst_gpu, const char *src_gpu,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return -1;
     return 0;
+}
+
+/* ───────────────── Normal sampler ──────────────────────────────────────── */
+
+/**
+ * @brief Derive a fresh PRNG seed for each `cuda_normal_*` call.
+ *
+ * Combines wall-clock seconds with a monotonically-increasing 64-bit
+ * counter so successive calls in the same second still produce
+ * statistically-independent streams. The previous implementation pinned
+ * the seed to `1234ULL` which made repeated calls within one process
+ * generate identical sample sequences — a real entropy bug.
+ *
+ * @return New 64-bit seed.
+ */
+static unsigned long long cuda_normal_next_seed(void) {
+    static unsigned long long counter = 0;
+    unsigned long long t = (unsigned long long)time(NULL);
+    /* The 17-bit shift gives each call a wide jump in the seed even when
+       the wall-clock didn't advance; the xor lets `time(NULL) == 0` (an
+       edge case during early init) still produce non-zero seeds. */
+    return (t << 32) ^ (counter++ << 17) ^ 0x9e3779b97f4a7c15ULL;
+}
+
+/**
+ * @brief curandStatus → return-or-throw helper.
+ *
+ * cuRAND failure modes here are: out-of-memory, invalid handle, no
+ * device. None are recoverable inside the wrapper so we surface them as
+ * a catchable PHP Error and leave the destination buffer in whatever
+ * state cuRAND left it (caller will `NDArray_FREE` and propagate
+ * `return NULL`).
+ *
+ * @param[in] st curandStatus_t.
+ * @return 1 on CURAND_STATUS_SUCCESS, 0 on every failure (Error in flight).
+ */
+static int cuda_normal_check(curandStatus_t st) {
+    if (st == CURAND_STATUS_SUCCESS) return 1;
+    /* Don't throw a PHP error from libcudart-linked code; just signal
+       failure. Callers translate to an Error in PHP-frame functions. */
+    return 0;
+}
+
+void cuda_normal_f32(float *d_data, long n, float mean, float stddev) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+
+    if ((n & 1) == 0) {
+        /* Even size — cuRAND can write directly into the destination. */
+        cuda_normal_check(curandGenerateNormal(gen, d_data, (size_t)n,
+                                                mean, stddev));
+    } else {
+        /* Odd size — cuRAND requires even. Write `n + 1` into a transient
+           pad buffer (vmalloc so NDARRAY_VCHECK sees it), then copy
+           `n` floats into the destination. The pad buffer is freed before
+           the wrapper returns. */
+        float *pad = NULL;
+        vmalloc((void **)&pad, (unsigned int)(sizeof(float) * (size_t)(n + 1)));
+        if (pad != NULL) {
+            cuda_normal_check(curandGenerateNormal(gen, pad, (size_t)(n + 1),
+                                                    mean, stddev));
+            cudaMemcpy(d_data, pad, sizeof(float) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+            vfree(pad);
+        }
+    }
+    curandDestroyGenerator(gen);
+}
+
+void cuda_normal_f64(double *d_data, long n, double mean, double stddev) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+
+    if ((n & 1) == 0) {
+        cuda_normal_check(curandGenerateNormalDouble(gen, d_data, (size_t)n,
+                                                      mean, stddev));
+    } else {
+        /* Odd size — same pad-and-copy trick as f32, but through vmalloc
+           so NDARRAY_VCHECK can balance the allocation against vfree. */
+        double *pad = NULL;
+        vmalloc((void **)&pad, (unsigned int)(sizeof(double) * (size_t)(n + 1)));
+        if (pad != NULL) {
+            cuda_normal_check(curandGenerateNormalDouble(gen, pad,
+                                                          (size_t)(n + 1),
+                                                          mean, stddev));
+            cudaMemcpy(d_data, pad, sizeof(double) * (size_t)n,
+                       cudaMemcpyDeviceToDevice);
+            vfree(pad);
+        }
+    }
+    curandDestroyGenerator(gen);
+}
+
+void cuda_truncated_normal_f32(float *d_data, long n, float loc, float scale) {
+    if (d_data == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    truncatedNormalKernelF32<<<blocks, block>>>(d_data, (int)n, loc, scale,
+                                                  cuda_normal_next_seed());
+}
+
+void cuda_truncated_normal_f64(double *d_data, long n, double loc, double scale) {
+    if (d_data == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    truncatedNormalKernelF64<<<blocks, block>>>(d_data, (int)n, loc, scale,
+                                                  cuda_normal_next_seed());
+}
+
+/**
+ * @brief Per-thread DD affine kernel: `dst[i] = loc + scale * z[i]` in dd.
+ *
+ * Reads one standard-normal double `z[i]`, computes the affine transform
+ * in true double-double arithmetic on device, and stores the result at
+ * `dst[2i..2i+1]`. The transform is intentionally done with full DD
+ * precision so a caller's fp128 `loc`/`scale` survive the trip through
+ * VRAM intact; the only precision loss along the pipeline is the
+ * standard-normal sample `z`, which is inherently 53-bit (cuRAND's
+ * `curandGenerateNormalDouble` produces fp64 samples).
+ */
+__global__ void cuda_normal_dd_affine_kernel(const double *z, double *dst,
+                                              long n,
+                                              double loc_hi, double loc_lo,
+                                              double scale_hi, double scale_lo) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dd_real zdd    = dd_make(z[i], 0.0);
+        dd_real scale  = dd_make(scale_hi, scale_lo);
+        dd_real loc    = dd_make(loc_hi, loc_lo);
+        dd_real prod   = dd_mul(zdd, scale);
+        dd_real result = dd_add(loc, prod);
+        dst[2*i]     = result.hi;
+        dst[2*i + 1] = result.lo;
+    }
+}
+
+void cuda_normal_dd_affine(const double *z, double *dst, long n,
+                           double loc_hi, double loc_lo,
+                           double scale_hi, double scale_lo) {
+    if (z == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_normal_dd_affine_kernel<<<blocks, block>>>(z, dst, n,
+                                                      loc_hi, loc_lo,
+                                                      scale_hi, scale_lo);
+}
+
+/* ───────────────── Uniform sampler ─────────────────────────────────────── */
+
+/**
+ * @brief Per-thread affine for the float32 uniform path.
+ *
+ * cuRAND's `curandGenerateUniform` returns values in `(0, 1]`. To match
+ * numpy's `[low, high)` contract we reflect with `1 - u`, mapping to
+ * `[0, 1)`, then evaluate `low + (1 - u) * (high - low)` so the closed
+ * endpoint sits at `low` (and the open endpoint at `high`). All math is
+ * done in single precision to keep the float32 path's quantisation
+ * deterministic.
+ *
+ * @param[in,out] data Length-@p n buffer of `(0, 1]` samples on entry; on
+ *                     return each slot holds `low + (1 - u_in) * (high - low)`.
+ * @param[in]     n    Element count.
+ * @param[in]     low  Lower bound (inclusive).
+ * @param[in]     high Upper bound (exclusive).
+ */
+__global__ void cuda_uniform_affine_kernel_f32(float *data, long n,
+                                                 float low, float high) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        data[i] = low + (1.0f - data[i]) * (high - low);
+    }
+}
+
+/**
+ * @brief Float64 companion of `cuda_uniform_affine_kernel_f32`.
+ *
+ * Identical reflection / affine, evaluated in double precision so the
+ * fp64 path keeps full 53-bit mantissa precision across the whole
+ * `[low, high)` range.
+ *
+ * @param[in,out] data Length-@p n buffer of `(0, 1]` samples on entry.
+ * @param[in]     n    Element count.
+ * @param[in]     low  Lower bound (inclusive).
+ * @param[in]     high Upper bound (exclusive).
+ */
+__global__ void cuda_uniform_affine_kernel_f64(double *data, long n,
+                                                 double low, double high) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        data[i] = low + (1.0 - data[i]) * (high - low);
+    }
+}
+
+void cuda_uniform_f32(float *d_data, long n, float low, float high) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    /* `curandGenerateUniform` has no parity restriction (unlike
+       `curandGenerateNormal`) so a single in-place call into the
+       destination is enough; no pad buffer needed. */
+    cuda_normal_check(curandGenerateUniform(gen, d_data, (size_t)n));
+    curandDestroyGenerator(gen);
+
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_affine_kernel_f32<<<blocks, block>>>(d_data, n, low, high);
+}
+
+void cuda_uniform_f64(double *d_data, long n, double low, double high) {
+    if (d_data == NULL || n <= 0) return;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    cuda_normal_check(curandGenerateUniformDouble(gen, d_data, (size_t)n));
+    curandDestroyGenerator(gen);
+
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_affine_kernel_f64<<<blocks, block>>>(d_data, n, low, high);
+}
+
+/**
+ * @brief Per-thread DD affine kernel for the float128 uniform GPU path.
+ *
+ * Reads one `[0, 1)` double `u[i]` (the reflection from `(0, 1]` is
+ * applied upstream by `cuda_uniform_f64` with `low=0, high=1`), and
+ * computes `low + u * range` in true double-double arithmetic on
+ * device. `range = high - low` is supplied as a DD pair computed on
+ * the host so the kernel itself does not need to perform a DD
+ * subtraction. The result is stored at `dst[2i..2i+1]`. The only
+ * precision loss along the pipeline is the underlying uniform sample,
+ * which is inherently 53-bit (cuRAND's `curandGenerateUniformDouble`).
+ *
+ * @param[in]  u         Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst       Length-`2*n` GPU buffer of interleaved (hi, lo) pairs.
+ * @param[in]  n         Element count.
+ * @param[in]  low_hi    DD high word of the lower bound.
+ * @param[in]  low_lo    DD low word of the lower bound.
+ * @param[in]  range_hi  DD high word of `(high - low)`.
+ * @param[in]  range_lo  DD low word of `(high - low)`.
+ */
+__global__ void cuda_uniform_dd_affine_kernel(const double *u, double *dst,
+                                                long n,
+                                                double low_hi, double low_lo,
+                                                double range_hi, double range_lo) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dd_real udd    = dd_make(u[i], 0.0);
+        dd_real range  = dd_make(range_hi, range_lo);
+        dd_real low    = dd_make(low_hi, low_lo);
+        dd_real prod   = dd_mul(udd, range);
+        dd_real result = dd_add(low, prod);
+        dst[2*i]     = result.hi;
+        dst[2*i + 1] = result.lo;
+    }
+}
+
+void cuda_uniform_dd_affine(const double *u, double *dst, long n,
+                             double low_hi, double low_lo,
+                             double range_hi, double range_lo) {
+    if (u == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_dd_affine_kernel<<<blocks, block>>>(u, dst, n,
+                                                       low_hi, low_lo,
+                                                       range_hi, range_lo);
+}
+
+/* ───────────────── uint64 affine kernels ──────────────────────────────── */
+
+/**
+ * @brief Per-thread normal/truncated-normal affine kernel for the uint64
+ *        GPU path.
+ *
+ * Reads one (possibly truncated) standard-normal double `z[i]`,
+ * evaluates `delta_s = (int64_t)(scaled * z[i])` (signed so negative-z
+ * samples subtract from `loc`), and writes `loc + (uint64_t)delta_s` to
+ * `dst[i]`. The signed→unsigned cast wraps modulo 2^64 — well-defined
+ * in C/C++ for unsigned destinations and matches the CPU filler's
+ * arithmetic. Used for both `NDArray_Normal` and `NDArray_TruncatedNormal`
+ * (the caller picks the source distribution by which cuRAND fill
+ * populates @p z).
+ *
+ * @param[in]  z      Length-@p n GPU buffer of standard-normal (or
+ *                    truncated standard-normal) doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  loc    Distribution mean (uint64).
+ * @param[in]  scaled Distribution stddev coerced to double.
+ */
+__global__ void cuda_normal_u64_affine_kernel(const double *z,
+                                                unsigned long long *dst,
+                                                long n,
+                                                unsigned long long loc,
+                                                double scaled) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        long long delta_s = (long long)(scaled * z[i]);
+        dst[i] = loc + (unsigned long long)delta_s;
+    }
+}
+
+void cuda_normal_u64_affine(const double *z, unsigned long long *dst, long n,
+                             unsigned long long loc, double scaled) {
+    if (z == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_normal_u64_affine_kernel<<<blocks, block>>>(z, dst, n, loc, scaled);
+}
+
+/**
+ * @brief Per-thread uniform affine kernel for the uint64 GPU path.
+ *
+ * Reads one `[0, 1)` double `u[i]` (callers pre-reflect via
+ * `cuda_uniform_f64(u, n, 0.0, 1.0)`) and writes
+ * `low + (uint64_t)(widthd * u[i])` to `dst[i]`. The width is supplied
+ * as a `double` because the cast `(double)(high - low)` happens once on
+ * the host — for widths past 2^53 this is the same precision floor
+ * the CPU filler hits (documented invariant). The unsigned add wraps
+ * modulo 2^64.
+ *
+ * @param[in]  u      Length-@p n GPU buffer of `[0, 1)` doubles.
+ * @param[out] dst    Length-@p n GPU uint64 buffer.
+ * @param[in]  n      Element count.
+ * @param[in]  low    Lower bound (uint64).
+ * @param[in]  widthd `(double)(high - low)`.
+ */
+__global__ void cuda_uniform_u64_affine_kernel(const double *u,
+                                                 unsigned long long *dst,
+                                                 long n,
+                                                 unsigned long long low,
+                                                 double widthd) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = low + (unsigned long long)(widthd * u[i]);
+    }
+}
+
+void cuda_uniform_u64_affine(const double *u, unsigned long long *dst, long n,
+                              unsigned long long low, double widthd) {
+    if (u == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_uniform_u64_affine_kernel<<<blocks, block>>>(u, dst, n, low, widthd);
+}
+
+/* ───────────────── Poisson sampler ─────────────────────────────────────── */
+
+int cuda_poisson_u32(unsigned int *d_data, long n, double lam) {
+    if (d_data == NULL || n <= 0) return 1;
+    curandGenerator_t gen;
+    if (curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT) != CURAND_STATUS_SUCCESS) {
+        return 0;
+    }
+    curandSetPseudoRandomGeneratorSeed(gen, cuda_normal_next_seed());
+    /* `curandGeneratePoisson` writes `n` uint32 samples directly into
+       @p d_data — no parity restriction, no scratch buffer required.
+       Internally cuRAND picks between rejection-from-normal and PTRS
+       depending on @p lam. cuRAND returns `CURAND_STATUS_OUT_OF_RANGE`
+       (or a different non-success code) when @p lam exceeds the
+       generator's supported range; we surface that failure to the
+       caller so a clear error can be raised at the PHP boundary
+       instead of returning a silently-zero buffer. */
+    int ok = cuda_normal_check(curandGeneratePoisson(gen, d_data,
+                                                      (size_t)n, lam));
+    curandDestroyGenerator(gen);
+    return ok;
+}
+
+/**
+ * @brief Per-thread widening kernel: write each u32 sample as a DD pair
+ *        with `lo = 0.0`.
+ *
+ * The destination layout is the interleaved (hi, lo) format the rest of
+ * the fp128 GPU pipeline uses: `dst[2i] = (double)src[i]`,
+ * `dst[2i + 1] = 0.0`. Every uint32 fits exactly in fp64's 53-bit
+ * mantissa, so the high word carries the integer count without loss
+ * and the low word is identically zero.
+ *
+ * @param[in]  src Length-@p n GPU buffer of uint32 Poisson samples.
+ * @param[out] dst Length-`2*n` GPU buffer of (hi, lo) DD pairs.
+ * @param[in]  n   Element count.
+ */
+__global__ void cuda_cast_u32_to_dd_kernel(const unsigned int *src,
+                                             double *dst, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[2*i]     = (double)src[i];
+        dst[2*i + 1] = 0.0;
+    }
+}
+
+void cuda_cast_u32_to_dd(const unsigned int *src, double *dst, long n) {
+    if (src == NULL || dst == NULL || n <= 0) return;
+    int block = 256;
+    long blocks_ll = (n + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_cast_u32_to_dd_kernel<<<blocks, block>>>(src, dst, n);
+}
+
+/* ───────────────── Binomial sampler ────────────────────────────────────── */
+
+/**
+ * @brief Per-thread direct-Bernoulli kernel for the Binomial sampler.
+ *
+ * Each thread owns one output slot, initialises its own cuRAND state
+ * from `(seed, idx)`, runs @p n independent Bernoulli trials with
+ * success probability @p p, and writes the success count as a uint32.
+ * `curand_uniform` returns `(0, 1]`; we reflect to `[0, 1)` via
+ * `1 - u` so the comparison `u < p` honours the closed-open convention
+ * (matches the CPU sampler).
+ *
+ * Cost is `O(n)` per element — fine for small to moderate @p n
+ * (< ~10^4); for very large @p n the call is still correct but a more
+ * sophisticated algorithm (BTPE) would be faster. The legacy CPU
+ * implementation also used this direct method.
+ *
+ * @param[out] dst  Destination GPU buffer of @p total uint32s.
+ * @param[in]  total Element count.
+ * @param[in]  n     Number of Bernoulli trials per sample.
+ * @param[in]  p     Per-trial success probability in `[0, 1]`.
+ * @param[in]  seed  Per-call seed (`cuda_normal_next_seed`).
+ */
+__global__ void cuda_binomial_kernel(unsigned int *dst, long total,
+                                       int n, float p,
+                                       unsigned long long seed) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    curandState_t state;
+    curand_init(seed, (unsigned long long)idx, 0, &state);
+    unsigned int successes = 0;
+    for (int j = 0; j < n; j++) {
+        float u = 1.0f - curand_uniform(&state);  /* (0, 1] → [0, 1) */
+        if (u < p) successes++;
+    }
+    dst[idx] = successes;
+}
+
+void cuda_binomial_u32(unsigned int *d_data, long total, int n, float p) {
+    if (d_data == NULL || total <= 0) return;
+    /* n == 0 is degenerate (every sample is 0); the kernel handles it
+       correctly (the per-thread loop is empty) but the upstream
+       dispatcher short-circuits with cudaMemset before reaching us. */
+    int block = 256;
+    long blocks_ll = (total + block - 1) / block;
+    if (blocks_ll > 2147483647LL) return;
+    int blocks = (int)blocks_ll;
+    cuda_binomial_kernel<<<blocks, block>>>(d_data, total, n, p,
+                                              cuda_normal_next_seed());
 }
 
 }
