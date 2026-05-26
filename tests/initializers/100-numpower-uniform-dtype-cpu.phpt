@@ -109,11 +109,37 @@ $fp128_wide_ok = (strpos($sample0, 'e+100') !== false ||
 echo 'fp128_wide: ', ($fp128_wide_ok ? 'OK' : "BAD($sample0)"), "\n";
 
 /* uint64 wide-range bounds: high='18446744073709550000', low='10'.
-   Every sample's string must have ≥ 18 digits to land in that range. */
+   Every sample must (1) be in `[low, high)` numerically and (2) on
+   aggregate use the high bits of the range — the previous `strlen($s) >= 18`
+   check on a single sample was flaky because P(sample < 1e17) ≈ 0.55% per
+   draw, so ~1 in 180 CI runs landed a "small" sample (e.g. "24560186366623750")
+   inside the legal range but with only 17 digits. Verifying via aggregate
+   instead of a single-sample digit-count avoids that false positive. */
 $a = NumPower::uniform([$n], '10', '18446744073709550000', 'uint64');
-$sample0 = (string)$a[0];
-$u64_wide_ok = (strlen($sample0) >= 18 && strlen($sample0) <= 20);
-echo 'u64_wide: ', ($u64_wide_ok ? 'OK' : "BAD($sample0)"), "\n";
+$arr = $a->toArray();
+/* Range check via string compare on left-padded digits — works for any
+   value past PHP_INT_MAX without bcmath. low_p / high_p have the same
+   width and the same lexicographic order as the underlying integers. */
+$low_p  = str_pad('10',                       20, '0', STR_PAD_LEFT);
+$high_p = str_pad('18446744073709550000',     20, '0', STR_PAD_LEFT);
+$range_ok = true;
+$max_digits = 0;
+foreach ($arr as $v) {
+    $s = (string)$v;
+    $p = str_pad($s, 20, '0', STR_PAD_LEFT);
+    if (strcmp($p, $low_p) < 0 || strcmp($p, $high_p) >= 0) {
+        $range_ok = false;
+        break;
+    }
+    if (strlen($s) > $max_digits) $max_digits = strlen($s);
+}
+/* At least one of the n=16384 samples should reach the upper binade
+   (≥18 digits = ≥1e17). P(none does) = (1 - 0.994)^16384 ≈ 0 — millions
+   of times more reliable than the single-sample check. */
+$u64_wide_ok = $range_ok && $max_digits >= 18;
+echo 'u64_wide: ', ($u64_wide_ok
+    ? 'OK'
+    : "BAD(range=" . ($range_ok ? "ok" : "fail") . " max_digits=$max_digits)"), "\n";
 
 /* int8 range check — values must land in [0, 100). */
 $a = NumPower::uniform([512], 0, 100, 'int8');

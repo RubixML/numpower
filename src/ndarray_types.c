@@ -147,6 +147,27 @@ double ndarray_fp16_to_double(uint16_t fp16) {
     return (double)fval;
 }
 
+/**
+ * @brief IEEE 754 round-to-nearest-even fp32 → fp16 conversion.
+ *
+ * The 23-bit fp32 mantissa is reduced to 10 bits by keeping the top 10 and
+ * adding a rounding bias derived from the 13 dropped bits:
+ *  - if the dropped bits exceed half (0x1000), round up,
+ *  - if exactly half, round to even (add 1 only when the kept-mantissa LSB is 1),
+ *  - otherwise round down.
+ *
+ * **Pre-existing bug fixed**: the previous implementation just truncated the
+ * 13 low bits (`man = (u >> 13) & 0x3FF`) — equivalent to round-toward-zero.
+ * This diverged from the GPU CUDA cast (`__float2half` uses round-to-nearest)
+ * by up to one ULP for any value not exactly representable in fp16, so
+ * CPU/GPU sum / prod / divide on fp16 inputs disagreed on innocuous values
+ * like `10.0/3.0` (CPU 3.33203125 vs GPU 3.333984375).
+ *
+ * @param[in] val Source double (must already fit in fp32's range for the
+ *                cast to be well-defined; out-of-range values saturate to
+ *                ±Inf below).
+ * @return 16-bit fp16 bit-pattern matching the GPU cast on the same input.
+ */
 uint16_t ndarray_double_to_fp16(double val) {
     float f = (float)val;
     uint32_t u;
@@ -154,10 +175,11 @@ uint16_t ndarray_double_to_fp16(double val) {
 
     uint32_t sign = u >> 31;
     uint32_t u_exp = (u >> 23) & 0xFFu;
-    uint32_t man  = (u >> 13) & 0x3FFu; /* top 10 bits of 23-bit mantissa */
+    uint32_t man32 = u & 0x7FFFFFu;        /* low 23 bits of fp32 mantissa */
 
     if (u_exp == 255u) {
-        /* Inf or NaN */
+        /* Inf or NaN — drop the low mantissa bits via the legacy >>13. */
+        uint32_t man = (u >> 13) & 0x3FFu;
         return (uint16_t)((sign << 15) | 0x7C00u | (man ? 0x0200u : 0u));
     }
 
@@ -165,15 +187,38 @@ uint16_t ndarray_double_to_fp16(double val) {
 
     if (exp32 <= 0) {
         if (exp32 < -10) return (uint16_t)(sign << 15); /* underflow → ±0 */
-        /* Subnormal fp16 */
-        uint32_t m = ((u >> 23) & 0xFFu) ? ((u & 0x7FFFFFu) | 0x800000u) : 0u;
-        m >>= (1 - exp32 + 13);
-        return (uint16_t)((sign << 15) | (m & 0x3FFu));
+        /* Subnormal fp16. Shift the implicit-leading-1 mantissa down by
+           (1 - exp32 + 13) bits with round-to-nearest-even on the dropped
+           tail. */
+        uint32_t m = (u_exp != 0u) ? (man32 | 0x800000u) : man32;
+        int shift = 1 - exp32 + 13;
+        uint32_t keep = (shift >= 32) ? 0u : (m >> shift);
+        uint32_t drop_mask = (shift >= 32) ? 0xFFFFFFFFu : ((1u << shift) - 1u);
+        uint32_t drop = m & drop_mask;
+        uint32_t half = (shift >= 1) ? (1u << (shift - 1)) : 0u;
+        if (drop > half || (drop == half && (keep & 1u))) keep++;
+        /* If rounding pushes the subnormal up to the smallest normal, the
+           result naturally encodes as (sign<<15)|0x0400 — the bit 10 is
+           the implicit bit boundary, matching the IEEE 754 layout. */
+        return (uint16_t)((sign << 15) | (keep & 0x7FFFu));
     }
 
     if (exp32 >= 31) return (uint16_t)((sign << 15) | 0x7C00u); /* Inf */
 
-    return (uint16_t)((sign << 15) | ((uint32_t)exp32 << 10) | man);
+    /* Normal range: round-to-nearest-even on the 13 low bits of the
+       fp32 mantissa. */
+    uint32_t keep = man32 >> 13;
+    uint32_t drop = man32 & 0x1FFFu;
+    if (drop > 0x1000u || (drop == 0x1000u && (keep & 1u))) {
+        keep++;
+        if (keep == 0x400u) {
+            /* Mantissa overflow → exponent carry. */
+            keep = 0u;
+            exp32++;
+            if (exp32 >= 31) return (uint16_t)((sign << 15) | 0x7C00u);
+        }
+    }
+    return (uint16_t)((sign << 15) | ((uint32_t)exp32 << 10) | keep);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

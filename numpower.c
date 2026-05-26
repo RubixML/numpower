@@ -468,6 +468,14 @@ static int *ndarray_compute_broadcast_shape(const NDArray *a, const NDArray *b, 
     return shape;
 }
 
+/* Forward declaration: ndarray_arith_dispatch (below) calls into the
+   typed-kernel dispatcher whose body lives later in this file. Same
+   translation unit so the linker has no work to do; declaring up front
+   keeps the helper-then-dispatcher ordering readable. */
+static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda,
+                                        NDArray *ndb,
+                                        const char **result_type_out);
+
 /**
  * Apply ZEND_DIV's "true division" dtype rule: integer operands divide to
  * float (float32 for narrow ints, float64 for 32/64-bit ints). Matches
@@ -489,6 +497,227 @@ static const char *ndarray_div_promote(const char *result_type)
         return "float64";
     }
     return "float32";
+}
+
+/**
+ * @brief Return non-zero when @p z is a PHP scalar promotable to a 0-D
+ *        NDArray for weak-scalar arithmetic.
+ *
+ * Mirrors the accepted-types set of `NDArray_EncodeZvalToDtype`:
+ * IS_LONG, IS_DOUBLE, IS_STRING, IS_TRUE, IS_FALSE. Every other zval
+ * type (arrays, objects, null, references) returns zero so the caller
+ * can fall back to the generic `ZVAL_TO_NDARRAY` path.
+ *
+ * @param[in] z Candidate zval.
+ * @return Non-zero if @p z can be promoted; zero otherwise.
+ */
+static int ndarray_is_promotable_scalar(zval *z)
+{
+    int t = Z_TYPE_P(z);
+    return t == IS_LONG || t == IS_DOUBLE || t == IS_STRING
+        || t == IS_TRUE || t == IS_FALSE;
+}
+
+/**
+ * @brief Choose the dtype of a weak-scalar promoted alongside @p tensor_dt.
+ *
+ * PyTorch "weak scalar" promotion rules:
+ *  - IS_LONG / IS_STRING / IS_TRUE / IS_FALSE: adopt the tensor's dtype.
+ *  - IS_DOUBLE: adopt the tensor's dtype when it is already floating point;
+ *    otherwise promote to `float64` so `int_tensor + 1.5` returns a float
+ *    result instead of truncating the fractional part.
+ *
+ * @param[in] tensor_dt Canonical dtype string of the peer NDArray operand.
+ * @param[in] z         PHP scalar being promoted.
+ * @return Target dtype string for the scalar's 0-D NDArray.
+ */
+static const char *ndarray_pick_scalar_dtype(const char *tensor_dt, zval *z)
+{
+    int is_int_tensor =
+        (!strcmp(tensor_dt, "int8")   || !strcmp(tensor_dt, "uint8")  ||
+         !strcmp(tensor_dt, "int16")  || !strcmp(tensor_dt, "uint16") ||
+         !strcmp(tensor_dt, "int32")  || !strcmp(tensor_dt, "uint32") ||
+         !strcmp(tensor_dt, "int64")  || !strcmp(tensor_dt, "uint64"));
+    if (is_int_tensor && Z_TYPE_P(z) == IS_DOUBLE) {
+        return "float64";
+    }
+    return tensor_dt;
+}
+
+/**
+ * @brief Allocate a 0-D NDArray of dtype @p target_dt and encode @p z into it.
+ *
+ * Routes through `NDArray_EncodeZvalToDtype` so encoding is loss-free for
+ * the wide dtypes — `float128` strings flow through `strtoflt128` (or the
+ * DD parser), `int64` / `uint64` through `strtoll` / `strtoull`. Every other
+ * dtype coerces the scalar through `double`, which represents its full range
+ * exactly. The resulting NDArray lives in CPU RAM; the upstream device
+ * migration in `ndarray_promote_and_op` moves it to GPU when needed.
+ *
+ * @param[in] z         PHP scalar (IS_LONG / IS_DOUBLE / IS_STRING /
+ *                      IS_TRUE / IS_FALSE).
+ * @param[in] target_dt Canonical dtype string.
+ * @return Caller-owned 0-D NDArray on success, NULL on validation error
+ *         (with a PHP exception in flight).
+ */
+static NDArray *ndarray_make_typed_scalar(zval *z, const char *target_dt)
+{
+    int *shape0 = emalloc(sizeof(int));
+    shape0[0] = 1;
+    NDArray *r = NDArray_Empty(shape0, 0, target_dt, NDARRAY_DEVICE_CPU);
+    if (r == NULL) {
+        return NULL;
+    }
+    if (!NDArray_EncodeZvalToDtype(z, target_dt, (char *)NDArray_DATA(r))) {
+        NDArray_FREE(r);
+        return NULL;
+    }
+    return r;
+}
+
+/**
+ * @brief Resolve a PHP operand zval to an NDArray, honouring weak-scalar
+ *        promotion against the peer operand's dtype.
+ *
+ * Handles both the NDArray-array and NDArray-scalar cases used by every
+ * binary arithmetic op:
+ *  - When @p other is an NDArray and @p value is a promotable scalar
+ *    (IS_LONG/IS_DOUBLE/IS_STRING/IS_TRUE/IS_FALSE), allocate a 0-D NDArray
+ *    of @p other's dtype and encode @p value into it with full precision
+ *    via `NDArray_EncodeZvalToDtype`. This is the only path that keeps
+ *    `float128` / `int64` / `uint64` strings loss-free end-to-end.
+ *  - Otherwise fall back to `ZVAL_TO_NDARRAY`, which already handles
+ *    arrays, NDArrays, integers, and doubles. A bare string with no peer
+ *    NDArray to anchor on throws a clear error here (we cannot guess a
+ *    dtype).
+ *
+ * @param[in]  value     PHP zval to resolve.
+ * @param[in]  other     Peer NDArray, or NULL when none exists.
+ * @param[out] is_owned  Receives 1 when the helper allocated a fresh NDArray
+ *                       that the caller must `NDArray_FREE` (rather than
+ *                       releasing via `CHECK_INPUT_AND_FREE`).
+ * @return NDArray operand on success, NULL on error (PHP exception in flight).
+ */
+static NDArray *ndarray_arith_resolve_operand(zval *value, NDArray *other,
+                                              int *is_owned)
+{
+    *is_owned = 0;
+    if (other != NULL && ndarray_is_promotable_scalar(value)) {
+        const char *target = ndarray_pick_scalar_dtype(NDArray_TYPE(other), value);
+        NDArray *r = ndarray_make_typed_scalar(value, target);
+        if (r == NULL) {
+            return NULL;
+        }
+        *is_owned = 1;
+        return r;
+    }
+    if (Z_TYPE_P(value) == IS_STRING) {
+        zend_throw_error(NULL,
+            "Cannot infer dtype for a string scalar without an NDArray peer.");
+        return NULL;
+    }
+    return ZVAL_TO_NDARRAY(value);
+}
+
+/**
+ * @brief Single binary-arithmetic dispatcher shared by every PHP entry point.
+ *
+ * Both `NumPower::add/sub/mul/div/pow/mod` and the operator-overload path
+ * (`$a + $b`, …) funnel through here. The function:
+ *  1. Resolves each operand via `ndarray_arith_resolve_operand`, applying
+ *     PyTorch's weak-scalar promotion when one side is a non-NDArray scalar.
+ *     String scalars adopt the peer NDArray's dtype so `float128` / `uint64`
+ *     precision is preserved end-to-end.
+ *  2. Checks broadcast compatibility.
+ *  3. Calls `ndarray_promote_and_op`, which routes the operands to the right
+ *     typed CPU or GPU kernel.
+ *  4. Releases every transient operand exactly once (whether owned or
+ *     borrowed from a PHP zval).
+ *  5. Installs the result via `ndarray_init_new_object`, which collapses
+ *     a 0-D result to the dtype-correct PHP scalar (string for `float128`/
+ *     `uint64`, int for the remaining integer dtypes, float for the
+ *     remaining floats).
+ *
+ * @param[in]  opcode ZEND_ADD / SUB / MUL / DIV / POW / MOD.
+ * @param[in]  op1    First operand zval (NDArray / array / scalar).
+ * @param[in]  op2    Second operand zval.
+ * @param[out] result zval populated with the arithmetic result.
+ * @return SUCCESS on success, FAILURE when an operand cannot be resolved,
+ *         shapes are not broadcastable, or the typed kernel itself failed.
+ */
+static int ndarray_arith_dispatch(zend_uchar opcode, zval *op1, zval *op2,
+                                   zval *result)
+{
+    int op1_is_nda = (Z_TYPE_P(op1) == IS_OBJECT &&
+                      instanceof_function(Z_OBJCE_P(op1), phpsci_ce_NDArray));
+    int op2_is_nda = (Z_TYPE_P(op2) == IS_OBJECT &&
+                      instanceof_function(Z_OBJCE_P(op2), phpsci_ce_NDArray));
+
+    NDArray *nda = NULL, *ndb = NULL;
+    int nda_owned = 0, ndb_owned = 0;
+
+    if (op1_is_nda && !op2_is_nda) {
+        nda = ZVAL_TO_NDARRAY(op1);
+        if (nda == NULL) return FAILURE;
+        ndb = ndarray_arith_resolve_operand(op2, nda, &ndb_owned);
+        if (ndb == NULL) {
+            CHECK_INPUT_AND_FREE(op1, nda);
+            return FAILURE;
+        }
+    } else if (op2_is_nda && !op1_is_nda) {
+        ndb = ZVAL_TO_NDARRAY(op2);
+        if (ndb == NULL) return FAILURE;
+        nda = ndarray_arith_resolve_operand(op1, ndb, &nda_owned);
+        if (nda == NULL) {
+            CHECK_INPUT_AND_FREE(op2, ndb);
+            return FAILURE;
+        }
+    } else {
+        /* Either both NDArrays or neither. For both-scalar (or both-array,
+           or one-array-one-array) the order matters only when exactly one
+           operand is `IS_STRING`: the string needs a peer NDArray to
+           anchor its dtype against. Resolve the non-string side first when
+           the asymmetry shows up, then anchor the string against it; this
+           keeps `add('1.5', 2)` and `add(2, '1.5')` symmetrical instead of
+           letting the first form throw while the second succeeds. */
+        int op1_is_str = Z_TYPE_P(op1) == IS_STRING;
+        int op2_is_str = Z_TYPE_P(op2) == IS_STRING;
+        if (op1_is_str && !op2_is_str) {
+            ndb = ndarray_arith_resolve_operand(op2, NULL, &ndb_owned);
+            if (ndb == NULL) return FAILURE;
+            nda = ndarray_arith_resolve_operand(op1, ndb, &nda_owned);
+            if (nda == NULL) {
+                if (ndb_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
+                return FAILURE;
+            }
+        } else {
+            nda = ndarray_arith_resolve_operand(op1, NULL, &nda_owned);
+            if (nda == NULL) return FAILURE;
+            ndb = ndarray_arith_resolve_operand(op2, nda, &ndb_owned);
+            if (ndb == NULL) {
+                if (nda_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+                return FAILURE;
+            }
+        }
+    }
+
+    if (!NDArray_IsBroadcastable(nda, ndb)) {
+        zend_throw_error(NULL, "Can't broadcast arrays with incompatible shapes.");
+        if (nda_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+        if (ndb_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
+        return FAILURE;
+    }
+
+    NDArray *rtn = ndarray_promote_and_op(opcode, nda, ndb, NULL);
+    if (nda_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
+    if (ndb_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
+
+    if (rtn == NULL) {
+        return FAILURE;
+    }
+    rtn->uuid = -1;
+    ndarray_init_new_object(rtn, result);
+    return SUCCESS;
 }
 
 static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray *ndb,
@@ -682,35 +911,50 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
     NDArray *b = ndb_cast ? ndb_cast : ndb;
     int use_double   = is_type(comp_type, NDARRAY_TYPE_FLOAT64);
     int use_float128 = is_type(comp_type, NDARRAY_TYPE_FLOAT128);
+    int use_int_native =
+        is_type(comp_type, "int8")  || is_type(comp_type, "uint8")  ||
+        is_type(comp_type, "int16") || is_type(comp_type, "uint16") ||
+        is_type(comp_type, "int32") || is_type(comp_type, "uint32") ||
+        is_type(comp_type, "int64") || is_type(comp_type, "uint64");
 
     NDArray *rtn = NULL;
-    switch (opcode) {
-    case ZEND_ADD:
-        rtn = use_float128 ? NDArray_Add_Float128(a, b)
-            : use_double   ? NDArray_Add_Double(a, b)
-                           : NDArray_Add_Float(a, b);      break;
-    case ZEND_SUB:
-        rtn = use_float128 ? NDArray_Subtract_Float128(a, b)
-            : use_double   ? NDArray_Subtract_Double(a, b)
-                           : NDArray_Subtract_Float(a, b); break;
-    case ZEND_MUL:
-        rtn = use_float128 ? NDArray_Multiply_Float128(a, b)
-            : use_double   ? NDArray_Multiply_Double(a, b)
-                           : NDArray_Multiply_Float(a, b); break;
-    case ZEND_DIV:
-        rtn = use_float128 ? NDArray_Divide_Float128(a, b)
-            : use_double   ? NDArray_Divide_Double(a, b)
-                           : NDArray_Divide_Float(a, b);   break;
-    case ZEND_POW:
-        rtn = use_float128 ? NDArray_Pow_Float128(a, b)
-            : use_double   ? NDArray_Pow_Double(a, b)
-                           : NDArray_Pow_Float(a, b);      break;
-    case ZEND_MOD:
-        rtn = use_float128 ? NDArray_Mod_Float128(a, b)
-            : use_double   ? NDArray_Mod_Double(a, b)
-                           : NDArray_Mod_Float(a, b);      break;
-    default:
-        break;
+    if (use_int_native) {
+        /* Native integer CPU kernel — keeps every integer dtype native so
+           PyTorch's modular wrap-around survives end-to-end. The legacy
+           float64 round-trip silently rounded `int32 * int32` past 2^53
+           (e.g. `(2^28+1)^2` returned 536870912 instead of 536870913)
+           and the matching `cuda_cast_f64_to_i32` saturated rather than
+           wrapping, so CPU and GPU diverged on the same input. */
+        rtn = NDArray_TypedBinOp_CPU_Int(opcode, a, b);
+    } else {
+        switch (opcode) {
+        case ZEND_ADD:
+            rtn = use_float128 ? NDArray_Add_Float128(a, b)
+                : use_double   ? NDArray_Add_Double(a, b)
+                               : NDArray_Add_Float(a, b);      break;
+        case ZEND_SUB:
+            rtn = use_float128 ? NDArray_Subtract_Float128(a, b)
+                : use_double   ? NDArray_Subtract_Double(a, b)
+                               : NDArray_Subtract_Float(a, b); break;
+        case ZEND_MUL:
+            rtn = use_float128 ? NDArray_Multiply_Float128(a, b)
+                : use_double   ? NDArray_Multiply_Double(a, b)
+                               : NDArray_Multiply_Float(a, b); break;
+        case ZEND_DIV:
+            rtn = use_float128 ? NDArray_Divide_Float128(a, b)
+                : use_double   ? NDArray_Divide_Double(a, b)
+                               : NDArray_Divide_Float(a, b);   break;
+        case ZEND_POW:
+            rtn = use_float128 ? NDArray_Pow_Float128(a, b)
+                : use_double   ? NDArray_Pow_Double(a, b)
+                               : NDArray_Pow_Float(a, b);      break;
+        case ZEND_MOD:
+            rtn = use_float128 ? NDArray_Mod_Float128(a, b)
+                : use_double   ? NDArray_Mod_Double(a, b)
+                               : NDArray_Mod_Float(a, b);      break;
+        default:
+            break;
+        }
     }
 
     if (nda_cast) NDArray_FREE(nda_cast);
@@ -728,10 +972,18 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
     return rtn;
 }
 
+/**
+ * @brief Operator-overload bridge — same path as the explicit PHP methods.
+ *
+ * PHP calls this through `ndarray_object_handlers.do_operation` for
+ * `$a + $b`, `$a - $b`, … . Opcodes outside the supported arithmetic
+ * set return FAILURE so the engine falls back to its default handling
+ * (e.g. string concatenation via `__toString`). All accepted opcodes
+ * go through the shared `ndarray_arith_dispatch`, which implements
+ * weak-scalar promotion (including IS_STRING for fp128/int64/uint64),
+ * broadcasting, typed dispatch, and 0-D scalar return.
+ */
 static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
-
-    /* Return FAILURE early for opcodes we don't handle so PHP can fall back
-       to __toString for string concatenation instead of crashing on ZVAL_TO_NDARRAY. */
     switch (opcode) {
         case ZEND_ADD: case ZEND_SUB: case ZEND_MUL:
         case ZEND_DIV: case ZEND_POW: case ZEND_MOD:
@@ -739,109 +991,7 @@ static int ndarray_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, z
         default:
             return FAILURE;
     }
-
-    /* PyTorch "weak scalar" promotion: when one operand is an NDArray and the
-       other is a bare PHP IS_LONG/IS_DOUBLE, create the scalar in the array's
-       dtype so the result preserves that dtype. Exception: an IS_DOUBLE
-       scalar with an integer tensor still promotes to float (matches PyTorch's
-       category-promotion rule). */
-    NDArray *nda = NULL, *ndb = NULL;
-    int nda_is_scalar_owned = 0, ndb_is_scalar_owned = 0;
-    int op1_is_ndarray = (Z_TYPE_P(op1) == IS_OBJECT &&
-                          instanceof_function(Z_OBJCE_P(op1), phpsci_ce_NDArray));
-    int op2_is_ndarray = (Z_TYPE_P(op2) == IS_OBJECT &&
-                          instanceof_function(Z_OBJCE_P(op2), phpsci_ce_NDArray));
-    int op1_is_php_scalar = (Z_TYPE_P(op1) == IS_LONG || Z_TYPE_P(op1) == IS_DOUBLE);
-    int op2_is_php_scalar = (Z_TYPE_P(op2) == IS_LONG || Z_TYPE_P(op2) == IS_DOUBLE);
-
-    if (op1_is_ndarray && op2_is_php_scalar) {
-        nda = ZVAL_TO_NDARRAY(op1);
-        if (nda == NULL) return FAILURE;
-        const char *target_dtype = NDArray_TYPE(nda);
-        int is_int_tensor =
-            (!strcmp(target_dtype, "int8")   || !strcmp(target_dtype, "uint8")  ||
-             !strcmp(target_dtype, "int16")  || !strcmp(target_dtype, "uint16") ||
-             !strcmp(target_dtype, "int32")  || !strcmp(target_dtype, "uint32") ||
-             !strcmp(target_dtype, "int64")  || !strcmp(target_dtype, "uint64"));
-        if (Z_TYPE_P(op2) == IS_DOUBLE && is_int_tensor) {
-            /* Float scalar + int tensor → float result. Default to float64
-               for full IEEE-754 double precision. */
-            target_dtype = "float64";
-        }
-        int *shape0 = emalloc(sizeof(int));
-        shape0[0] = 1;
-        ndb = NDArray_Empty(shape0, 0, target_dtype, NDARRAY_DEVICE_CPU);
-        if (ndb == NULL) {
-            CHECK_INPUT_AND_FREE(op1, nda);
-            return FAILURE;
-        }
-        if (Z_TYPE_P(op2) == IS_LONG) {
-            ndarray_set_from_double(target_dtype, NDArray_DATA(ndb), 0,
-                                    (double)Z_LVAL_P(op2));
-        } else {
-            ndarray_set_from_double(target_dtype, NDArray_DATA(ndb), 0,
-                                    Z_DVAL_P(op2));
-        }
-        ndb_is_scalar_owned = 1;
-    } else if (op1_is_php_scalar && op2_is_ndarray) {
-        ndb = ZVAL_TO_NDARRAY(op2);
-        if (ndb == NULL) return FAILURE;
-        const char *target_dtype = NDArray_TYPE(ndb);
-        int is_int_tensor =
-            (!strcmp(target_dtype, "int8")   || !strcmp(target_dtype, "uint8")  ||
-             !strcmp(target_dtype, "int16")  || !strcmp(target_dtype, "uint16") ||
-             !strcmp(target_dtype, "int32")  || !strcmp(target_dtype, "uint32") ||
-             !strcmp(target_dtype, "int64")  || !strcmp(target_dtype, "uint64"));
-        if (Z_TYPE_P(op1) == IS_DOUBLE && is_int_tensor) {
-            target_dtype = "float64";
-        }
-        int *shape0 = emalloc(sizeof(int));
-        shape0[0] = 1;
-        nda = NDArray_Empty(shape0, 0, target_dtype, NDARRAY_DEVICE_CPU);
-        if (nda == NULL) {
-            CHECK_INPUT_AND_FREE(op2, ndb);
-            return FAILURE;
-        }
-        if (Z_TYPE_P(op1) == IS_LONG) {
-            ndarray_set_from_double(target_dtype, NDArray_DATA(nda), 0,
-                                    (double)Z_LVAL_P(op1));
-        } else {
-            ndarray_set_from_double(target_dtype, NDArray_DATA(nda), 0,
-                                    Z_DVAL_P(op1));
-        }
-        nda_is_scalar_owned = 1;
-    } else {
-        nda = ZVAL_TO_NDARRAY(op1);
-        ndb = ZVAL_TO_NDARRAY(op2);
-    }
-
-    if (nda == NULL || ndb == NULL) {
-        if (nda_is_scalar_owned && nda) NDArray_FREE(nda);
-        else if (nda) CHECK_INPUT_AND_FREE(op1, nda);
-        if (ndb_is_scalar_owned && ndb) NDArray_FREE(ndb);
-        else if (ndb) CHECK_INPUT_AND_FREE(op2, ndb);
-        return FAILURE;
-    }
-
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast arrays with incompatible shapes.");
-        if (nda_is_scalar_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
-        if (ndb_is_scalar_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
-        return FAILURE;
-    }
-
-    NDArray *rtn = ndarray_promote_and_op(opcode, nda, ndb, NULL);
-
-    if (nda_is_scalar_owned) NDArray_FREE(nda); else CHECK_INPUT_AND_FREE(op1, nda);
-    if (ndb_is_scalar_owned) NDArray_FREE(ndb); else CHECK_INPUT_AND_FREE(op2, ndb);
-
-    if (rtn == NULL) {
-        return FAILURE;
-    }
-
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, result);
-    return SUCCESS;
+    return ndarray_arith_dispatch(opcode, op1, op2, result);
 }
 
 static int arithmetic_do_operation_ex(zend_uchar opcode, zval *result, zval *op1, zval *op2) { /* {{{ */
@@ -5169,243 +5319,101 @@ PHP_METHOD(NumPower, log2) {
 }
 
 /**
- * NumPower::subtract
+ * @brief Shared PHP entry-point body for the six binary arithmetic methods.
+ *
+ * Every method (`add`, `subtract`, `multiply`, `divide`, `pow`, `mod`)
+ * differs only in the opcode passed to `ndarray_arith_dispatch`. The
+ * dispatcher handles weak-scalar promotion for IS_LONG/IS_DOUBLE/IS_STRING/
+ * IS_TRUE/IS_FALSE (including loss-free `float128` / `int64` / `uint64`
+ * string parsing), broadcasting, typed kernel dispatch on the correct
+ * device, and dtype-correct return-value installation.
+ *
+ * @param[in]  opcode       Arithmetic opcode (ZEND_ADD / SUB / …).
+ * @param[in]  execute_data PHP call frame (provides the two operands).
+ * @param[out] return_value zval receiving the result.
+ */
+static void php_ndarray_arith_method(zend_uchar opcode, INTERNAL_FUNCTION_PARAMETERS)
+{
+    zval *a, *b;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_ZVAL(a)
+        Z_PARAM_ZVAL(b)
+    ZEND_PARSE_PARAMETERS_END();
+    (void)ndarray_arith_dispatch(opcode, a, b, return_value);
+}
+
+/**
+ * @brief `NumPower::subtract(a, b): NDArray|int|float|string` — element-wise
+ *        subtraction with broadcasting and weak-scalar (IS_STRING-capable)
+ *        promotion. See `php_ndarray_arith_method`.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_subtract, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, subtract) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-    Z_PARAM_ZVAL(a)
-    Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-    if (nda == NULL) {
-        return;
-    }
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-    rtn = ndarray_promote_and_op(ZEND_SUB, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_SUB, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
- * NumPower::mod
+ * @brief `NumPower::mod(a, b): NDArray|int|float|string` — element-wise
+ *        remainder. Shares the dispatcher with the other binary ops.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_mod, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, mod) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-    Z_PARAM_ZVAL(a)
-    Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-    if (nda == NULL) {
-        return;
-    }
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-    rtn = ndarray_promote_and_op(ZEND_MOD, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_MOD, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
- * NumPower::pow
+ * @brief `NumPower::pow(a, b): NDArray|int|float|string` — element-wise
+ *        power. Shares the dispatcher with the other binary ops.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_pow, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, pow) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ZVAL(a)
-        Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-
-    if (nda == NULL) {
-        return;
-    }
-
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-
-    rtn = ndarray_promote_and_op(ZEND_POW, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_POW, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
- * NumPower::multiply
+ * @brief `NumPower::multiply(a, b): NDArray|int|float|string` — element-wise
+ *        multiplication. Shares the dispatcher with the other binary ops.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_multiply, 0)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, multiply) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ZVAL(a)
-        Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-
-    if (nda == NULL) {
-        return;
-    }
-
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-
-    rtn = ndarray_promote_and_op(ZEND_MUL, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_MUL, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
- * NumPower::divide
+ * @brief `NumPower::divide(a, b): NDArray|int|float|string` — element-wise
+ *        true division (matches PyTorch: integer operands divide to float).
+ *        Shares the dispatcher with the other binary ops.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_divide, 0)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, divide) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-    Z_PARAM_ZVAL(a)
-    Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-    if (nda == NULL) {
-        return;
-    }
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-    rtn = ndarray_promote_and_op(ZEND_DIV, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_DIV, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
- * NumPower::add
+ * @brief `NumPower::add(a, b): NDArray|int|float|string` — element-wise
+ *        addition. Shares the dispatcher with the other binary ops.
  */
 ZEND_BEGIN_ARG_INFO(arginfo_ndarray_add, 0)
     ZEND_ARG_INFO(0, a)
     ZEND_ARG_INFO(0, b)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, add) {
-    NDArray *rtn = NULL;
-    zval *a, *b;
-
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ZVAL(a)
-        Z_PARAM_ZVAL(b)
-    ZEND_PARSE_PARAMETERS_END();
-
-    NDArray *nda = ZVAL_TO_NDARRAY(a);
-    NDArray *ndb = ZVAL_TO_NDARRAY(b);
-
-    if (nda == NULL) {
-        return;
-    }
-
-    if (ndb == NULL) {
-        CHECK_INPUT_AND_FREE(a, nda);
-        return;
-    }
-
-    if (!NDArray_IsBroadcastable(nda, ndb)) {
-        zend_throw_error(NULL, "Can't broadcast array.");
-        CHECK_INPUT_AND_FREE(a, nda);
-        CHECK_INPUT_AND_FREE(b, ndb);
-        return;
-    }
-
-    rtn = ndarray_promote_and_op(ZEND_ADD, nda, ndb, NULL);
-    CHECK_INPUT_AND_FREE(a, nda);
-    CHECK_INPUT_AND_FREE(b, ndb);
-    if (rtn == NULL) return;
-    rtn->uuid = -1;
-    ndarray_init_new_object(rtn, return_value);
+    php_ndarray_arith_method(ZEND_ADD, INTERNAL_FUNCTION_PARAM_PASSTHRU);
 }
 
 /**
@@ -6537,34 +6545,44 @@ PHP_METHOD(NumPower, det) {
 /**
  * NumPower::sum
  */
+/**
+ * @brief `NumPower::sum(a, axis = null): NDArray|int|float|string` — sum of
+ *        elements, optionally over a single axis.
+ *
+ * `$axis === null` reduces every element to a 0-D NDArray collapsed by
+ * `ndarray_init_new_object` into a dtype-correct PHP scalar — `string` for
+ * `float128` / `uint64` (preserves the wide-dtype precision; `RETURN_DOUBLE`
+ * would silently round past 2⁵³), `int` for the remaining integer dtypes,
+ * `float` for the remaining floats.
+ *
+ * Integer `$axis` reduces along that axis; the result preserves @p a's
+ * dtype and device. Negative indices count from the end (`-1` is the last
+ * axis), matching numpy. The reduction stays on GPU for GPU inputs via the
+ * typed binop kernels in `NDArray_Reduce_Axis`.
+ */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sum, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, sum) {
-    NDArray *rtn = NULL;
     zval *a;
-    long axis;
-    int axis_i;
+    zend_long axis = 0;
+    zend_bool axis_is_null = 1;
     ZEND_PARSE_PARAMETERS_START(1, 2)
-    Z_PARAM_ZVAL(a)
-    Z_PARAM_OPTIONAL
-    Z_PARAM_LONG(axis)
+        Z_PARAM_ZVAL(a)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(axis, axis_is_null)
     ZEND_PARSE_PARAMETERS_END();
-    axis_i = (int)axis;
+
     NDArray *nda = ZVAL_TO_NDARRAY(a);
-    if (nda == NULL) {
-        return;
-    }
-    if (ZEND_NUM_ARGS() == 2) {
-        rtn = reduce(nda, &axis_i, NDArray_Add_Float);
-    } else {
-        double value = NDArray_Reduce_Sum(nda);
-        CHECK_INPUT_AND_FREE(a, nda);
-        RETURN_DOUBLE(value);
-        return;
-    }
+    if (nda == NULL) return;
+
+    NDArray *rtn = axis_is_null
+        ? NDArray_Reduce_Sum_AsNDArray(nda)
+        : NDArray_Reduce_Axis(nda, (int)axis, ND_AXIS_RED_SUM);
     CHECK_INPUT_AND_FREE(a, nda);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 
@@ -6642,35 +6660,38 @@ PHP_METHOD(NumPower, max) {
     ndarray_init_new_object(rtn, return_value);
 }
 
+/**
+ * @brief `NumPower::prod(a, axis = null): NDArray|int|float|string` — product
+ *        of elements, optionally over a single axis.
+ *
+ * Mirrors `sum()` in every respect — dtype preservation, GPU residency,
+ * dtype-correct scalar return, negative-axis support — but accumulates via
+ * multiplication. See the `sum()` docblock for the per-dtype return-type
+ * contract.
+ */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_prod, 0, 0, 1)
 ZEND_ARG_INFO(0, a)
 ZEND_ARG_INFO(0, axis)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, prod) {
-    NDArray *rtn = NULL;
     zval *a;
-    long axis;
-    int axis_i;
-    float value;
+    zend_long axis = 0;
+    zend_bool axis_is_null = 1;
     ZEND_PARSE_PARAMETERS_START(1, 2)
-    Z_PARAM_ZVAL(a)
-    Z_PARAM_OPTIONAL
-    Z_PARAM_LONG(axis)
+        Z_PARAM_ZVAL(a)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG_OR_NULL(axis, axis_is_null)
     ZEND_PARSE_PARAMETERS_END();
-    axis_i = (int)axis;
+
     NDArray *nda = ZVAL_TO_NDARRAY(a);
-    if (nda == NULL) {
-        return;
-    }
-    if (ZEND_NUM_ARGS() == 2) {
-        rtn = reduce(nda, &axis_i, NDArray_Multiply_Float);
-    } else {
-        double pvalue = NDArray_Reduce_Prod(nda);
-        CHECK_INPUT_AND_FREE(a, nda);
-        RETURN_DOUBLE(pvalue);
-        return;
-    }
+    if (nda == NULL) return;
+
+    NDArray *rtn = axis_is_null
+        ? NDArray_Reduce_Prod_AsNDArray(nda)
+        : NDArray_Reduce_Axis(nda, (int)axis, ND_AXIS_RED_PROD);
     CHECK_INPUT_AND_FREE(a, nda);
+    if (rtn == NULL) return;
+    rtn->uuid = -1;
     ndarray_init_new_object(rtn, return_value);
 }
 

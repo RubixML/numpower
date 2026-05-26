@@ -389,6 +389,549 @@ NDArray_Reduce_Mean(NDArray *a) {
     return NDArray_Reduce_Sum(a) / (double) n;
 }
 
+/**
+ * @brief Pick the result dtype for a sum / prod reduction over @p input_dt.
+ *
+ * Default widening (PyTorch parity):
+ *  - signed   integer dtypes (int8..int64)   widen to `int64`,
+ *  - unsigned integer dtypes (uint8..uint64) widen to `uint64`,
+ *  - narrow   floating dtypes (float4..float16) widen to `float32` so the
+ *    sum / prod doesn't saturate at the dtype's tiny representable range
+ *    (`float4` max = 6, `float8 E4M3` max = 240, `float16` max ≈ 65504),
+ *  - `float32` / `float64` / `float128` keep the source dtype.
+ *
+ * This is the only place where the reduction's output dtype differs from
+ * the input — `NDArray_ScalarToZval` then picks the correct PHP-scalar
+ * encoding for the widened type (`string` for `uint64`/`float128`,
+ * `int` for the remaining integer dtypes, `float` otherwise).
+ *
+ * @param[in] input_dt Source NDArray dtype.
+ * @return Canonical dtype string for the reduction's output.
+ */
+static const char *
+ndarray_reduce_result_dtype(const char *input_dt) {
+    if (!strcmp(input_dt, "int8")   || !strcmp(input_dt, "int16")  ||
+        !strcmp(input_dt, "int32")  || !strcmp(input_dt, "int64"))  return "int64";
+    if (!strcmp(input_dt, "uint8")  || !strcmp(input_dt, "uint16") ||
+        !strcmp(input_dt, "uint32") || !strcmp(input_dt, "uint64")) return "uint64";
+    if (!strcmp(input_dt, "float4") || !strcmp(input_dt, "float8")  ||
+        !strcmp(input_dt, "float16")) return "float32";
+    return input_dt;
+}
+
+/**
+ * @brief Read element @p idx of @p data (dtype @p t) as `int64_t`.
+ *
+ * Used by the int64-accumulator path of `sum` / `prod` so narrow signed and
+ * unsigned int inputs can be safely widened (each element exactly representable
+ * as `int64_t`; the accumulator then wraps on overflow per C signed-integer
+ * semantics).
+ *
+ * @param[in] t    Dtype of the source buffer.
+ * @param[in] data Source buffer pointer.
+ * @param[in] idx  Element index.
+ * @return Element value widened to `int64_t`.
+ */
+static int64_t
+ndarray_element_to_int64(const char *t, const char *data, size_t idx) {
+    if (!strcmp(t, "int8"))   return (int64_t)(int8_t)((const uint8_t *)data)[idx];
+    if (!strcmp(t, "uint8"))  return (int64_t)((const uint8_t *)data)[idx];
+    if (!strcmp(t, "int16"))  { int16_t v;  memcpy(&v, (const int16_t  *)data + idx, 2); return (int64_t)v; }
+    if (!strcmp(t, "uint16")) { uint16_t v; memcpy(&v, (const uint16_t *)data + idx, 2); return (int64_t)v; }
+    if (!strcmp(t, "int32"))  { int32_t v;  memcpy(&v, (const int32_t  *)data + idx, 4); return (int64_t)v; }
+    if (!strcmp(t, "uint32")) { uint32_t v; memcpy(&v, (const uint32_t *)data + idx, 4); return (int64_t)v; }
+    if (!strcmp(t, "int64"))  { int64_t v;  memcpy(&v, (const int64_t  *)data + idx, 8); return v; }
+    if (!strcmp(t, "uint64")) { uint64_t v; memcpy(&v, (const uint64_t *)data + idx, 8); return (int64_t)v; }
+    /* Non-integer fallback — round to nearest. */
+    return (int64_t)ndarray_element_to_double(t, data, idx);
+}
+
+/**
+ * @brief Read element @p idx of @p data (dtype @p t) as `uint64_t`.
+ *
+ * Companion to `ndarray_element_to_int64` for the uint64-accumulator path.
+ * Signed inputs are widened through `int64_t` first so negative values
+ * sign-extend before reinterpretation, matching the two's-complement
+ * behaviour of an explicit `(uint64_t)(int64_t)v` cast.
+ *
+ * @param[in] t    Dtype of the source buffer.
+ * @param[in] data Source buffer pointer.
+ * @param[in] idx  Element index.
+ * @return Element value widened to `uint64_t`.
+ */
+static uint64_t
+ndarray_element_to_uint64(const char *t, const char *data, size_t idx) {
+    if (!strcmp(t, "uint8"))  return (uint64_t)((const uint8_t *)data)[idx];
+    if (!strcmp(t, "uint16")) { uint16_t v; memcpy(&v, (const uint16_t *)data + idx, 2); return (uint64_t)v; }
+    if (!strcmp(t, "uint32")) { uint32_t v; memcpy(&v, (const uint32_t *)data + idx, 4); return (uint64_t)v; }
+    if (!strcmp(t, "uint64")) { uint64_t v; memcpy(&v, (const uint64_t *)data + idx, 8); return v; }
+    return (uint64_t)ndarray_element_to_int64(t, data, idx);
+}
+
+/**
+ * @brief Read element @p idx of @p data (dtype @p t) as `ndarray_fp128_t`.
+ *
+ * Loss-free for `float128` inputs (direct memcpy of the 16-byte storage);
+ * for every other dtype the element first widens through `double` (exact
+ * for `float4..float64` and every integer dtype except `uint64` /
+ * `int64` past the double mantissa). The fp128 accumulator absorbs the
+ * exact double, which is far wider than the source dtype's range.
+ *
+ * @param[in] t    Dtype of the source buffer.
+ * @param[in] data Source buffer pointer.
+ * @param[in] idx  Element index.
+ * @return Element widened to `ndarray_fp128_t`.
+ */
+static ndarray_fp128_t
+ndarray_element_to_fp128(const char *t, const char *data, size_t idx) {
+    if (!strcmp(t, "float128")) {
+        ndarray_fp128_t v;
+        memcpy(&v, (const ndarray_fp128_t *)data + idx, NDARRAY_FP128_SIZE);
+        return v;
+    }
+    return NDARRAY_FP128_FROM_D(ndarray_element_to_double(t, data, idx));
+}
+
+/**
+ * @brief CPU sum reduction with native-precision accumulator selected by
+ *        @p out_dt.
+ *
+ * Walks every element of @p src once and writes the final accumulator into
+ * the first slot of @p out:
+ *  - `int64`    → `int64_t` accumulator (signed-overflow wrap matches C),
+ *  - `uint64`   → `uint64_t` accumulator (modular two's-complement wrap),
+ *  - `float128` → `ndarray_fp128_t` accumulator (native fp128 add),
+ *  - everything else → `double` accumulator stored via
+ *    `ndarray_set_from_double` (rounds to the target dtype's precision).
+ *
+ * @param[in]  src    Source NDArray, CPU resident.
+ * @param[out] out    Destination NDArray (0-D / 1-element / axis output slot).
+ * @param[in]  out_dt Canonical dtype string of @p out.
+ */
+static void
+cpu_reduce_sum_into(NDArray *src, NDArray *out, const char *out_dt) {
+    const char *src_dt = NDArray_TYPE(src);
+    long n = NDArray_NUMELEMENTS(src);
+    if (!strcmp(out_dt, "int64")) {
+        int64_t acc = 0;
+        for (long i = 0; i < n; i++) {
+            acc += ndarray_element_to_int64(src_dt, NDArray_DATA(src), (size_t)i);
+        }
+        memcpy(NDArray_DATA(out), &acc, sizeof(int64_t));
+        return;
+    }
+    if (!strcmp(out_dt, "uint64")) {
+        uint64_t acc = 0;
+        for (long i = 0; i < n; i++) {
+            acc += ndarray_element_to_uint64(src_dt, NDArray_DATA(src), (size_t)i);
+        }
+        memcpy(NDArray_DATA(out), &acc, sizeof(uint64_t));
+        return;
+    }
+    if (!strcmp(out_dt, "float128")) {
+        ndarray_fp128_t acc = NDARRAY_FP128_ZERO();
+        for (long i = 0; i < n; i++) {
+            ndarray_fp128_t v = ndarray_element_to_fp128(src_dt, NDArray_DATA(src), (size_t)i);
+            acc = NDARRAY_FP128_ADD(acc, v);
+        }
+        memcpy(NDArray_DATA(out), &acc, NDARRAY_FP128_SIZE);
+        return;
+    }
+    /* Float dtypes (f4/f8/f16/f32/f64): double accumulator rounds to the
+       output's precision at the very end. */
+    double acc = 0.0;
+    for (long i = 0; i < n; i++) {
+        acc += ndarray_element_to_double(src_dt, NDArray_DATA(src), (size_t)i);
+    }
+    ndarray_set_from_double(out_dt, NDArray_DATA(out), 0, acc);
+}
+
+/**
+ * @brief CPU prod reduction — see `cpu_reduce_sum_into` for the accumulator
+ *        selection rules. The combining op is `*` instead of `+`, identity is
+ *        `1` instead of `0`, and float128 identity is `NDARRAY_FP128_FROM_D(1.0)`.
+ *
+ * @param[in]  src    Source NDArray.
+ * @param[out] out    Destination NDArray.
+ * @param[in]  out_dt Canonical dtype string of @p out.
+ */
+static void
+cpu_reduce_prod_into(NDArray *src, NDArray *out, const char *out_dt) {
+    const char *src_dt = NDArray_TYPE(src);
+    long n = NDArray_NUMELEMENTS(src);
+    if (!strcmp(out_dt, "int64")) {
+        int64_t acc = 1;
+        for (long i = 0; i < n; i++) {
+            acc *= ndarray_element_to_int64(src_dt, NDArray_DATA(src), (size_t)i);
+        }
+        memcpy(NDArray_DATA(out), &acc, sizeof(int64_t));
+        return;
+    }
+    if (!strcmp(out_dt, "uint64")) {
+        uint64_t acc = 1;
+        for (long i = 0; i < n; i++) {
+            acc *= ndarray_element_to_uint64(src_dt, NDArray_DATA(src), (size_t)i);
+        }
+        memcpy(NDArray_DATA(out), &acc, sizeof(uint64_t));
+        return;
+    }
+    if (!strcmp(out_dt, "float128")) {
+        ndarray_fp128_t acc = NDARRAY_FP128_FROM_D(1.0);
+        for (long i = 0; i < n; i++) {
+            ndarray_fp128_t v = ndarray_element_to_fp128(src_dt, NDArray_DATA(src), (size_t)i);
+            acc = NDARRAY_FP128_MUL(acc, v);
+        }
+        memcpy(NDArray_DATA(out), &acc, NDARRAY_FP128_SIZE);
+        return;
+    }
+    double acc = 1.0;
+    for (long i = 0; i < n; i++) {
+        acc *= ndarray_element_to_double(src_dt, NDArray_DATA(src), (size_t)i);
+    }
+    ndarray_set_from_double(out_dt, NDArray_DATA(out), 0, acc);
+}
+
+/**
+ * @brief Allocate a 0-D NDArray containing the no-axis reduction of @p a in
+ *        @p a's widened reduction dtype, on the source device.
+ *
+ * The output dtype follows `ndarray_reduce_result_dtype` (NumPy default
+ * widening — narrow ints widen to `int64`/`uint64`; floats keep their
+ * dtype). The accumulator dtype on CPU matches the output for `int64` /
+ * `uint64` / `float128` (native-precision accumulation) and is `double`
+ * for the floating-point dtypes (matches NumPy's "sum precision = source
+ * dtype").
+ *
+ * For GPU sources the work stays on device: the routine calls
+ * `NDArray_Reduce_Sum`/`Prod` (which dispatches to the per-dtype
+ * `cuda_reduce_*` kernels — only a single double crosses the bus) and
+ * encodes the resulting double into the host-side widened slot. **Known
+ * limitation**: when the GPU sum / prod overflows the double mantissa
+ * (`> 2⁵³`) the result rounds; CPU and GPU may differ for `int64` /
+ * `uint64` / `float128` inputs in that regime.
+ *
+ * @param[in] a  Source NDArray (any dtype, any device).
+ * @param[in] op `ND_AXIS_RED_SUM` or `ND_AXIS_RED_PROD`.
+ * @return Freshly-allocated 0-D NDArray on success, NULL on failure (with a
+ *         PHP exception in flight).
+ */
+static NDArray *
+ndarray_reduce_full_as_ndarray(NDArray *a, enum ndarray_reduce_axis_op op) {
+    const char *src_dt = NDArray_TYPE(a);
+    const char *out_dt = ndarray_reduce_result_dtype(src_dt);
+    int *shape0 = emalloc(sizeof(int));
+    shape0[0] = 1;
+    NDArray *out = NDArray_Empty(shape0, 0, out_dt, NDARRAY_DEVICE_CPU);
+    if (out == NULL) return NULL;
+
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
+        if (op == ND_AXIS_RED_SUM)  cpu_reduce_sum_into (a, out, out_dt);
+        else                         cpu_reduce_prod_into(a, out, out_dt);
+        return out;
+    }
+
+    /* GPU source: run the typed `cuda_reduce_*` kernel that returns a single
+       double, then encode into the widened CPU slot. The CPU/GPU mismatch
+       for wide-int64 / wide-uint64 / wide-fp128 reductions is documented
+       above. */
+    double v = (op == ND_AXIS_RED_SUM) ? NDArray_Reduce_Sum(a)
+                                       : NDArray_Reduce_Prod(a);
+    if (EG(exception)) {
+        NDArray_FREE(out);
+        return NULL;
+    }
+    if (!strcmp(out_dt, "int64")) {
+        int64_t iv = (int64_t)v;
+        memcpy(NDArray_DATA(out), &iv, sizeof(int64_t));
+    } else if (!strcmp(out_dt, "uint64")) {
+        uint64_t uv = (uint64_t)v;
+        memcpy(NDArray_DATA(out), &uv, sizeof(uint64_t));
+    } else {
+        ndarray_set_from_double(out_dt, NDArray_DATA(out), 0, v);
+    }
+    return out;
+}
+
+NDArray *NDArray_Reduce_Sum_AsNDArray(NDArray *a) {
+    return ndarray_reduce_full_as_ndarray(a, ND_AXIS_RED_SUM);
+}
+
+NDArray *NDArray_Reduce_Prod_AsNDArray(NDArray *a) {
+    return ndarray_reduce_full_as_ndarray(a, ND_AXIS_RED_PROD);
+}
+
+#ifdef HAVE_CUBLAS
+/**
+ * @brief Run @p a [i] op= @p b [i] for every element in place, on GPU.
+ *
+ * Dispatches to the dtype-appropriate `cuda_<op>_<tag>` kernel; both buffers
+ * must already reside on GPU and be of the same dtype. The kernel writes
+ * back into @p a (in-place), so callers driving the axis-reduction loop
+ * never need a scratch buffer.
+ *
+ * `float128` is handled via the dd kernels (one fp128 element = 2 doubles
+ * in the dd layout). `float4` / `float8` are not handled here — the caller
+ * arranges for fp16 staging before driving this loop.
+ *
+ * @param[in]     dt Canonical dtype string of both buffers.
+ * @param[in,out] a  GPU buffer (also the result).
+ * @param[in]     b  GPU buffer.
+ * @param[in]     n  Element count (logical: fp128 counts as one per slot).
+ * @param[in]     op `ND_AXIS_RED_SUM` or `ND_AXIS_RED_PROD`.
+ * @return 0 on success, -1 when the dtype has no native kernel.
+ */
+static int
+gpu_axis_inplace_op(const char *dt, void *a, const void *b, int n,
+                    enum ndarray_reduce_axis_op op) {
+#define HANDLE_TYPED(DTSTR, TAG, T)                                                  \
+    if (!strcmp(dt, DTSTR)) {                                                         \
+        T *ap = (T *)a;                                                               \
+        T *bp = (T *)b;                                                               \
+        if (op == ND_AXIS_RED_SUM) cuda_add_##TAG(ap, bp, ap, n);                     \
+        else                       cuda_mul_##TAG(ap, bp, ap, n);                     \
+        return 0;                                                                     \
+    }
+    HANDLE_TYPED("int8",    i8,  int8_t)
+    HANDLE_TYPED("uint8",   u8,  uint8_t)
+    HANDLE_TYPED("int16",   i16, int16_t)
+    HANDLE_TYPED("uint16",  u16, uint16_t)
+    HANDLE_TYPED("int32",   i32, int32_t)
+    HANDLE_TYPED("uint32",  u32, uint32_t)
+    HANDLE_TYPED("int64",   i64, int64_t)
+    HANDLE_TYPED("uint64",  u64, uint64_t)
+    HANDLE_TYPED("float16", f16, uint16_t)
+    HANDLE_TYPED("float64", f64, double)
+#undef HANDLE_TYPED
+    if (!strcmp(dt, "float32")) {
+        float *ap = (float *)a;
+        float *bp = (float *)b;
+        if (op == ND_AXIS_RED_SUM) cuda_add_float(n, ap, bp, ap, n);
+        else                       cuda_multiply_float(n, ap, bp, ap, n);
+        return 0;
+    }
+    if (!strcmp(dt, "float128")) {
+        double *ap = (double *)a;
+        double *bp = (double *)b;
+        if (op == ND_AXIS_RED_SUM) cuda_add_dd(ap, bp, ap, n);
+        else                       cuda_mul_dd(ap, bp, ap, n);
+        return 0;
+    }
+    return -1;
+}
+#endif /* HAVE_CUBLAS */
+
+/**
+ * @brief Reduce @p a along a single axis, preserving dtype and device.
+ *
+ * Implements numpy-style `sum(axis=k)` / `prod(axis=k)`. The output shape
+ * is @p a's shape with axis @p axis removed; a 1-D input collapses to a
+ * 0-D NDArray (callers route 0-D through `NDArray_ScalarToZval` to land in
+ * a dtype-correct PHP scalar).
+ *
+ * Algorithm:
+ *  - Resolve negative axes (numpy semantics: `-1` is the last axis).
+ *  - Move @p axis to position 0 via `NDArray_Rollaxis` (no-op when already
+ *    there); after the roll the per-slice memory layout is contiguous, so
+ *    slice `k` lives at `data + k * n_per_slice * elsize`.
+ *  - **CPU path**: walk each output position once, summing / multiplying
+ *    `a_rolled[i + k * n_per_slice]` for `k` in `[0, s_axis)` with `double`
+ *    accumulators (matches the no-axis CPU reduction's precision profile).
+ *  - **GPU path**: initialise the output with `cudaMemcpy(D2D)` of slice 0,
+ *    then apply the dtype's typed binop kernel in place for slices
+ *    `1 .. s_axis - 1`. `float4` / `float8` are routed through a float16
+ *    staging copy because no native fp4/fp8 binop kernels exist.
+ *
+ * Empty axis (`s_axis == 0`): return an output filled with the operation's
+ * identity (zero for sum, one for prod) — same semantic as `np.sum(axis=0)`
+ * on a zero-size dimension.
+ *
+ * @param[in] a    Source NDArray; any dtype, CPU or GPU.
+ * @param[in] axis Axis index in `[-ndim, ndim)`.
+ * @param[in] op   `ND_AXIS_RED_SUM` or `ND_AXIS_RED_PROD`.
+ * @return Freshly-allocated NDArray on success, NULL on validation error or
+ *         allocation failure (with a PHP exception in flight).
+ */
+NDArray *
+NDArray_Reduce_Axis(NDArray *a, int axis, enum ndarray_reduce_axis_op op) {
+    int ndim = NDArray_NDIM(a);
+    if (ndim == 0) {
+        /* 0-D source: numpy throws for any axis. */
+        zend_throw_error(NULL, "axis %d is out of bounds for array of dimension 0", axis);
+        return NULL;
+    }
+    if (axis < 0) axis += ndim;
+    if (axis < 0 || axis >= ndim) {
+        zend_throw_error(NULL,
+                         "axis %d is out of bounds for array of dimension %d",
+                         axis, ndim);
+        return NULL;
+    }
+
+    const char *src_dt = NDArray_TYPE(a);
+    const char *out_dt = ndarray_reduce_result_dtype(src_dt);
+    int dev = NDArray_DEVICE(a);
+    long s_axis = (long)NDArray_SHAPE(a)[axis];
+    long total = (long)NDArray_NUMELEMENTS(a);
+    long n_per_slice = (s_axis > 0) ? (total / s_axis) : 0;
+
+    /* Output shape — input shape with `axis` removed. */
+    int out_ndim = ndim - 1;
+    int *out_shape = emalloc(sizeof(int) * (out_ndim > 0 ? out_ndim : 1));
+    if (out_ndim > 0) {
+        for (int i = 0, j = 0; i < ndim; i++) {
+            if (i != axis) out_shape[j++] = NDArray_SHAPE(a)[i];
+        }
+    } else {
+        out_shape[0] = 1;  /* placeholder; ndim == 0 ignores it */
+    }
+
+    /* Empty reduction axis (s_axis == 0): output is identity-filled. */
+    if (s_axis == 0) {
+        long out_n = 1;
+        for (int i = 0; i < out_ndim; i++) out_n *= out_shape[i];
+        NDArray *out = NDArray_Empty(out_shape, out_ndim, out_dt, dev);
+        if (out == NULL) return NULL;
+        double id_v = (op == ND_AXIS_RED_SUM) ? 0.0 : 1.0;
+        if (dev == NDARRAY_DEVICE_CPU) {
+            for (long i = 0; i < out_n; i++) {
+                ndarray_set_from_double(out_dt, NDArray_DATA(out), (size_t)i, id_v);
+            }
+        }
+#ifdef HAVE_CUBLAS
+        else {
+            int elsize = NDArray_ELSIZE(out);
+            char *staging = ecalloc((size_t)(out_n > 0 ? out_n : 1), (size_t)elsize);
+            for (long i = 0; i < out_n; i++) {
+                ndarray_set_from_double(out_dt, staging, (size_t)i, id_v);
+            }
+            NDArray_TypedH2D((char *)NDArray_DATA(out), staging, out_n, out_dt);
+            efree(staging);
+        }
+#endif
+        return out;
+    }
+
+    /* Allocate output on the source device with the widened dtype. */
+    NDArray *out = NDArray_Empty(out_shape, out_ndim, out_dt, dev);
+    if (out == NULL) {
+        return NULL;
+    }
+
+    /* CPU per-output-element walk: pick the accumulator dtype based on
+       out_dt so wide-int / wide-fp128 reductions stay exact. */
+    if (dev == NDARRAY_DEVICE_CPU) {
+        /* Move axis to position 0 so each axis-0 slice is contiguous in
+           memory — simplifies the per-output index math. */
+        NDArray *a_rolled = (axis == 0) ? a : NDArray_Rollaxis(a, axis, 0);
+        if (a_rolled == NULL) {
+            NDArray_FREE(out);
+            return NULL;
+        }
+        const char *r_dt = NDArray_TYPE(a_rolled);
+        for (long i = 0; i < n_per_slice; i++) {
+            if (!strcmp(out_dt, "int64")) {
+                int64_t acc = (op == ND_AXIS_RED_SUM) ? 0 : 1;
+                for (long k = 0; k < s_axis; k++) {
+                    int64_t v = ndarray_element_to_int64(
+                        r_dt, NDArray_DATA(a_rolled), (size_t)(i + k * n_per_slice));
+                    if (op == ND_AXIS_RED_SUM) acc += v; else acc *= v;
+                }
+                memcpy((int64_t *)NDArray_DATA(out) + i, &acc, sizeof(int64_t));
+            } else if (!strcmp(out_dt, "uint64")) {
+                uint64_t acc = (op == ND_AXIS_RED_SUM) ? 0 : 1;
+                for (long k = 0; k < s_axis; k++) {
+                    uint64_t v = ndarray_element_to_uint64(
+                        r_dt, NDArray_DATA(a_rolled), (size_t)(i + k * n_per_slice));
+                    if (op == ND_AXIS_RED_SUM) acc += v; else acc *= v;
+                }
+                memcpy((uint64_t *)NDArray_DATA(out) + i, &acc, sizeof(uint64_t));
+            } else if (!strcmp(out_dt, "float128")) {
+                ndarray_fp128_t acc = (op == ND_AXIS_RED_SUM)
+                    ? NDARRAY_FP128_ZERO()
+                    : NDARRAY_FP128_FROM_D(1.0);
+                for (long k = 0; k < s_axis; k++) {
+                    ndarray_fp128_t v = ndarray_element_to_fp128(
+                        r_dt, NDArray_DATA(a_rolled), (size_t)(i + k * n_per_slice));
+                    acc = (op == ND_AXIS_RED_SUM) ? NDARRAY_FP128_ADD(acc, v)
+                                                  : NDARRAY_FP128_MUL(acc, v);
+                }
+                memcpy((ndarray_fp128_t *)NDArray_DATA(out) + i, &acc, NDARRAY_FP128_SIZE);
+            } else {
+                /* Float dtypes: double accumulator stored via set_from_double. */
+                double acc = (op == ND_AXIS_RED_SUM) ? 0.0 : 1.0;
+                for (long k = 0; k < s_axis; k++) {
+                    double v = ndarray_element_to_double(
+                        r_dt, NDArray_DATA(a_rolled), (size_t)(i + k * n_per_slice));
+                    if (op == ND_AXIS_RED_SUM) acc += v; else acc *= v;
+                }
+                ndarray_set_from_double(out_dt, NDArray_DATA(out), (size_t)i, acc);
+            }
+        }
+        if (a_rolled != a) NDArray_FREE(a_rolled);
+        return out;
+    }
+#ifdef HAVE_CUBLAS
+    /* GPU path. Cast input to the widened dtype first if necessary so the
+       accumulation runs entirely in the widened native int / fp dtype on
+       device — narrow ints won't wrap at their narrow range and float128
+       inputs accumulate with dd precision. */
+    NDArray *a_widened = (strcmp(src_dt, out_dt) == 0)
+        ? a : NDArray_AsType(a, out_dt);
+    if (a_widened == NULL) {
+        NDArray_FREE(out);
+        return NULL;
+    }
+    NDArray *a_rolled = (axis == 0) ? a_widened
+                                     : NDArray_Rollaxis(a_widened, axis, 0);
+    if (a_rolled == NULL) {
+        if (a_widened != a) NDArray_FREE(a_widened);
+        NDArray_FREE(out);
+        return NULL;
+    }
+
+    int elsize           = NDArray_ELSIZE(a_rolled);
+    const char *src_data = (const char *)NDArray_DATA(a_rolled);
+    char *out_data       = (char *)NDArray_DATA(out);
+    int n_slice_i        = (int)n_per_slice;
+    size_t slice_bytes   = (size_t)n_per_slice * (size_t)elsize;
+
+    /* `out_dt` is the widened dtype produced by `ndarray_reduce_result_dtype`
+       — narrow floats (fp4 / fp8 / fp16) have already been widened to
+       float32 by the `NDArray_AsType(a, out_dt)` cast above, so the GPU
+       loop below only ever sees the native-kernel dtypes (int8..int64,
+       uint8..uint64, float32, float64, float128 via dd). No fp4 / fp8
+       branch is needed here. */
+    cudaError_t cerr = cudaMemcpy(out_data, src_data, slice_bytes,
+                                   cudaMemcpyDeviceToDevice);
+    if (cerr != cudaSuccess) {
+        if (a_rolled != a_widened) NDArray_FREE(a_rolled);
+        if (a_widened != a) NDArray_FREE(a_widened);
+        NDArray_FREE(out);
+        zend_throw_error(NULL,
+            "GPU axis reduction memcpy failed: %s", cudaGetErrorString(cerr));
+        return NULL;
+    }
+    for (long k = 1; k < s_axis; k++) {
+        const void *src_k = (const void *)(src_data + (size_t)k * slice_bytes);
+        if (gpu_axis_inplace_op(out_dt, out_data, src_k, n_slice_i, op) < 0) {
+            if (a_rolled != a_widened) NDArray_FREE(a_rolled);
+            if (a_widened != a) NDArray_FREE(a_widened);
+            NDArray_FREE(out);
+            zend_throw_error(NULL,
+                "GPU axis reduction has no kernel for dtype \"%s\"", out_dt);
+            return NULL;
+        }
+    }
+    if (a_rolled != a_widened) NDArray_FREE(a_rolled);
+    if (a_widened != a) NDArray_FREE(a_widened);
+    return out;
+#else
+    NDArray_FREE(out);
+    zend_throw_error(NULL, "GPU reduction unavailable: built without CUDA");
+    return NULL;
+#endif
+}
+
 // Comparison function for sorting
 int compare(const void* a, const void* b) {
     float fa = *((const float*)a);
@@ -2055,6 +2598,318 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
     if (b_temp) NDArray_FREE(b);
     if (broadcasted) NDArray_FREE(broadcasted);
     return result;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Native integer CPU arithmetic kernels covering every one of the eight
+   integer dtypes: `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`,
+   `int64`, `uint64`.
+
+   The legacy dispatch promoted every integer dtype to `float32` (narrow
+   ints) or `float64` (int32 / uint32 / int64 / uint64) before computing,
+   then cast the result back. That round-trip:
+    1. Loses precision once the intermediate exceeds the float mantissa
+       (24 bits for narrow ints — still safe for int8..int16 products —
+       53 bits for int32 / uint32 / int64 / uint64; int32 * int32 with
+       products past 2⁵³ silently rounds; int64 / uint64 past 2⁵³ rounds
+       in every binary op).
+    2. Diverges from PyTorch which always computes natively in the input
+       dtype with C-style modular wrap.
+    3. Diverges between CPU (double rounds, then narrow cast wraps) and
+       GPU (`cuda_cast_f64_to_i32` saturates on out-of-range doubles —
+       different result on the same inputs).
+
+   The kernels below operate directly on the native integer storage so
+   the result matches PyTorch's modular semantics on both CPU and GPU.
+   Identical broadcast / 0-D scalar / shape handling as the float kernels.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Broadcast a 0-D scalar to @p other's shape on CPU, preserving its
+ *        dtype.
+ *
+ * Shared by the integer-binop path so the scalar+array case can fall into
+ * the same per-element loop as the array+array case. The caller frees the
+ * returned NDArray.
+ *
+ * @param[in] scalar 0-D NDArray (dtype must match @p other's).
+ * @param[in] other  Peer NDArray whose shape drives the broadcast.
+ * @return Caller-owned broadcast NDArray on success, NULL on allocation
+ *         failure (PHP exception in flight).
+ */
+static NDArray *
+ndarray_int_broadcast_scalar_cpu(NDArray *scalar, NDArray *other) {
+    int ndim = NDArray_NDIM(other);
+    int *n_shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
+    if (ndim > 0) {
+        memcpy(n_shape, NDArray_SHAPE(other), sizeof(int) * ndim);
+    } else {
+        n_shape[0] = 1;
+    }
+    NDArray *r = NDArray_Empty(n_shape, ndim, NDArray_TYPE(other),
+                                NDARRAY_DEVICE_CPU);
+    if (r == NULL) return NULL;
+    long n = NDArray_NUMELEMENTS(r);
+    int elsize = NDArray_ELSIZE(other);
+    const char *src = (const char *)NDArray_DATA(scalar);
+    char *dst = (char *)NDArray_DATA(r);
+    for (long i = 0; i < n; i++) {
+        memcpy(dst + (size_t)i * (size_t)elsize, src, (size_t)elsize);
+    }
+    return r;
+}
+
+/**
+ * @brief Compile a single per-dtype native-int binop body.
+ *
+ * The macro takes a C type (signed) and an unsigned-twin type for the
+ * arithmetic ops that need defined wrap-around semantics (signed integer
+ * overflow is undefined behaviour in C, so add/sub/mul/pow go through the
+ * unsigned twin and round-trip back; div/mod use the signed type so the
+ * sign-of-dividend remainder is what falls out).
+ *
+ * @param T     Signed integer C type (e.g. `int32_t`).
+ * @param UT    Unsigned-twin C type of the same width (e.g. `uint32_t`).
+ *
+ * For unsigned target dtypes (`uint8` etc.) we pass the unsigned type as
+ * both T and UT — the casts then collapse to no-ops, and `%` on unsigned
+ * is already well-defined.
+ *
+ * The generated body assumes `n` elements, `ap` / `bp` source pointers
+ * of type `T *`, and `rp` destination pointer of type `T *`.
+ */
+#define NDARRAY_INT_BINOP_BODY(T, UT)                                                \
+    do {                                                                              \
+        switch (opcode) {                                                             \
+            case ZEND_ADD:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] + (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_SUB:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] - (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_MUL:                                                            \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (T)((UT)ap[i] * (UT)bp[i]);                               \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_MOD:                                                            \
+                /* Divisor==0 → 0 to avoid SIGFPE; matches the float */               \
+                /* kernels' NaN convention. C11 `%` on signed values is */            \
+                /* truncated (sign of dividend), matching PyTorch's */                \
+                /* `torch.remainder` semantics for integer dtypes. */                 \
+                for (long i = 0; i < n; i++) {                                        \
+                    rp[i] = (bp[i] == 0) ? 0 : (T)(ap[i] % bp[i]);                    \
+                }                                                                     \
+                break;                                                                \
+            case ZEND_POW: {                                                          \
+                /* Binary exponentiation in unsigned width — base / r */              \
+                /* round-trip through UT so signed overflow stays UB-free. */         \
+                /* Negative exponents on signed types yield 0 (integer */             \
+                /* truncation of a fractional reciprocal), matching */                \
+                /* PyTorch's int-pow contract. */                                     \
+                for (long i = 0; i < n; i++) {                                        \
+                    T base = ap[i], exp = bp[i];                                      \
+                    if (exp < 0) { rp[i] = 0; continue; }                             \
+                    UT r = 1u;                                                        \
+                    UT b_acc = (UT)base;                                              \
+                    while (exp > 0) {                                                 \
+                        if (exp & 1) r = (UT)(r * b_acc);                             \
+                        b_acc = (UT)(b_acc * b_acc);                                  \
+                        exp >>= 1;                                                    \
+                    }                                                                 \
+                    rp[i] = (T)r;                                                     \
+                }                                                                     \
+                break;                                                                \
+            }                                                                         \
+            default:                                                                  \
+                zend_throw_error(NULL,                                                \
+                    "Unsupported opcode for native int CPU binop.");                  \
+                return -1;                                                            \
+        }                                                                             \
+    } while (0)
+
+/**
+ * @brief Run the per-dtype native-int binop body for @p dt against the
+ *        already-broadcast @p ap / @p bp / @p rp buffers.
+ *
+ * Centralises the dtype dispatch so the broadcast / alloc plumbing in
+ * `ndarray_int_binop_cpu` doesn't have to repeat the 8-way switch.
+ *
+ * @param[in]  dt     Canonical dtype string (one of `int8`..`uint64`).
+ * @param[in]  n      Element count.
+ * @param[in]  ap, bp Operand pointers; must be of `dt`'s native width.
+ * @param[out] rp     Destination pointer; same width as @p ap / @p bp.
+ * @param[in]  opcode ZEND_ADD / SUB / MUL / MOD / POW.
+ * @return 0 on success, -1 on dispatch error (PHP exception in flight).
+ */
+static int
+ndarray_run_int_binop_typed(const char *dt, long n,
+                             const void *ap_v, const void *bp_v, void *rp_v,
+                             int opcode) {
+#define DISPATCH_INT_TYPED(STR, T, UT)                                                \
+    if (!strcmp(dt, STR)) {                                                           \
+        const T *ap = (const T *)ap_v;                                                \
+        const T *bp = (const T *)bp_v;                                                \
+        T       *rp = (T       *)rp_v;                                                \
+        NDARRAY_INT_BINOP_BODY(T, UT);                                                \
+        return 0;                                                                     \
+    }
+    DISPATCH_INT_TYPED("int8",   int8_t,   uint8_t)
+    DISPATCH_INT_TYPED("uint8",  uint8_t,  uint8_t)
+    DISPATCH_INT_TYPED("int16",  int16_t,  uint16_t)
+    DISPATCH_INT_TYPED("uint16", uint16_t, uint16_t)
+    DISPATCH_INT_TYPED("int32",  int32_t,  uint32_t)
+    DISPATCH_INT_TYPED("uint32", uint32_t, uint32_t)
+    DISPATCH_INT_TYPED("int64",  int64_t,  uint64_t)
+    DISPATCH_INT_TYPED("uint64", uint64_t, uint64_t)
+#undef DISPATCH_INT_TYPED
+    zend_throw_error(NULL,
+        "Native CPU int binop: unsupported dtype \"%s\".", dt);
+    return -1;
+}
+
+/**
+ * @brief Broadcast / alloc / dispatch plumbing for native int CPU binops.
+ *
+ * Handles the 0-D scalar promotion, NumPy-style shape broadcasting,
+ * result allocation, and per-dtype kernel dispatch shared by every
+ * integer dtype. Inputs must already share the same dtype — the caller
+ * (`ndarray_promote_and_op` via `NDArray_TypedBinOp_CPU_Int`) is
+ * responsible for casting.
+ *
+ * @param[in] a, b    Same-dtype CPU operands; one may be 0-D.
+ * @param[in] opcode  ZEND_ADD / SUB / MUL / MOD / POW.
+ * @return Result NDArray on success (caller owns), NULL on validation /
+ *         allocation failure (PHP exception in flight).
+ */
+static NDArray *
+ndarray_int_binop_cpu(NDArray *a, NDArray *b, int opcode) {
+    NDArray *a_temp = NULL, *b_temp = NULL, *broadcasted = NULL;
+    const char *out_dt = NDArray_TYPE(a);
+
+    /* 0-D scalar broadcast — fill a buffer of the peer's shape with the
+       scalar's single element. */
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {
+        a_temp = a;
+        a = ndarray_int_broadcast_scalar_cpu(a_temp, b);
+        if (a == NULL) return NULL;
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {
+        b_temp = b;
+        b = ndarray_int_broadcast_scalar_cpu(b_temp, a);
+        if (b == NULL) return NULL;
+    }
+
+    NDArray *a_broad = NULL, *b_broad = NULL;
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {
+        broadcasted = NDArray_Broadcast(a, b);
+        a_broad = broadcasted;
+        b_broad = b;
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {
+        broadcasted = NDArray_Broadcast(b, a);
+        b_broad = broadcasted;
+        a_broad = a;
+    } else {
+        a_broad = a;
+        b_broad = b;
+    }
+    if (a_broad == NULL || b_broad == NULL) {
+        if (a_temp) NDArray_FREE(a);
+        if (b_temp) NDArray_FREE(b);
+        if (broadcasted) NDArray_FREE(broadcasted);
+        zend_throw_error(NULL, "Can't broadcast arrays.");
+        return NULL;
+    }
+
+    /* Allocate result mirroring a_broad's shape and dtype. */
+    int *res_shape = emalloc(sizeof(int) * (NDArray_NDIM(a_broad) > 0
+                                              ? NDArray_NDIM(a_broad) : 1));
+    if (NDArray_NDIM(a_broad) > 0) {
+        memcpy(res_shape, NDArray_SHAPE(a_broad),
+               sizeof(int) * NDArray_NDIM(a_broad));
+    } else {
+        res_shape[0] = 1;
+    }
+    NDArray *result = NDArray_Empty(res_shape, NDArray_NDIM(a_broad),
+                                     out_dt, NDARRAY_DEVICE_CPU);
+    if (result == NULL) {
+        if (a_temp) NDArray_FREE(a);
+        if (b_temp) NDArray_FREE(b);
+        if (broadcasted) NDArray_FREE(broadcasted);
+        return NULL;
+    }
+
+    long n = NDArray_NUMELEMENTS(a_broad);
+    if (ndarray_run_int_binop_typed(out_dt, n,
+                                     NDArray_DATA(a_broad),
+                                     NDArray_DATA(b_broad),
+                                     NDArray_DATA(result),
+                                     opcode) < 0) {
+        NDArray_FREE(result);
+        if (a_temp) NDArray_FREE(a);
+        if (b_temp) NDArray_FREE(b);
+        if (broadcasted) NDArray_FREE(broadcasted);
+        return NULL;
+    }
+
+    if (a_temp) NDArray_FREE(a);
+    if (b_temp) NDArray_FREE(b);
+    if (broadcasted) NDArray_FREE(broadcasted);
+    return result;
+}
+
+/**
+ * @brief CPU binary-op dispatcher for every native integer dtype.
+ *
+ * Routes the supported opcodes to the native-int kernel above so:
+ *  - PyTorch's modular wrap-around semantics are honoured exactly,
+ *  - precision past 2⁵³ survives for `int64` / `uint64`,
+ *  - the result matches the GPU path's native-int kernels bit-for-bit.
+ *
+ * The previous implementation handled only `int64` / `uint64`; narrower
+ * ints still went through float promotion, which silently diverged from
+ * PyTorch for `int32 * int32` once the intermediate exceeded the float64
+ * mantissa.
+ *
+ * Both operands must already share the same dtype — the calling
+ * dispatcher (`ndarray_promote_and_op`) handles the cast through
+ * `NDArray_AsType` before reaching this entry point. Falls back to
+ * NULL with a PHP error for opcodes outside the supported set; `/` is
+ * already promoted to a float dtype by `ndarray_div_promote` and never
+ * reaches here.
+ *
+ * @param[in] opcode ZEND_ADD / SUB / MUL / MOD / POW.
+ * @param[in] a, b   Same-dtype operands on CPU; one may be 0-D.
+ * @return Result NDArray on success, NULL on error.
+ */
+NDArray *
+NDArray_TypedBinOp_CPU_Int(int opcode, NDArray *a, NDArray *b) {
+    if (NDArray_DEVICE(a) != NDARRAY_DEVICE_CPU
+        || NDArray_DEVICE(b) != NDARRAY_DEVICE_CPU) {
+        zend_throw_error(NULL,
+            "NDArray_TypedBinOp_CPU_Int: both operands must be on CPU.");
+        return NULL;
+    }
+    if (strcmp(NDArray_TYPE(a), NDArray_TYPE(b)) != 0) {
+        zend_throw_error(NULL,
+            "NDArray_TypedBinOp_CPU_Int: dtype mismatch (%s vs %s).",
+            NDArray_TYPE(a), NDArray_TYPE(b));
+        return NULL;
+    }
+    const char *dt = NDArray_TYPE(a);
+    int is_int = (!strcmp(dt, "int8")  || !strcmp(dt, "uint8")  ||
+                  !strcmp(dt, "int16") || !strcmp(dt, "uint16") ||
+                  !strcmp(dt, "int32") || !strcmp(dt, "uint32") ||
+                  !strcmp(dt, "int64") || !strcmp(dt, "uint64"));
+    if (!is_int) {
+        zend_throw_error(NULL,
+            "NDArray_TypedBinOp_CPU_Int: unsupported dtype \"%s\".", dt);
+        return NULL;
+    }
+    return ndarray_int_binop_cpu(a, b, opcode);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
