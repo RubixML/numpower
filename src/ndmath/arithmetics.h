@@ -113,7 +113,45 @@ typedef enum {
     NDARRAY_UNOP_RSQRT,
     NDARRAY_UNOP_SQUARE,
     NDARRAY_UNOP_CLIP,
-    NDARRAY_UNOP_SINC
+    NDARRAY_UNOP_SINC,
+    NDARRAY_UNOP_EXP,
+    NDARRAY_UNOP_EXP2,
+    NDARRAY_UNOP_EXPM1,
+    NDARRAY_UNOP_LOG,
+    NDARRAY_UNOP_LOG2,
+    NDARRAY_UNOP_LOG10,
+    NDARRAY_UNOP_LOG1P,
+    NDARRAY_UNOP_LOGB,
+    /* ── Trig / hyperbolic / angle / rounding block ──────────────────────
+       The contiguous range `[SIN, CEIL]` is required by
+       `unary_op_is_trig` in src/ndmath/arithmetics.c, which uses a single
+       range check (`op >= SIN && op <= CEIL`) to pick `UNARY_TRIG_BODY`
+       over `UNARY_FLOAT_BODY`. New ops inserted between `SIN` and `CEIL`
+       must also live in `UNARY_TRIG_BODY`'s switch; new non-trig ops
+       must NOT land inside this block. */
+    /* Trigonometric */
+    NDARRAY_UNOP_SIN,
+    NDARRAY_UNOP_COS,
+    NDARRAY_UNOP_TAN,
+    NDARRAY_UNOP_ARCSIN,
+    NDARRAY_UNOP_ARCCOS,
+    NDARRAY_UNOP_ARCTAN,
+    /* Hyperbolic */
+    NDARRAY_UNOP_SINH,
+    NDARRAY_UNOP_COSH,
+    NDARRAY_UNOP_TANH,
+    NDARRAY_UNOP_ARCSINH,
+    NDARRAY_UNOP_ARCCOSH,
+    NDARRAY_UNOP_ARCTANH,
+    /* Angle conversion */
+    NDARRAY_UNOP_DEGREES,
+    NDARRAY_UNOP_RADIANS,
+    /* Rounding (preserves dtype for floats; integers pass through) */
+    NDARRAY_UNOP_RINT,
+    NDARRAY_UNOP_FIX,
+    NDARRAY_UNOP_TRUNC,
+    NDARRAY_UNOP_FLOOR,
+    NDARRAY_UNOP_CEIL
 } NDArrayUnaryOp;
 
 /**

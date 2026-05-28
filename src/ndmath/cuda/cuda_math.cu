@@ -589,66 +589,10 @@ void tanFloatKernel(float* d_array, int size) {
 }
 
 __global__
-void expm1FloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = expm1f(d_array[index]);
-    }
-}
-
-__global__
-void expFloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = expf(d_array[index]);
-    }
-}
-
-__global__
 void sqrtFloatKernel(float* d_array, int size) {
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index < size) {
         d_array[index] = sqrtf(d_array[index]);
-    }
-}
-
-__global__
-void logFloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = logf(d_array[index]);
-    }
-}
-
-__global__
-void logbFloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = logbf(d_array[index]);
-    }
-}
-
-__global__
-void log2FloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = log2f(d_array[index]);
-    }
-}
-
-__global__
-void log1pFloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = log1pf(d_array[index]);
-    }
-}
-
-__global__
-void log10FloatKernel(float* d_array, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = log10f(d_array[index]);
     }
 }
 
@@ -1402,6 +1346,79 @@ template <typename T> __device__ inline T tcuda_fabs_fp(T x);
 template <>           __device__ inline float  tcuda_fabs_fp<float >(float  x) { return fabsf(x); }
 template <>           __device__ inline double tcuda_fabs_fp<double>(double x) { return fabs (x); }
 
+/* Transcendental traits — every op routes through the suffixed `f` intrinsic
+   for `float` and the unsuffixed CUDA libdevice intrinsic for `double` so
+   each instantiation pulls the correct precision without a runtime cast. */
+template <typename T> __device__ inline T tcuda_exp_fp  (T x);
+template <>           __device__ inline float  tcuda_exp_fp <float >(float  x) { return expf (x); }
+template <>           __device__ inline double tcuda_exp_fp <double>(double x) { return exp  (x); }
+
+template <typename T> __device__ inline T tcuda_exp2_fp (T x);
+template <>           __device__ inline float  tcuda_exp2_fp<float >(float  x) { return exp2f(x); }
+template <>           __device__ inline double tcuda_exp2_fp<double>(double x) { return exp2 (x); }
+
+template <typename T> __device__ inline T tcuda_expm1_fp(T x);
+template <>           __device__ inline float  tcuda_expm1_fp<float >(float  x) { return expm1f(x); }
+template <>           __device__ inline double tcuda_expm1_fp<double>(double x) { return expm1 (x); }
+
+template <typename T> __device__ inline T tcuda_log_fp  (T x);
+template <>           __device__ inline float  tcuda_log_fp <float >(float  x) { return logf (x); }
+template <>           __device__ inline double tcuda_log_fp <double>(double x) { return log  (x); }
+
+template <typename T> __device__ inline T tcuda_log1p_fp(T x);
+template <>           __device__ inline float  tcuda_log1p_fp<float >(float  x) { return log1pf(x); }
+template <>           __device__ inline double tcuda_log1p_fp<double>(double x) { return log1p (x); }
+
+template <typename T> __device__ inline T tcuda_log2_fp (T x);
+template <>           __device__ inline float  tcuda_log2_fp<float >(float  x) { return log2f(x); }
+template <>           __device__ inline double tcuda_log2_fp<double>(double x) { return log2 (x); }
+
+template <typename T> __device__ inline T tcuda_log10_fp(T x);
+template <>           __device__ inline float  tcuda_log10_fp<float >(float  x) { return log10f(x); }
+template <>           __device__ inline double tcuda_log10_fp<double>(double x) { return log10 (x); }
+
+template <typename T> __device__ inline T tcuda_logb_fp (T x);
+template <>           __device__ inline float  tcuda_logb_fp<float >(float  x) { return logbf(x); }
+template <>           __device__ inline double tcuda_logb_fp<double>(double x) { return logb (x); }
+
+/* Trig / hyperbolic / rounding traits — same DRY pattern as the
+   exp/log traits above. Each op specialises to the float vs double
+   libdevice intrinsic. `tcuda_<op>_fp<T>(x)` is the only entry the
+   templated float kernel needs. */
+#define DEF_TCUDA_FP_TRAIT(NAME, F_FN, D_FN)                                          \
+    template <typename T> __device__ inline T tcuda_##NAME##_fp (T x);                \
+    template <>           __device__ inline float  tcuda_##NAME##_fp<float >(float  x) { return F_FN(x); }  \
+    template <>           __device__ inline double tcuda_##NAME##_fp<double>(double x) { return D_FN(x); }
+
+/* `tcuda_sin_fp` already exists above as the sinc trait — reused as-is. */
+DEF_TCUDA_FP_TRAIT(cos,     cosf,   cos)
+DEF_TCUDA_FP_TRAIT(tan,     tanf,   tan)
+DEF_TCUDA_FP_TRAIT(arcsin,  asinf,  asin)
+DEF_TCUDA_FP_TRAIT(arccos,  acosf,  acos)
+DEF_TCUDA_FP_TRAIT(arctan,  atanf,  atan)
+DEF_TCUDA_FP_TRAIT(sinh,    sinhf,  sinh)
+DEF_TCUDA_FP_TRAIT(cosh,    coshf,  cosh)
+DEF_TCUDA_FP_TRAIT(tanh,    tanhf,  tanh)
+DEF_TCUDA_FP_TRAIT(arcsinh, asinhf, asinh)
+DEF_TCUDA_FP_TRAIT(arccosh, acoshf, acosh)
+DEF_TCUDA_FP_TRAIT(arctanh, atanhf, atanh)
+DEF_TCUDA_FP_TRAIT(rint,    rintf,  rint)
+DEF_TCUDA_FP_TRAIT(trunc,   truncf, trunc)
+DEF_TCUDA_FP_TRAIT(floor,   floorf, floor)
+DEF_TCUDA_FP_TRAIT(ceil,    ceilf,  ceil)
+
+#undef DEF_TCUDA_FP_TRAIT
+
+/* Degrees / radians use a multiplicative constant rather than a libm
+   intrinsic. Inline the constant per type so the launch picks the
+   right precision (fp32 constant for `float`, fp64 for `double`). */
+template <typename T> __device__ inline T tcuda_deg_factor();
+template <>           __device__ inline float  tcuda_deg_factor<float >() { return (float)(180.0 / 3.14159265358979323846); }
+template <>           __device__ inline double tcuda_deg_factor<double>() { return 180.0 / 3.14159265358979323846; }
+template <typename T> __device__ inline T tcuda_rad_factor();
+template <>           __device__ inline float  tcuda_rad_factor<float >() { return (float)(3.14159265358979323846 / 180.0); }
+template <>           __device__ inline double tcuda_rad_factor<double>() { return 3.14159265358979323846 / 180.0; }
+
 template <typename T>
 __global__ void tcuda_abs_float_kernel(T *a, int n) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -1421,6 +1438,94 @@ template <typename T>
 __global__ void tcuda_rsqrt_float_kernel(T *a, int n) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     if (i < n) a[i] = (T)1 / tcuda_sqrt_fp<T>(a[i]);
+}
+
+/* Transcendental float kernels — one template per op so the dispatcher
+   can instantiate against either `float` or `double` without an
+   intermediate cast. The libdevice intrinsics produced by `tcuda_<op>_fp`
+   round to the IEEE-754 nearest-even mode that matches the libm path
+   on the CPU. */
+template <typename T>
+__global__ void tcuda_exp_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_exp_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_exp2_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_exp2_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_expm1_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_expm1_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_log_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_log_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_log1p_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_log1p_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_log2_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_log2_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_log10_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_log10_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_logb_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_logb_fp<T>(a[i]);
+}
+
+/* Trig / hyperbolic / rounding templated float kernels. Each kernel
+   dispatches to its dtype-specialised libdevice intrinsic via the
+   matching `tcuda_<op>_fp<T>` trait. The macro keeps the 16 kernels
+   shaped identically. */
+#define DEF_TCUDA_FLOAT_UNOP(NAME, TRAIT)                                             \
+    template <typename T>                                                             \
+    __global__ void tcuda_##NAME##_float_kernel(T *a, int n) {                        \
+        int i = threadIdx.x + blockIdx.x * blockDim.x;                                \
+        if (i < n) a[i] = TRAIT<T>(a[i]);                                             \
+    }
+
+DEF_TCUDA_FLOAT_UNOP(sin,     tcuda_sin_fp)
+DEF_TCUDA_FLOAT_UNOP(cos,     tcuda_cos_fp)
+DEF_TCUDA_FLOAT_UNOP(tan,     tcuda_tan_fp)
+DEF_TCUDA_FLOAT_UNOP(arcsin,  tcuda_arcsin_fp)
+DEF_TCUDA_FLOAT_UNOP(arccos,  tcuda_arccos_fp)
+DEF_TCUDA_FLOAT_UNOP(arctan,  tcuda_arctan_fp)
+DEF_TCUDA_FLOAT_UNOP(sinh,    tcuda_sinh_fp)
+DEF_TCUDA_FLOAT_UNOP(cosh,    tcuda_cosh_fp)
+DEF_TCUDA_FLOAT_UNOP(tanh,    tcuda_tanh_fp)
+DEF_TCUDA_FLOAT_UNOP(arcsinh, tcuda_arcsinh_fp)
+DEF_TCUDA_FLOAT_UNOP(arccosh, tcuda_arccosh_fp)
+DEF_TCUDA_FLOAT_UNOP(arctanh, tcuda_arctanh_fp)
+DEF_TCUDA_FLOAT_UNOP(rint,    tcuda_rint_fp)
+DEF_TCUDA_FLOAT_UNOP(trunc,   tcuda_trunc_fp)
+DEF_TCUDA_FLOAT_UNOP(floor,   tcuda_floor_fp)
+DEF_TCUDA_FLOAT_UNOP(ceil,    tcuda_ceil_fp)
+
+#undef DEF_TCUDA_FLOAT_UNOP
+
+/* Degrees / radians kernels — linear multiplication, no libm. */
+template <typename T>
+__global__ void tcuda_degrees_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = a[i] * tcuda_deg_factor<T>();
+}
+template <typename T>
+__global__ void tcuda_radians_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = a[i] * tcuda_rad_factor<T>();
 }
 template <typename T>
 __global__ void tcuda_sinc_float_kernel(T *a, int n) {
@@ -1525,6 +1630,61 @@ __global__ void tcuda_sinc_half_kernel(__half *a, int n) {
     }
 }
 
+/* Transcendental fp16 kernels — round-trip through float for accuracy.
+   The native half intrinsics (`hexp`, `hlog`, …) round once to the
+   nearest representable half value, which can diverge from the CPU's
+   `double → fp16` path on edge inputs. Routing through `float` keeps
+   bit-for-bit parity with the CPU loop that test 108 enforces. The
+   layout mirrors the abs/sqrt/recip/sinc unary half-kernels above. */
+#define HALF_UNOP_KERNEL(NAME, EXPR_F)                                              \
+__global__ void NAME(__half *a, int n) {                                            \
+    int i = threadIdx.x + blockIdx.x * blockDim.x;                                  \
+    if (i < n) a[i] = __float2half((EXPR_F)(__half2float(a[i])));                   \
+}
+HALF_UNOP_KERNEL(tcuda_exp_half_kernel,   expf)
+HALF_UNOP_KERNEL(tcuda_exp2_half_kernel,  exp2f)
+HALF_UNOP_KERNEL(tcuda_expm1_half_kernel, expm1f)
+HALF_UNOP_KERNEL(tcuda_log_half_kernel,   logf)
+HALF_UNOP_KERNEL(tcuda_log1p_half_kernel, log1pf)
+HALF_UNOP_KERNEL(tcuda_log2_half_kernel,  log2f)
+HALF_UNOP_KERNEL(tcuda_log10_half_kernel, log10f)
+HALF_UNOP_KERNEL(tcuda_logb_half_kernel,  logbf)
+/* Trig / hyperbolic / rounding fp16 kernels — round-trip through
+   float32 (same precision contract as the exp/log half family). */
+HALF_UNOP_KERNEL(tcuda_sin_half_kernel,      sinf)
+HALF_UNOP_KERNEL(tcuda_cos_half_kernel,      cosf)
+HALF_UNOP_KERNEL(tcuda_tan_half_kernel,      tanf)
+HALF_UNOP_KERNEL(tcuda_arcsin_half_kernel,   asinf)
+HALF_UNOP_KERNEL(tcuda_arccos_half_kernel,   acosf)
+HALF_UNOP_KERNEL(tcuda_arctan_half_kernel,   atanf)
+HALF_UNOP_KERNEL(tcuda_sinh_half_kernel,     sinhf)
+HALF_UNOP_KERNEL(tcuda_cosh_half_kernel,     coshf)
+HALF_UNOP_KERNEL(tcuda_tanh_half_kernel,     tanhf)
+HALF_UNOP_KERNEL(tcuda_arcsinh_half_kernel,  asinhf)
+HALF_UNOP_KERNEL(tcuda_arccosh_half_kernel,  acoshf)
+HALF_UNOP_KERNEL(tcuda_arctanh_half_kernel,  atanhf)
+HALF_UNOP_KERNEL(tcuda_rint_half_kernel,     rintf)
+HALF_UNOP_KERNEL(tcuda_trunc_half_kernel,    truncf)
+HALF_UNOP_KERNEL(tcuda_floor_half_kernel,    floorf)
+HALF_UNOP_KERNEL(tcuda_ceil_half_kernel,     ceilf)
+#undef HALF_UNOP_KERNEL
+
+/* Degrees / radians fp16 kernels — linear scale via float32. */
+__global__ void tcuda_degrees_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float v = __half2float(a[i]) * (float)(180.0 / 3.14159265358979323846);
+        a[i] = __float2half(v);
+    }
+}
+__global__ void tcuda_radians_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float v = __half2float(a[i]) * (float)(3.14159265358979323846 / 180.0);
+        a[i] = __float2half(v);
+    }
+}
+
 /* DD (float128 emulation) unary kernels. Buffer is laid out as
    `(hi[0], lo[0], hi[1], lo[1], …)` so each element occupies 2 doubles. */
 #define DD_UNOP_KERNEL(NAME, EXPR)                                                  \
@@ -1545,6 +1705,54 @@ DD_UNOP_KERNEL(tcuda_sqrt_dd_kernel,   dd_sqrt(x))
 DD_UNOP_KERNEL(tcuda_rsqrt_dd_kernel,  dd_rsqrt(x))
 DD_UNOP_KERNEL(tcuda_square_dd_kernel, dd_mul(x, x))
 DD_UNOP_KERNEL(tcuda_sinc_dd_kernel,   dd_sinc(x))
+
+/* Transcendental DD kernels — every op rounds the DD pair to a `double`,
+   runs the libdevice intrinsic, and writes the result back as a DD pair
+   with a zero `lo` word. The accuracy ceiling is therefore fp64 (~15.95
+   decimal digits) regardless of how many DD bits the host packed in,
+   matching the contract of the existing GPU `dd_sinc` (`tcuda_sinc_dd_kernel`)
+   and `dd_pow` (`tcuda_pow_dd_kernel`) reference paths above, which
+   likewise route through fp64. Full 113-bit transcendentals require
+   libquadmath on the CPU side (Linux GCC x86-64); GPU compute stops at
+   the libdevice fp64 intrinsics. */
+DD_UNOP_KERNEL(tcuda_exp_dd_kernel,    dd_make(exp  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_exp2_dd_kernel,   dd_make(exp2 (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_expm1_dd_kernel,  dd_make(expm1(dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_log_dd_kernel,    dd_make(log  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_log1p_dd_kernel,  dd_make(log1p(dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_log2_dd_kernel,   dd_make(log2 (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_log10_dd_kernel,  dd_make(log10(dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_logb_dd_kernel,   dd_make(logb (dd_to_double(x)), 0.0))
+
+/* Trig / hyperbolic / rounding DD kernels — same fp64 precision tier
+   as the exp/log dd kernels above. Full 113-bit fp128 transcendentals
+   require libquadmath on the CPU; GPU compute caps at fp64. */
+DD_UNOP_KERNEL(tcuda_sin_dd_kernel,      dd_make(sin   (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_cos_dd_kernel,      dd_make(cos   (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_tan_dd_kernel,      dd_make(tan   (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arcsin_dd_kernel,   dd_make(asin  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arccos_dd_kernel,   dd_make(acos  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arctan_dd_kernel,   dd_make(atan  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_sinh_dd_kernel,     dd_make(sinh  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_cosh_dd_kernel,     dd_make(cosh  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_tanh_dd_kernel,     dd_make(tanh  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arcsinh_dd_kernel,  dd_make(asinh (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arccosh_dd_kernel,  dd_make(acosh (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_arctanh_dd_kernel,  dd_make(atanh (dd_to_double(x)), 0.0))
+/* Rounding ops preserve the full fp128 input bits — only the fp64 hi
+   word changes, so we keep the original lo word. dd_rint/trunc/floor/
+   ceil on a pure-double input value-equals libm rounding of the hi
+   word. */
+DD_UNOP_KERNEL(tcuda_rint_dd_kernel,     dd_make(rint  (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_trunc_dd_kernel,    dd_make(trunc (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_floor_dd_kernel,    dd_make(floor (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_ceil_dd_kernel,     dd_make(ceil  (dd_to_double(x)), 0.0))
+
+/* Degrees / radians DD kernels — fp64-precision multiplicative scale. */
+DD_UNOP_KERNEL(tcuda_degrees_dd_kernel,
+               dd_make(dd_to_double(x) * (180.0 / 3.14159265358979323846), 0.0))
+DD_UNOP_KERNEL(tcuda_radians_dd_kernel,
+               dd_make(dd_to_double(x) * (3.14159265358979323846 / 180.0), 0.0))
 
 __global__ void tcuda_clip_dd_kernel(double *a, double lo_hi, double lo_lo,
                                      double hi_hi, double hi_lo, int n) {
@@ -2189,41 +2397,6 @@ extern "C" {
     }
 
     void
-    cuda_float_log(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        logFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
-    cuda_float_logb(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        logbFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
-    cuda_float_log2(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        log2FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
-    cuda_float_log1p(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        log1pFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
-    cuda_float_log10(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        log10FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
     cuda_float_sqrt(int nblocks, float *d_array) {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
@@ -2231,24 +2404,10 @@ extern "C" {
     }
 
     void
-    cuda_float_exp(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        expFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
     cuda_float_abs(int nblocks, float *d_array) {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
         absFloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
-    }
-
-    void
-    cuda_float_expm1(int nblocks, float *d_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        expm1FloatKernel<<<numBlocks, blockSize>>>(d_array, nblocks);
     }
 
     void
@@ -3153,6 +3312,55 @@ void cuda_sinc_dd(double *a, int n) {
     GRID_FOR(n);
     tcuda_sinc_dd_kernel<<<numBlocks, blockSize>>>(a, n);
 }
+
+/* ── Transcendental wrappers (exp / exp2 / expm1 / log / log1p / log2 /
+   log10 / logb). Each op exposes a `_f32`, `_f64`, `_f16`, and `_dd`
+   wrapper so the host dispatcher can route by compute dtype without
+   re-templating. */
+#define DEF_TRANSC_WRAPPERS(OP, KERNEL)                                              \
+DEF_UNOP_T_WRAPPER(cuda_##OP##_f32, KERNEL##_float_kernel, float)                    \
+DEF_UNOP_T_WRAPPER(cuda_##OP##_f64, KERNEL##_float_kernel, double)                   \
+void cuda_##OP##_f16(uint16_t *a, int n) {                                           \
+    GRID_FOR(n);                                                                     \
+    KERNEL##_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);                  \
+}                                                                                    \
+void cuda_##OP##_dd(double *a, int n) {                                              \
+    GRID_FOR(n);                                                                     \
+    KERNEL##_dd_kernel<<<numBlocks, blockSize>>>(a, n);                              \
+}
+
+DEF_TRANSC_WRAPPERS(exp,   tcuda_exp)
+DEF_TRANSC_WRAPPERS(exp2,  tcuda_exp2)
+DEF_TRANSC_WRAPPERS(expm1, tcuda_expm1)
+DEF_TRANSC_WRAPPERS(log,   tcuda_log)
+DEF_TRANSC_WRAPPERS(log1p, tcuda_log1p)
+DEF_TRANSC_WRAPPERS(log2,  tcuda_log2)
+DEF_TRANSC_WRAPPERS(log10, tcuda_log10)
+DEF_TRANSC_WRAPPERS(logb,  tcuda_logb)
+
+/* Trig / hyperbolic / angle / rounding wrappers — same naming and
+   shape as the transcendental wrappers above so the host dispatcher
+   uses a single template (cf. `UNOP_GPU_TRIG_DT` in arithmetics.c). */
+DEF_TRANSC_WRAPPERS(sin,      tcuda_sin)
+DEF_TRANSC_WRAPPERS(cos,      tcuda_cos)
+DEF_TRANSC_WRAPPERS(tan,      tcuda_tan)
+DEF_TRANSC_WRAPPERS(arcsin,   tcuda_arcsin)
+DEF_TRANSC_WRAPPERS(arccos,   tcuda_arccos)
+DEF_TRANSC_WRAPPERS(arctan,   tcuda_arctan)
+DEF_TRANSC_WRAPPERS(sinh,     tcuda_sinh)
+DEF_TRANSC_WRAPPERS(cosh,     tcuda_cosh)
+DEF_TRANSC_WRAPPERS(tanh,     tcuda_tanh)
+DEF_TRANSC_WRAPPERS(arcsinh,  tcuda_arcsinh)
+DEF_TRANSC_WRAPPERS(arccosh,  tcuda_arccosh)
+DEF_TRANSC_WRAPPERS(arctanh,  tcuda_arctanh)
+DEF_TRANSC_WRAPPERS(degrees,  tcuda_degrees)
+DEF_TRANSC_WRAPPERS(radians,  tcuda_radians)
+DEF_TRANSC_WRAPPERS(rint,     tcuda_rint)
+DEF_TRANSC_WRAPPERS(trunc,    tcuda_trunc)
+DEF_TRANSC_WRAPPERS(floor,    tcuda_floor)
+DEF_TRANSC_WRAPPERS(ceil,     tcuda_ceil)
+
+#undef DEF_TRANSC_WRAPPERS
 
 #define DEF_CLIP_T_WRAPPER(NAME, T)                                                 \
 void NAME(T *a, T lo, T hi, int n) {                                                \
