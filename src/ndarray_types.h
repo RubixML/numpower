@@ -42,10 +42,25 @@ uint16_t ndarray_double_to_fp16(double val);
    they expand to native operators (zero overhead); on the DD path they
    expand to ndarray_dd_* calls. */
 #if NDARRAY_HAVE_FLOAT128
+   /* sqrt / sin / isnan for __float128 are routed through these out-of-line
+      helpers so the libquadmath-vs-libm-fallback choice is made inside
+      ndarray_types.c (where `config.h` has been included and `HAVE_QUADMATH`
+      is meaningful) rather than baked into the expansion at every header
+      include site. Inlining the choice here would silently pick the
+      long-double fallback in any translation unit that pulls
+      ndarray_types.h via a transitive header before its own
+      `#include "config.h"`. */
+   ndarray_fp128_t ndarray_fp128_sqrt(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_sin (ndarray_fp128_t a);
+   int             ndarray_fp128_isnan(ndarray_fp128_t a);
+#  define NDARRAY_FP128_SQRT(a)     ndarray_fp128_sqrt(a)
+#  define NDARRAY_FP128_SIN(a)      ndarray_fp128_sin(a)
+#  define NDARRAY_FP128_ISNAN(a)    ndarray_fp128_isnan(a)
 #  define NDARRAY_FP128_FROM_D(d)   ((ndarray_fp128_t)(d))
 #  define NDARRAY_FP128_FROM_LD(ld) ((ndarray_fp128_t)(ld))
 #  define NDARRAY_FP128_TO_D(x)     ((double)(x))
 #  define NDARRAY_FP128_ZERO()      ((ndarray_fp128_t)0)
+#  define NDARRAY_FP128_ONE()       ((ndarray_fp128_t)1)
 #  define NDARRAY_FP128_NAN()       ((ndarray_fp128_t)(0.0/0.0))
 #  define NDARRAY_FP128_ADD(a, b)   ((a) + (b))
 #  define NDARRAY_FP128_SUB(a, b)   ((a) - (b))
@@ -63,6 +78,7 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_FROM_LD(ld) ndarray_dd_from_double((double)(ld))
 #  define NDARRAY_FP128_TO_D(x)     ndarray_dd_to_double(x)
 #  define NDARRAY_FP128_ZERO()      ndarray_dd_from_double(0.0)
+#  define NDARRAY_FP128_ONE()       ndarray_dd_from_double(1.0)
 #  define NDARRAY_FP128_NAN()       ndarray_dd_from_double(0.0/0.0)
 #  define NDARRAY_FP128_ADD(a, b)   ndarray_dd_add((a), (b))
 #  define NDARRAY_FP128_SUB(a, b)   ndarray_dd_sub((a), (b))
@@ -70,9 +86,12 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_DIV(a, b)   ndarray_dd_div((a), (b))
 #  define NDARRAY_FP128_NEG(a)      ndarray_dd_neg(a)
 #  define NDARRAY_FP128_ABS(a)      ndarray_dd_abs(a)
+#  define NDARRAY_FP128_SQRT(a)     ndarray_dd_sqrt(a)
+#  define NDARRAY_FP128_SIN(a)      ndarray_dd_from_double(sin(ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_EQ(a, b)    (ndarray_dd_cmp((a), (b)) == 0)
 #  define NDARRAY_FP128_LT(a, b)    (ndarray_dd_cmp((a), (b)) <  0)
 #  define NDARRAY_FP128_ISZERO(a)   ndarray_dd_iszero(a)
+#  define NDARRAY_FP128_ISNAN(a)    ndarray_dd_isnan(a)
 #  define NDARRAY_FP128_FROM_I64(i) ndarray_dd_from_int64(i)
 #  define NDARRAY_FP128_TO_I64(x)   ndarray_dd_to_int64(x)
 #endif

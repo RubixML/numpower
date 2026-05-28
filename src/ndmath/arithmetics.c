@@ -3277,3 +3277,679 @@ NDArray *NDArray_TypedBinOp_GPU(int opcode, NDArray *a, NDArray *b) {
     return NULL;
 }
 #endif
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Typed unary op dispatch — element-wise abs / negative / positive /
+   reciprocal / sign / sqrt / rsqrt / square / clip / sinc across every
+   supported dtype on both CPU and GPU.
+
+   The dispatcher decides the result dtype per-op:
+   - sqrt / rsqrt / reciprocal / sinc promote integer inputs to float64
+     (32/64-bit ints) or float32 (narrow ints) — matches PyTorch's
+     `result_type` for transcendental ops applied to integer tensors;
+   - every other op preserves the input dtype.
+
+   Narrow floats (`float4`, `float8`) route their compute through
+   `float32` (no native intrinsics). The on-CPU path uses
+   `NDArray_AsType` to stage; the on-GPU path uses the same AsType which
+   stays on GPU for those dtypes.
+
+   `clip_min` / `clip_max` are decimal strings parsed losslessly into the
+   computed dtype so `float128` / `uint64` survive end-to-end.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Test whether @p dt names an integer dtype.
+ * @param[in] dt Canonical dtype string.
+ * @return 1 if @p dt is one of `int8..int64`/`uint8..uint64`; 0 otherwise.
+ */
+static int unary_is_int_dtype(const char *dt) {
+    return (!strcmp(dt, "int8")   || !strcmp(dt, "uint8")  ||
+            !strcmp(dt, "int16")  || !strcmp(dt, "uint16") ||
+            !strcmp(dt, "int32")  || !strcmp(dt, "uint32") ||
+            !strcmp(dt, "int64")  || !strcmp(dt, "uint64"));
+}
+
+/**
+ * @brief Test whether @p dt is a 32/64-bit signed or unsigned integer dtype.
+ * @param[in] dt Canonical dtype string.
+ * @return 1 if @p dt is int32/uint32/int64/uint64; 0 otherwise.
+ */
+static int unary_is_wide_int_dtype(const char *dt) {
+    return (!strcmp(dt, "int32") || !strcmp(dt, "uint32") ||
+            !strcmp(dt, "int64") || !strcmp(dt, "uint64"));
+}
+
+/**
+ * @brief Result dtype the unary op writes when applied to @p input_dt.
+ *
+ * sqrt/rsqrt/reciprocal/sinc promote integer inputs to a floating-point
+ * dtype (PyTorch widening rule): narrow ints (`int8`..`uint16`) widen
+ * to `float32`, the wider 32/64-bit ints widen to `float64`. Every
+ * other op preserves the input dtype.
+ *
+ * @param[in] op       Unary op selector.
+ * @param[in] input_dt Source dtype string.
+ * @return Canonical dtype string for the result NDArray.
+ */
+static const char *unary_result_dtype(NDArrayUnaryOp op, const char *input_dt) {
+    switch (op) {
+        case NDARRAY_UNOP_SQRT:
+        case NDARRAY_UNOP_RSQRT:
+        case NDARRAY_UNOP_RECIPROCAL:
+        case NDARRAY_UNOP_SINC:
+            if (unary_is_int_dtype(input_dt)) {
+                return unary_is_wide_int_dtype(input_dt)
+                    ? NDARRAY_TYPE_FLOAT64
+                    : NDARRAY_TYPE_FLOAT32;
+            }
+            return input_dt;
+        default:
+            return input_dt;
+    }
+}
+
+/**
+ * @brief Choose the compute dtype that backs @p result_dt for unary ops.
+ *
+ * Narrow non-half floats (`float4`, `float8`) have no GPU intrinsics
+ * and only minimal CPU range, so the dispatcher casts up to `float32`
+ * for compute and casts back to the source dtype after the op. Every
+ * other dtype computes natively.
+ */
+static const char *unary_compute_dtype(const char *result_dt) {
+    if (!strcmp(result_dt, "float4") || !strcmp(result_dt, "float8")) {
+        return NDARRAY_TYPE_FLOAT32;
+    }
+    return result_dt;
+}
+
+/* ── CPU per-dtype kernels (templated by macro) ─────────────────────────── */
+
+/**
+ * @brief CPU integer in-place unary loop.
+ *
+ * Wraps `signed` overflow through `unsigned` of the same width so:
+ *  - `negate(INT_MIN)` returns `INT_MIN` (modular wrap, matches NumPy);
+ *  - `abs(INT_MIN)`    returns `INT_MIN` (likewise);
+ *  - `square` of any int wraps to the modular value PyTorch produces.
+ */
+#define UNARY_INT_BODY(T, UT, OP_TAG, LO_VAL, HI_VAL)                                \
+    do {                                                                              \
+        T *p = (T *)data;                                                             \
+        for (long i = 0; i < n; i++) {                                                \
+            T x = p[i];                                                               \
+            switch (OP_TAG) {                                                         \
+                case NDARRAY_UNOP_NEGATIVE:                                           \
+                    p[i] = (T)(UT)(-(UT)x);                                           \
+                    break;                                                            \
+                case NDARRAY_UNOP_ABS:                                                \
+                    p[i] = (x < (T)0) ? (T)(UT)(-(UT)x) : x;                          \
+                    break;                                                            \
+                case NDARRAY_UNOP_POSITIVE:                                           \
+                    p[i] = x;                                                         \
+                    break;                                                            \
+                case NDARRAY_UNOP_SIGN:                                               \
+                    p[i] = (T)((x > (T)0) - (x < (T)0));                              \
+                    break;                                                            \
+                case NDARRAY_UNOP_SQUARE:                                             \
+                    p[i] = (T)(UT)((UT)x * (UT)x);                                    \
+                    break;                                                            \
+                case NDARRAY_UNOP_CLIP:                                               \
+                    /* PyTorch clamp = min(max(x, lo), hi). For ints we use the   \
+                       same branchless ordering as the float body so `lo > hi`   \
+                       deterministically returns `hi` (matches PyTorch's docs). */\
+                    {                                                                 \
+                        T _y = (x < (LO_VAL)) ? (LO_VAL) : x;                        \
+                        p[i] = ((HI_VAL) < _y) ? (HI_VAL) : _y;                      \
+                    }                                                                 \
+                    break;                                                            \
+                default: break;                                                       \
+            }                                                                         \
+        }                                                                             \
+    } while (0)
+
+/**
+ * @brief CPU floating-point in-place unary loop (float32 / float64 templated).
+ *
+ * Handles every op including the ones that require floating-point math
+ * (`sqrt`, `rsqrt`, `reciprocal`, `sinc`). Sign is implemented as the
+ * branchless three-way comparison so it returns +0/-0/+1/-1 in the
+ * source dtype.
+ */
+#define UNARY_FLOAT_BODY(T, FN_SQRT, FN_SIN, FN_FABS, OP_TAG, LO_VAL, HI_VAL)         \
+    do {                                                                              \
+        T *p = (T *)data;                                                             \
+        for (long i = 0; i < n; i++) {                                                \
+            T x = p[i];                                                               \
+            switch (OP_TAG) {                                                         \
+                case NDARRAY_UNOP_NEGATIVE:    p[i] = -x;                             \
+                    break;                                                            \
+                case NDARRAY_UNOP_ABS:         p[i] = FN_FABS(x);                     \
+                    break;                                                            \
+                case NDARRAY_UNOP_POSITIVE:    p[i] = x;                              \
+                    break;                                                            \
+                case NDARRAY_UNOP_SIGN:                                               \
+                    /* PyTorch: NaN propagates through sign. The branchless     \
+                       `(x > 0) - (x < 0)` idiom would return 0 (both ordered  \
+                       comparisons are false for NaN), so we guard for NaN     \
+                       explicitly. `x != x` is the canonical IEEE 754 NaN     \
+                       test that works for every float dtype (fp16 / fp32 /    \
+                       fp64 / fp128). */                                       \
+                    if (x != x) p[i] = x;                                         \
+                    else        p[i] = (T)((x > (T)0) - (x < (T)0));              \
+                    break;                                                            \
+                case NDARRAY_UNOP_SQUARE:      p[i] = x * x;                          \
+                    break;                                                            \
+                case NDARRAY_UNOP_RECIPROCAL:  p[i] = (T)1 / x;                       \
+                    break;                                                            \
+                case NDARRAY_UNOP_SQRT:        p[i] = FN_SQRT(x);                     \
+                    break;                                                            \
+                case NDARRAY_UNOP_RSQRT:       p[i] = (T)1 / FN_SQRT(x);              \
+                    break;                                                            \
+                case NDARRAY_UNOP_SINC: {                                             \
+                    if (x == (T)0) p[i] = (T)1;                                       \
+                    else {                                                            \
+                        T px = (T)3.14159265358979323846 * x;                         \
+                        p[i] = FN_SIN(px) / px;                                       \
+                    }                                                                 \
+                    break;                                                            \
+                }                                                                     \
+                case NDARRAY_UNOP_CLIP:                                               \
+                    /* PyTorch clamp(x, lo, hi) = std::min(std::max(x, lo), hi). \
+                       cppref:                                                  \
+                         std::max(a, b) = (a < b) ? b : a                       \
+                         std::min(a, b) = (b < a) ? b : a                       \
+                       The branching order matters for NaN: a NaN in `x`        \
+                       propagates through the chain (both comparisons are       \
+                       false, the NaN-arg is returned), but a NaN in `lo` /     \
+                       `hi` is swallowed (the original value survives). Also    \
+                       gives the documented PyTorch behaviour when lo > hi:     \
+                       result is hi. */                                         \
+                    {                                                             \
+                        T _y = ((x) < (LO_VAL)) ? (LO_VAL) : (x);                 \
+                        p[i] = ((HI_VAL) < _y) ? (HI_VAL) : _y;                   \
+                    }                                                             \
+                    break;                                                            \
+                default: break;                                                       \
+            }                                                                         \
+        }                                                                             \
+    } while (0)
+
+/**
+ * @brief Skip leading ASCII whitespace and an optional sign. Returns a
+ *        pointer into @p str pointing at the first digit / dot / digit-like
+ *        character that the numeric parsers consume.
+ */
+static const char *unary_skip_sign_ws(const char *str) {
+    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
+    if (*str == '+' || *str == '-') str++;
+    return str;
+}
+
+/**
+ * @brief Validate that @p str is a syntactically well-formed numeric
+ *        literal accepted by `ndarray_set_from_string` for @p dt.
+ *
+ * Catches the silent acceptance case where `ndarray_set_from_string`
+ * would parse "abc" as 0 via `strtod`. The check is strict but cheap:
+ * after optional sign / whitespace, require at least one digit and a
+ * NUL-terminated suffix (also accepting trailing whitespace).
+ *
+ * @param[in] str Candidate numeric string (non-NULL).
+ * @return 0 on success, -1 if @p str is not a valid numeric literal
+ *         (PHP exception in flight).
+ */
+static int unary_validate_numeric_string(const char *str, const char *which) {
+    if (str == NULL || *str == '\0') {
+        zend_throw_error(NULL,
+            "NDArray clip: '%s' is empty.", which);
+        return -1;
+    }
+    const char *p = unary_skip_sign_ws(str);
+    /* Accept inf / nan tokens (case-insensitive, with optional trailing
+       junk consistent with strtod's contract). */
+    char low3[4] = {0};
+    for (int i = 0; i < 3 && p[i]; i++) {
+        low3[i] = (char)(p[i] | 0x20);
+    }
+    if (!strncmp(low3, "inf", 3) || !strncmp(low3, "nan", 3)) {
+        return 0;
+    }
+    int saw_digit = 0;
+    while (*p) {
+        if (*p >= '0' && *p <= '9') { saw_digit = 1; p++; continue; }
+        break;
+    }
+    /* Optional fractional part. */
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') { saw_digit = 1; p++; }
+    }
+    /* Optional exponent. */
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (!(*p >= '0' && *p <= '9')) {
+            zend_throw_error(NULL,
+                "NDArray clip: '%s' has malformed exponent: %s.", which, str);
+            return -1;
+        }
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    /* Trailing whitespace is OK. */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (!saw_digit || *p != '\0') {
+        zend_throw_error(NULL,
+            "NDArray clip: '%s' is not a valid number: %s.", which, str);
+        return -1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Parse @p str into the typed scalar buffer @p out_buf for @p dt.
+ *
+ * Validates the string syntactically first so callers get a clean error
+ * instead of a silent 0 coerced from a malformed input. Routes through
+ * `ndarray_set_from_string` so `float128` / `int64` / `uint64` strings
+ * preserve precision. Other dtypes route through `double`.
+ *
+ * @param[in]  dt      Canonical dtype string.
+ * @param[in]  str     Decimal literal.
+ * @param[in]  which   Diagnostic label (`"min"` / `"max"`).
+ * @param[out] out_buf Buffer of `elsize(dt)` bytes the value is written into.
+ * @return 0 on success, -1 on validation failure (PHP exception in flight).
+ */
+static int unary_parse_typed_scalar(const char *dt, const char *str,
+                                     const char *which, void *out_buf) {
+    if (unary_validate_numeric_string(str, which) < 0) return -1;
+    ndarray_set_from_string(dt, (char *)out_buf, 0, str);
+    return 0;
+}
+
+/**
+ * @brief Execute the unary op on a CPU buffer in place.
+ *
+ * @param[in,out] data      Buffer of length @p n × elsize(@p dt) bytes.
+ * @param[in]     n         Element count.
+ * @param[in]     dt        Computed dtype string (post-promotion).
+ * @param[in]     op        Unary op selector.
+ * @param[in]     clip_min  Decimal string (clip only); NULL otherwise.
+ * @param[in]     clip_max  Decimal string (clip only); NULL otherwise.
+ * @return 0 on success, -1 on dispatch error (PHP exception in flight).
+ */
+static int unary_run_cpu_inplace(void *data, long n, const char *dt,
+                                  NDArrayUnaryOp op,
+                                  const char *clip_min, const char *clip_max) {
+    /* Pre-parse clip bounds into the right dtype so the inner loop stays
+       cheap. The bound buffers are at most 16 bytes (float128). */
+    union {
+        int8_t   i8;  uint8_t  u8;
+        int16_t  i16; uint16_t u16;
+        int32_t  i32; uint32_t u32;
+        int64_t  i64; uint64_t u64;
+        float    f32; double   f64;
+        char     fp128[16];
+    } lo, hi;
+    int is_clip = (op == NDARRAY_UNOP_CLIP);
+    if (is_clip) {
+        if (unary_parse_typed_scalar(dt, clip_min, "min", &lo) < 0) return -1;
+        if (unary_parse_typed_scalar(dt, clip_max, "max", &hi) < 0) return -1;
+    } else {
+        memset(&lo, 0, sizeof(lo));
+        memset(&hi, 0, sizeof(hi));
+    }
+
+    if (!strcmp(dt, "int8"))   { UNARY_INT_BODY(int8_t,   uint8_t,  op, lo.i8,  hi.i8);  return 0; }
+    if (!strcmp(dt, "uint8"))  { UNARY_INT_BODY(uint8_t,  uint8_t,  op, lo.u8,  hi.u8);  return 0; }
+    if (!strcmp(dt, "int16"))  { UNARY_INT_BODY(int16_t,  uint16_t, op, lo.i16, hi.i16); return 0; }
+    if (!strcmp(dt, "uint16")) { UNARY_INT_BODY(uint16_t, uint16_t, op, lo.u16, hi.u16); return 0; }
+    if (!strcmp(dt, "int32"))  { UNARY_INT_BODY(int32_t,  uint32_t, op, lo.i32, hi.i32); return 0; }
+    if (!strcmp(dt, "uint32")) { UNARY_INT_BODY(uint32_t, uint32_t, op, lo.u32, hi.u32); return 0; }
+    if (!strcmp(dt, "int64"))  { UNARY_INT_BODY(int64_t,  uint64_t, op, lo.i64, hi.i64); return 0; }
+    if (!strcmp(dt, "uint64")) { UNARY_INT_BODY(uint64_t, uint64_t, op, lo.u64, hi.u64); return 0; }
+
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) {
+        UNARY_FLOAT_BODY(float, sqrtf, sinf, fabsf, op, lo.f32, hi.f32);
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) {
+        UNARY_FLOAT_BODY(double, sqrt, sin, fabs, op, lo.f64, hi.f64);
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) {
+        /* Compute through float32 to keep accuracy. */
+        uint16_t *p = (uint16_t *)data;
+        float lo_f = is_clip ? (float)ndarray_fp16_to_double(lo.u16) : 0.0f;
+        float hi_f = is_clip ? (float)ndarray_fp16_to_double(hi.u16) : 0.0f;
+        for (long i = 0; i < n; i++) {
+            float x = (float)ndarray_fp16_to_double(p[i]);
+            float y = x;
+            switch (op) {
+                case NDARRAY_UNOP_NEGATIVE:    y = -x; break;
+                case NDARRAY_UNOP_ABS:         y = fabsf(x); break;
+                case NDARRAY_UNOP_POSITIVE:    y = x; break;
+                case NDARRAY_UNOP_SIGN:
+                    /* NaN-safe sign: propagate NaN per PyTorch. */
+                    y = (x != x) ? x : (float)((x > 0.0f) - (x < 0.0f));
+                    break;
+                case NDARRAY_UNOP_SQUARE:      y = x * x; break;
+                case NDARRAY_UNOP_RECIPROCAL:  y = 1.0f / x; break;
+                case NDARRAY_UNOP_SQRT:        y = sqrtf(x); break;
+                case NDARRAY_UNOP_RSQRT:       y = 1.0f / sqrtf(x); break;
+                case NDARRAY_UNOP_SINC:
+                    if (x == 0.0f) y = 1.0f;
+                    else { float px = 3.14159265358979323846f * x; y = sinf(px) / px; }
+                    break;
+                case NDARRAY_UNOP_CLIP: {
+                    /* min(max(x, lo), hi) per PyTorch clamp; see UNARY_FLOAT_BODY. */
+                    float _yc = (x < lo_f) ? lo_f : x;
+                    y = (hi_f < _yc) ? hi_f : _yc;
+                    break;
+                }
+                default: break;
+            }
+            p[i] = ndarray_double_to_fp16((double)y);
+        }
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT128)) {
+        ndarray_fp128_t *p = (ndarray_fp128_t *)data;
+        ndarray_fp128_t lo_v = NDARRAY_FP128_ZERO(), hi_v = NDARRAY_FP128_ZERO();
+        if (is_clip) {
+            memcpy(&lo_v, lo.fp128, sizeof(lo_v));
+            memcpy(&hi_v, hi.fp128, sizeof(hi_v));
+        }
+        for (long i = 0; i < n; i++) {
+            ndarray_fp128_t x = p[i];
+            ndarray_fp128_t y = x;
+            switch (op) {
+                case NDARRAY_UNOP_NEGATIVE:    y = NDARRAY_FP128_NEG(x); break;
+                case NDARRAY_UNOP_ABS:         y = NDARRAY_FP128_ABS(x); break;
+                case NDARRAY_UNOP_POSITIVE:    y = x; break;
+                case NDARRAY_UNOP_SIGN: {
+                    /* PyTorch sign(NaN) = NaN. Without the explicit NaN
+                       guard the else branch below would silently return
+                       +1 (LT(NaN, 0) is false → falls through). */
+                    if (NDARRAY_FP128_ISNAN(x))       y = x;
+                    else if (NDARRAY_FP128_ISZERO(x)) y = NDARRAY_FP128_ZERO();
+                    else if (NDARRAY_FP128_LT(x, NDARRAY_FP128_ZERO()))
+                        y = NDARRAY_FP128_NEG(NDARRAY_FP128_ONE());
+                    else y = NDARRAY_FP128_ONE();
+                    break;
+                }
+                case NDARRAY_UNOP_SQUARE:      y = NDARRAY_FP128_MUL(x, x); break;
+                case NDARRAY_UNOP_RECIPROCAL:  y = NDARRAY_FP128_DIV(NDARRAY_FP128_ONE(), x); break;
+                case NDARRAY_UNOP_SQRT:        y = NDARRAY_FP128_SQRT(x); break;
+                case NDARRAY_UNOP_RSQRT:
+                    y = NDARRAY_FP128_DIV(NDARRAY_FP128_ONE(), NDARRAY_FP128_SQRT(x));
+                    break;
+                case NDARRAY_UNOP_SINC: {
+                    if (NDARRAY_FP128_ISZERO(x)) y = NDARRAY_FP128_ONE();
+                    else {
+                        /* sin works at full fp128 precision on libquadmath
+                           (`sinq`); on the DD fallback it routes through
+                           double - same accuracy bound as the GPU dd path.
+                           `M_PIq` from quadmath gives the full 34-digit pi
+                           when available, otherwise we promote a long-double
+                           literal (~19 digits on x86_64). */
+#if NDARRAY_HAVE_FLOAT128 && HAVE_QUADMATH
+                        ndarray_fp128_t pi = M_PIq;
+#else
+                        ndarray_fp128_t pi = NDARRAY_FP128_FROM_LD(
+                            3.141592653589793238462643383279502884L);
+#endif
+                        ndarray_fp128_t px = NDARRAY_FP128_MUL(pi, x);
+                        ndarray_fp128_t s  = NDARRAY_FP128_SIN(px);
+                        y = NDARRAY_FP128_DIV(s, px);
+                    }
+                    break;
+                }
+                case NDARRAY_UNOP_CLIP: {
+                    /* min(max(x, lo), hi) per PyTorch clamp; see UNARY_FLOAT_BODY. */
+                    ndarray_fp128_t _yc = NDARRAY_FP128_LT(x, lo_v) ? lo_v : x;
+                    y = NDARRAY_FP128_LT(hi_v, _yc) ? hi_v : _yc;
+                    break;
+                }
+                default: break;
+            }
+            p[i] = y;
+        }
+        return 0;
+    }
+    zend_throw_error(NULL,
+        "NDArray_TypedUnaryOp: unsupported compute dtype \"%s\".", dt);
+    return -1;
+}
+
+#ifdef HAVE_CUBLAS
+/**
+ * @brief Dispatch the unary op against a typed GPU buffer in place.
+ *
+ * Routes to the right `cuda_<op>_<tag>` wrapper for every supported
+ * compute dtype. Caller has already cast the input to the compute
+ * dtype on GPU via `NDArray_AsType` / `NDArray_Copy`.
+ *
+ * `clip_min` / `clip_max` are decimal strings parsed losslessly into
+ * the typed bound for the clip op.
+ */
+static int unary_run_gpu_inplace(void *data, long n, const char *dt,
+                                  NDArrayUnaryOp op,
+                                  const char *clip_min, const char *clip_max) {
+    union {
+        int8_t   i8;  uint8_t  u8;
+        int16_t  i16; uint16_t u16;
+        int32_t  i32; uint32_t u32;
+        int64_t  i64; uint64_t u64;
+        float    f32; double   f64;
+        char     fp128[16];
+    } lo, hi;
+    int is_clip = (op == NDARRAY_UNOP_CLIP);
+    if (is_clip) {
+        if (unary_parse_typed_scalar(dt, clip_min, "min", &lo) < 0) return -1;
+        if (unary_parse_typed_scalar(dt, clip_max, "max", &hi) < 0) return -1;
+    } else {
+        memset(&lo, 0, sizeof(lo));
+        memset(&hi, 0, sizeof(hi));
+    }
+    int ni = (int)n;
+#define UNOP_GPU_DT(DTSTR, T, NEG, ABS, SIGN, RECIP, SQRT, RSQRT, SQUARE, SINC, CLIP) \
+    if (!strcmp(dt, DTSTR)) {                                                          \
+        T *p = (T *)data;                                                              \
+        switch (op) {                                                                  \
+            case NDARRAY_UNOP_NEGATIVE:                NEG (p, ni); break;             \
+            case NDARRAY_UNOP_ABS:                    {ABS;}                  break;   \
+            case NDARRAY_UNOP_POSITIVE:                /* in-place no-op */   break;   \
+            case NDARRAY_UNOP_SIGN:                    SIGN(p, ni); break;             \
+            case NDARRAY_UNOP_RECIPROCAL:             {RECIP;}                break;   \
+            case NDARRAY_UNOP_SQRT:                   {SQRT;}                 break;   \
+            case NDARRAY_UNOP_RSQRT:                  {RSQRT;}                break;   \
+            case NDARRAY_UNOP_SQUARE:                  SQUARE(p, ni); break;           \
+            case NDARRAY_UNOP_SINC:                   {SINC;}                 break;   \
+            case NDARRAY_UNOP_CLIP:                    CLIP; break;                    \
+            default:                                                                   \
+                zend_throw_error(NULL,                                                 \
+                    "NDArray_TypedUnaryOp GPU: unsupported op for dtype %s.", DTSTR);  \
+                return -1;                                                             \
+        }                                                                              \
+        return 0;                                                                      \
+    }
+
+    /* Helpers for "not supported on integer dtype" — the dispatcher
+       promotes ints to float before launch for these ops, so reaching
+       these branches is a programmer error. */
+#define UNOP_INT_NOT_FLOAT { zend_throw_error(NULL,                                    \
+        "NDArray_TypedUnaryOp GPU: integer dispatched to float-only op"); return -1; }
+
+    UNOP_GPU_DT("int8", int8_t,
+        cuda_negate_i8, cuda_abs_i8(p, ni), cuda_sign_i8,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_i8, UNOP_INT_NOT_FLOAT,
+        cuda_clip_i8(p, lo.i8, hi.i8, ni))
+    UNOP_GPU_DT("uint8", uint8_t,
+        cuda_negate_u8, /* uint abs is a no-op */ (void)0, cuda_sign_u8,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_u8, UNOP_INT_NOT_FLOAT,
+        cuda_clip_u8(p, lo.u8, hi.u8, ni))
+    UNOP_GPU_DT("int16", int16_t,
+        cuda_negate_i16, cuda_abs_i16(p, ni), cuda_sign_i16,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_i16, UNOP_INT_NOT_FLOAT,
+        cuda_clip_i16(p, lo.i16, hi.i16, ni))
+    UNOP_GPU_DT("uint16", uint16_t,
+        cuda_negate_u16, (void)0, cuda_sign_u16,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_u16, UNOP_INT_NOT_FLOAT,
+        cuda_clip_u16(p, lo.u16, hi.u16, ni))
+    UNOP_GPU_DT("int32", int32_t,
+        cuda_negate_i32, cuda_abs_i32(p, ni), cuda_sign_i32,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_i32, UNOP_INT_NOT_FLOAT,
+        cuda_clip_i32(p, lo.i32, hi.i32, ni))
+    UNOP_GPU_DT("uint32", uint32_t,
+        cuda_negate_u32, (void)0, cuda_sign_u32,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_u32, UNOP_INT_NOT_FLOAT,
+        cuda_clip_u32(p, lo.u32, hi.u32, ni))
+    UNOP_GPU_DT("int64", int64_t,
+        cuda_negate_i64, cuda_abs_i64(p, ni), cuda_sign_i64,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_i64, UNOP_INT_NOT_FLOAT,
+        cuda_clip_i64(p, lo.i64, hi.i64, ni))
+    UNOP_GPU_DT("uint64", uint64_t,
+        cuda_negate_u64, (void)0, cuda_sign_u64,
+        UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT, UNOP_INT_NOT_FLOAT,
+        cuda_square_u64, UNOP_INT_NOT_FLOAT,
+        cuda_clip_u64(p, lo.u64, hi.u64, ni))
+    UNOP_GPU_DT("float32", float,
+        cuda_negate_f32, cuda_abs_f32(p, ni), cuda_sign_f32,
+        cuda_recip_f32(p, ni), cuda_sqrt_f32(p, ni), cuda_rsqrt_f32(p, ni),
+        cuda_square_f32, cuda_sinc_f32(p, ni),
+        cuda_clip_f32(p, lo.f32, hi.f32, ni))
+    UNOP_GPU_DT("float64", double,
+        cuda_negate_f64, cuda_abs_f64(p, ni), cuda_sign_f64,
+        cuda_recip_f64(p, ni), cuda_sqrt_f64(p, ni), cuda_rsqrt_f64(p, ni),
+        cuda_square_f64, cuda_sinc_f64(p, ni),
+        cuda_clip_f64(p, lo.f64, hi.f64, ni))
+    UNOP_GPU_DT("float16", uint16_t,
+        cuda_negate_f16, cuda_abs_f16(p, ni), cuda_sign_f16,
+        cuda_recip_f16(p, ni), cuda_sqrt_f16(p, ni), cuda_rsqrt_f16(p, ni),
+        cuda_square_f16,  cuda_sinc_f16(p, ni),
+        cuda_clip_f16(p, (float)ndarray_fp16_to_double(lo.u16),
+                          (float)ndarray_fp16_to_double(hi.u16), ni))
+
+#undef UNOP_GPU_DT
+#undef UNOP_INT_NOT_FLOAT
+
+    if (!strcmp(dt, "float128")) {
+        double *p = (double *)data;
+        double lo_hi = 0.0, lo_lo = 0.0, hi_hi = 0.0, hi_lo = 0.0;
+        if (is_clip) {
+            ndarray_fp128_t v;
+            memcpy(&v, lo.fp128, sizeof(v));
+#if NDARRAY_HAVE_FLOAT128
+            lo_hi = (double)v;
+            lo_lo = (double)(v - (ndarray_fp128_t)lo_hi);
+#else
+            lo_hi = v.hi; lo_lo = v.lo;
+#endif
+            memcpy(&v, hi.fp128, sizeof(v));
+#if NDARRAY_HAVE_FLOAT128
+            hi_hi = (double)v;
+            hi_lo = (double)(v - (ndarray_fp128_t)hi_hi);
+#else
+            hi_hi = v.hi; hi_lo = v.lo;
+#endif
+        }
+        switch (op) {
+            case NDARRAY_UNOP_NEGATIVE:   cuda_negate_dd(p, ni); break;
+            case NDARRAY_UNOP_ABS:        cuda_abs_dd  (p, ni); break;
+            case NDARRAY_UNOP_POSITIVE:                          break;
+            case NDARRAY_UNOP_SIGN:       cuda_sign_dd (p, ni); break;
+            case NDARRAY_UNOP_RECIPROCAL: cuda_recip_dd(p, ni); break;
+            case NDARRAY_UNOP_SQRT:       cuda_sqrt_dd (p, ni); break;
+            case NDARRAY_UNOP_RSQRT:      cuda_rsqrt_dd(p, ni); break;
+            case NDARRAY_UNOP_SQUARE:     cuda_square_dd(p, ni); break;
+            case NDARRAY_UNOP_SINC:       cuda_sinc_dd (p, ni); break;
+            case NDARRAY_UNOP_CLIP:
+                cuda_clip_dd(p, lo_hi, lo_lo, hi_hi, hi_lo, ni); break;
+            default:
+                zend_throw_error(NULL,
+                    "NDArray_TypedUnaryOp GPU: unsupported op for fp128.");
+                return -1;
+        }
+        return 0;
+    }
+    zend_throw_error(NULL,
+        "NDArray_TypedUnaryOp GPU: unsupported compute dtype \"%s\".", dt);
+    return -1;
+}
+#endif /* HAVE_CUBLAS */
+
+NDArray *
+NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
+                     const char *clip_min, const char *clip_max) {
+    if (nda == NULL) return NULL;
+
+    const char *input_dt   = NDArray_TYPE(nda);
+    const char *result_dt  = unary_result_dtype(op, input_dt);
+    const char *compute_dt = unary_compute_dtype(result_dt);
+    int device             = NDArray_DEVICE(nda);
+
+    /* Empty input → empty output of the right dtype. The kernel doesn't
+       handle n == 0 differently, but skipping the launch keeps the GPU
+       path leak-free and matches NumPy. */
+    if (NDArray_NUMELEMENTS(nda) == 0) {
+        int ndim = NDArray_NDIM(nda);
+        int *shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));
+        if (ndim > 0) memcpy(shape, NDArray_SHAPE(nda), sizeof(int) * ndim);
+        else          shape[0] = 1;
+        return NDArray_Empty(shape, ndim, result_dt, device);
+    }
+
+    /* Stage the result on the same device as the input. Two cases:
+       (a) compute_dt == input_dt (every dtype except fp4 / fp8): clone
+           the input buffer via NDArray_Copy, then run the op in place
+           on the copy. NDArray_Copy stays on-device on every dtype.
+       (b) compute_dt != input_dt (fp4 / fp8 inputs only): NDArray_AsType
+           casts to float32 on the input's device. GPU AsType keeps the
+           fp4 / fp8 → fp32 cast on GPU (`cuda_cast_fp4_to_f32` /
+           `cuda_cast_fp8_to_f32`); CPU AsType uses the generic
+           element-wise loop. fp128 is never the source of a promotion
+           because (a) covers it. */
+    NDArray *work = is_type(input_dt, compute_dt)
+        ? NDArray_Copy  (nda, device)
+        : NDArray_AsType(nda, compute_dt);
+    if (work == NULL) return NULL;
+
+    long n = NDArray_NUMELEMENTS(work);
+    int rc;
+    if (device == NDARRAY_DEVICE_CPU) {
+        rc = unary_run_cpu_inplace(NDArray_DATA(work), n, compute_dt,
+                                   op, clip_min, clip_max);
+    } else {
+#ifdef HAVE_CUBLAS
+        rc = unary_run_gpu_inplace(NDArray_DATA(work), n, compute_dt,
+                                   op, clip_min, clip_max);
+#else
+        zend_throw_error(NULL,
+            "NDArray_TypedUnaryOp: GPU input but extension built without CUDA.");
+        rc = -1;
+#endif
+    }
+    if (rc != 0) {
+        NDArray_FREE(work);
+        return NULL;
+    }
+
+    /* If we computed in a wider dtype (fp4 / fp8 → float32), cast back
+       to the declared result dtype now. NDArray_AsType stays on-device
+       for those narrow-float pairs. */
+    if (!is_type(compute_dt, result_dt)) {
+        NDArray *narrow = NDArray_AsType(work, result_dt);
+        NDArray_FREE(work);
+        return narrow;
+    }
+    return work;
+}

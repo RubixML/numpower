@@ -36,6 +36,13 @@ ndarray_dd_t ndarray_dd_trunc(ndarray_dd_t a);
 ndarray_dd_t ndarray_dd_fmod(ndarray_dd_t a, ndarray_dd_t b);
 ndarray_dd_t ndarray_dd_pow(ndarray_dd_t a, ndarray_dd_t b);
 
+/* Square root and reciprocal sqrt to ~106-bit precision via one
+   double-precision sqrt seed followed by a single Newton iteration in
+   double-double arithmetic. Returns NaN for negative inputs and matches
+   sqrtq(__float128)/qsqrtq on the libquadmath build to the last DD bit. */
+ndarray_dd_t ndarray_dd_sqrt(ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_rsqrt(ndarray_dd_t a);
+
 /* ── comparisons ────────────────────────────────────────────────────────── */
 int  ndarray_dd_cmp(ndarray_dd_t a, ndarray_dd_t b);   /* -1, 0, 1 */
 int  ndarray_dd_iszero(ndarray_dd_t a);

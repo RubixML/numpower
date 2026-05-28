@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <stdint.h>
 #include <time.h>
+#include <type_traits>
 
 #define CHECK_CUDA(func) do { \
   cudaError_t status = (func); \
@@ -1218,6 +1219,343 @@ __global__ void tcuda_fill_dd_kernel(double *out, double hi, double lo, int n) {
     if (i < n) {
         out[2*i]   = hi;
         out[2*i+1] = lo;
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Device-side DD unary helpers. Pair with the existing dd_add / dd_mul /
+   dd_div / dd_neg primitives (above) to provide abs, sign, sqrt, rsqrt
+   and a clip comparator used by the typed unary kernels.
+   ────────────────────────────────────────────────────────────────────────── */
+
+__device__ inline dd_real dd_abs(dd_real a) {
+    return (a.hi < 0.0) ? dd_neg(a) : a;
+}
+
+__device__ inline int dd_cmp(dd_real a, dd_real b) {
+    if (a.hi < b.hi) return -1;
+    if (a.hi > b.hi) return  1;
+    if (a.lo < b.lo) return -1;
+    if (a.lo > b.lo) return  1;
+    return 0;
+}
+
+__device__ inline dd_real dd_sign(dd_real a) {
+    /* PyTorch sign(NaN) = NaN. A DD-encoded NaN has `hi != hi`; the
+       canonical IEEE-754 NaN test is the self-compare. Without this
+       guard the fall-through would silently return 0 (every ordered
+       compare against NaN is false). */
+    if (a.hi != a.hi)                          return a;
+    if (a.hi > 0.0)                            return dd_make( 1.0, 0.0);
+    if (a.hi < 0.0)                            return dd_make(-1.0, 0.0);
+    if (a.lo > 0.0)                            return dd_make( 1.0, 0.0);
+    if (a.lo < 0.0)                            return dd_make(-1.0, 0.0);
+    return dd_make(0.0, 0.0);
+}
+
+/* Single Newton refinement (one DD multiplication + one DD division) over a
+   fp64 sqrt seed: matches the CPU `ndarray_dd_sqrt` bit-for-bit. */
+__device__ inline dd_real dd_sqrt(dd_real a) {
+    if (a.hi == 0.0 && a.lo == 0.0) return a;
+    if (a.hi < 0.0) return dd_make(nan(""), 0.0);
+    double y = sqrt(a.hi);
+    dd_real y_dd  = dd_make(y, 0.0);
+    dd_real y_sq  = dd_mul(y_dd, y_dd);
+    dd_real diff  = dd_sub(a, y_sq);
+    dd_real denom = dd_make(2.0 * y, 0.0);
+    dd_real corr  = dd_div(diff, denom);
+    return dd_add(y_dd, corr);
+}
+
+__device__ inline dd_real dd_recip(dd_real a) {
+    return dd_div(dd_make(1.0, 0.0), a);
+}
+
+__device__ inline dd_real dd_rsqrt(dd_real a) {
+    return dd_recip(dd_sqrt(a));
+}
+
+/**
+ * @brief DD strict less-than, NaN-safe.
+ *
+ * Returns true iff `a < b` under the lexicographic (hi, lo) ordering.
+ * NaN in either operand makes both `< ` and `> ` checks false, falling
+ * through to a NaN-vs-NaN comparison on `.lo` which is also false — so
+ * the predicate returns false whenever either operand is NaN, matching
+ * IEEE-754's "unordered" contract for ordered comparisons.
+ */
+__device__ inline bool dd_lt(dd_real a, dd_real b) {
+    if (a.hi < b.hi) return true;
+    if (a.hi > b.hi) return false;
+    return a.lo < b.lo;
+}
+
+/**
+ * @brief DD clamp matching PyTorch's clamp semantics.
+ *
+ * Equivalent to `std::min(std::max(x, lo), hi)` for ordered inputs.
+ * NaN propagation:
+ *  - NaN in `x` propagates to the result (both `lt(x, lo)` and
+ *    `lt(hi, x)` are false, so the original NaN survives both
+ *    branches);
+ *  - NaN in `lo` or `hi` is swallowed (the corresponding bound check
+ *    returns false, so the value survives), matching PyTorch's CPU
+ *    kernel behaviour.
+ * Also gives the documented PyTorch result when `lo > hi`: the
+ * answer is `hi`.
+ */
+__device__ inline dd_real dd_clip(dd_real x, dd_real lo, dd_real hi) {
+    dd_real _y = dd_lt(x, lo)  ? lo : x;     /* max(x, lo)  */
+    return       dd_lt(hi, _y) ? hi : _y;    /* min(_y, hi) */
+}
+
+/* sinc(π·x) with x stored as DD. sin/cos through fp64 only — full DD
+   trig would need a CORDIC ladder; for normalised sinc the input is in
+   units of π so the argument never has the precision headroom DD offers
+   anyway. dd_to_double + sin retains > 15 decimal digits of accuracy. */
+__device__ inline dd_real dd_sinc(dd_real x) {
+    double xd = dd_to_double(x);
+    if (xd == 0.0 && x.lo == 0.0) return dd_make(1.0, 0.0);
+    double arg = 3.14159265358979323846 * xd;
+    double r = sin(arg) / arg;
+    return dd_make(r, 0.0);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Templated unary kernels — one body per op-shape.
+
+   Numeric semantics (parallel to CPU):
+   - `negate`/`square` on integers wrap modulo 2^N (cast through unsigned).
+   - `abs` on signed ints uses the wrap-on-INT_MIN convention NumPy follows.
+   - `sign` always returns -1, 0, or +1 (cast to the source dtype).
+   - `reciprocal`/`sqrt`/`rsqrt`/`sinc` operate only on floating dtypes; the
+     dispatcher promotes integer inputs to a float dtype before launch.
+   ────────────────────────────────────────────────────────────────────────── */
+
+/* Integer-template branch: cast through `unsigned` of the same width to
+   wrap negation / squaring modulo 2^N (NumPy + PyTorch contract,
+   especially for `-INT_MIN` on signed types). */
+template <typename T>
+__device__ inline typename std::enable_if<std::is_integral<T>::value, T>::type
+tcuda_negate_v(T x) {
+    typedef typename std::make_unsigned<T>::type UT;
+    return (T)(UT)(-(UT)x);
+}
+template <typename T>
+__device__ inline typename std::enable_if<std::is_floating_point<T>::value, T>::type
+tcuda_negate_v(T x) { return -x; }
+
+template <typename T>
+__device__ inline typename std::enable_if<std::is_integral<T>::value, T>::type
+tcuda_square_v(T x) {
+    typedef typename std::make_unsigned<T>::type UT;
+    return (T)(UT)((UT)x * (UT)x);
+}
+template <typename T>
+__device__ inline typename std::enable_if<std::is_floating_point<T>::value, T>::type
+tcuda_square_v(T x) { return x * x; }
+
+/* `abs` is only instantiated for signed integer dtypes (the dispatcher
+   short-circuits to a no-op for unsigned). The wrapping cast handles
+   `abs(INT_MIN)` symmetrically with negation. */
+template <typename T> __device__ inline T tcuda_abs_signed_v(T x) {
+    typedef typename std::make_unsigned<T>::type UT;
+    return (x < (T)0) ? (T)(UT)(-(UT)x) : x;
+}
+
+/* Sign returns -1 / 0 / +1 in the source dtype. The signed branch is
+   the canonical three-way subtraction; the unsigned branch avoids the
+   always-false `x < 0` comparison NVCC otherwise warns about. */
+template <typename T>
+__device__ inline typename std::enable_if<std::is_signed<T>::value, T>::type
+tcuda_sign_v(T x) { return (T)((x > (T)0) - (x < (T)0)); }
+template <typename T>
+__device__ inline typename std::enable_if<std::is_unsigned<T>::value, T>::type
+tcuda_sign_v(T x) { return (T)(x != (T)0); }
+
+
+/* In-place kernels for arity-0 ops (single buffer). */
+#define TYPED_UNOP_KERNEL_INPLACE(NAME, EXPR)                                       \
+template <typename T>                                                               \
+__global__ void NAME(T *a, int n) {                                                 \
+    int i = threadIdx.x + blockIdx.x * blockDim.x;                                  \
+    if (i < n) { T x = a[i]; a[i] = (EXPR); }                                       \
+}
+
+TYPED_UNOP_KERNEL_INPLACE(tcuda_negate_kernel,  tcuda_negate_v<T>(x))
+TYPED_UNOP_KERNEL_INPLACE(tcuda_abs_int_kernel, tcuda_abs_signed_v<T>(x))
+TYPED_UNOP_KERNEL_INPLACE(tcuda_sign_kernel,    tcuda_sign_v<T>(x))
+TYPED_UNOP_KERNEL_INPLACE(tcuda_square_kernel,  tcuda_square_v<T>(x))
+
+/* Floating-point unary kernels — fp32 / fp64 share the body but parameterise
+   the math functions through a small trait so each instantiation pulls the
+   right intrinsic (sqrtf vs sqrt, sinf vs sin). */
+template <typename T> __device__ inline T tcuda_sqrt_fp (T x);
+template <>           __device__ inline float  tcuda_sqrt_fp<float >(float  x) { return sqrtf(x); }
+template <>           __device__ inline double tcuda_sqrt_fp<double>(double x) { return sqrt (x); }
+
+template <typename T> __device__ inline T tcuda_sin_fp (T x);
+template <>           __device__ inline float  tcuda_sin_fp<float >(float  x) { return sinf(x); }
+template <>           __device__ inline double tcuda_sin_fp<double>(double x) { return sin (x); }
+
+template <typename T> __device__ inline T tcuda_fabs_fp(T x);
+template <>           __device__ inline float  tcuda_fabs_fp<float >(float  x) { return fabsf(x); }
+template <>           __device__ inline double tcuda_fabs_fp<double>(double x) { return fabs (x); }
+
+template <typename T>
+__global__ void tcuda_abs_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_fabs_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_recip_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = (T)1 / a[i];
+}
+template <typename T>
+__global__ void tcuda_sqrt_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = tcuda_sqrt_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_rsqrt_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = (T)1 / tcuda_sqrt_fp<T>(a[i]);
+}
+template <typename T>
+__global__ void tcuda_sinc_float_kernel(T *a, int n) {
+    /* Normalised sinc(x) = sin(π·x) / (π·x), with sinc(0) = 1. */
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        T x  = a[i];
+        if (x == (T)0) { a[i] = (T)1; }
+        else {
+            T px = (T)3.14159265358979323846 * x;
+            a[i] = tcuda_sin_fp<T>(px) / px;
+        }
+    }
+}
+template <typename T>
+__global__ void tcuda_sign_float_kernel(T *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        T x = a[i];
+        /* PyTorch sign(NaN) = NaN. The IEEE-754 self-compare `x != x` is
+           the canonical NaN test and works for any float dtype. */
+        if      (x != x)   a[i] = x;
+        else if (x > (T)0) a[i] = (T) 1;
+        else if (x < (T)0) a[i] = (T)-1;
+        else               a[i] = (T) 0;
+    }
+}
+template <typename T>
+__global__ void tcuda_clip_kernel(T *a, T lo, T hi, int n) {
+    /* For integer T this is plain min/max via cppref-style branching.
+       For float T the (a < b) ? b : a / (b < a) ? b : a pair matches
+       std::max / std::min — see UNARY_FLOAT_BODY for the NaN rationale. */
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        T x  = a[i];
+        T _y = (x < lo) ? lo : x;
+        a[i] = (hi < _y) ? hi : _y;
+    }
+}
+
+/* __half (float16, stored as uint16_t) unary kernels — compute through float
+   for accuracy, matching the binary path. */
+__global__ void tcuda_negate_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = __float2half(-__half2float(a[i]));
+}
+__global__ void tcuda_abs_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = __float2half(fabsf(__half2float(a[i])));
+}
+__global__ void tcuda_sign_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float x = __half2float(a[i]);
+        /* PyTorch sign(NaN) = NaN. NaN-aware branch before the
+           branchless triplet, then `__float2half(NaN)` round-trips
+           the NaN through the half encoding. */
+        float r;
+        if      (x != x)   r = x;
+        else if (x > 0.0f) r =  1.0f;
+        else if (x < 0.0f) r = -1.0f;
+        else               r =  0.0f;
+        a[i] = __float2half(r);
+    }
+}
+__global__ void tcuda_recip_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = __float2half(1.0f / __half2float(a[i]));
+}
+__global__ void tcuda_sqrt_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = __float2half(sqrtf(__half2float(a[i])));
+}
+__global__ void tcuda_rsqrt_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) a[i] = __float2half(1.0f / sqrtf(__half2float(a[i])));
+}
+__global__ void tcuda_square_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float x = __half2float(a[i]);
+        a[i] = __float2half(x * x);
+    }
+}
+__global__ void tcuda_clip_half_kernel(__half *a, float lo, float hi, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float x  = __half2float(a[i]);
+        float _y = (x < lo) ? lo : x;
+        float r  = (hi < _y) ? hi : _y;
+        a[i] = __float2half(r);
+    }
+}
+__global__ void tcuda_sinc_half_kernel(__half *a, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float x = __half2float(a[i]);
+        float r;
+        if (x == 0.0f) r = 1.0f;
+        else { float px = 3.14159265358979323846f * x; r = sinf(px) / px; }
+        a[i] = __float2half(r);
+    }
+}
+
+/* DD (float128 emulation) unary kernels. Buffer is laid out as
+   `(hi[0], lo[0], hi[1], lo[1], …)` so each element occupies 2 doubles. */
+#define DD_UNOP_KERNEL(NAME, EXPR)                                                  \
+__global__ void NAME(double *a, int n) {                                            \
+    int i = threadIdx.x + blockIdx.x * blockDim.x;                                  \
+    if (i < n) {                                                                    \
+        dd_real x = dd_make(a[2*i], a[2*i+1]);                                      \
+        dd_real r = (EXPR);                                                         \
+        a[2*i]   = r.hi;                                                            \
+        a[2*i+1] = r.lo;                                                            \
+    }                                                                               \
+}
+DD_UNOP_KERNEL(tcuda_negate_dd_kernel, dd_neg(x))
+DD_UNOP_KERNEL(tcuda_abs_dd_kernel,    dd_abs(x))
+DD_UNOP_KERNEL(tcuda_sign_dd_kernel,   dd_sign(x))
+DD_UNOP_KERNEL(tcuda_recip_dd_kernel,  dd_recip(x))
+DD_UNOP_KERNEL(tcuda_sqrt_dd_kernel,   dd_sqrt(x))
+DD_UNOP_KERNEL(tcuda_rsqrt_dd_kernel,  dd_rsqrt(x))
+DD_UNOP_KERNEL(tcuda_square_dd_kernel, dd_mul(x, x))
+DD_UNOP_KERNEL(tcuda_sinc_dd_kernel,   dd_sinc(x))
+
+__global__ void tcuda_clip_dd_kernel(double *a, double lo_hi, double lo_lo,
+                                     double hi_hi, double hi_lo, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        dd_real x  = dd_make(a[2*i], a[2*i+1]);
+        dd_real lo = dd_make(lo_hi, lo_lo);
+        dd_real hi = dd_make(hi_hi, hi_lo);
+        dd_real r  = dd_clip(x, lo, hi);
+        a[2*i]   = r.hi;
+        a[2*i+1] = r.lo;
     }
 }
 
@@ -2680,6 +3018,166 @@ DEF_DD_WRAPPER(cuda_mul_dd, tcuda_mul_dd_kernel)
 DEF_DD_WRAPPER(cuda_div_dd, tcuda_div_dd_kernel)
 DEF_DD_WRAPPER(cuda_pow_dd, tcuda_pow_dd_kernel)
 DEF_DD_WRAPPER(cuda_mod_dd, tcuda_mod_dd_kernel)
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Typed unary op wrappers — element-wise abs / negate / sign / square /
+   clip / sqrt / rsqrt / reciprocal / sinc. Naming convention:
+     cuda_<op>_<dtype>(buffer, [extra args], n)
+   The buffer is updated in place; the dispatcher (`NDArray_TypedUnaryOp`)
+   allocates the output via `NDArray_Copy` first when the op preserves
+   dtype, or via `NDArray_AsType` when the op promotes integer → float.
+   ────────────────────────────────────────────────────────────────────────── */
+
+#define DEF_UNOP_T_WRAPPER(NAME, KERNEL, T)                                         \
+void NAME(T *a, int n) {                                                            \
+    GRID_FOR(n);                                                                    \
+    KERNEL<T><<<numBlocks, blockSize>>>(a, n);                                      \
+}
+
+DEF_UNOP_T_WRAPPER(cuda_negate_i8,  tcuda_negate_kernel, int8_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_u8,  tcuda_negate_kernel, uint8_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_i16, tcuda_negate_kernel, int16_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_u16, tcuda_negate_kernel, uint16_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_i32, tcuda_negate_kernel, int32_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_u32, tcuda_negate_kernel, uint32_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_i64, tcuda_negate_kernel, int64_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_u64, tcuda_negate_kernel, uint64_t)
+DEF_UNOP_T_WRAPPER(cuda_negate_f64, tcuda_negate_kernel, double)
+DEF_UNOP_T_WRAPPER(cuda_negate_f32, tcuda_negate_kernel, float)
+void cuda_negate_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_negate_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_negate_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_negate_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+/* Signed-int `abs` uses the wrapping kernel; unsigned `abs` is a no-op so
+   the dispatcher omits it. */
+DEF_UNOP_T_WRAPPER(cuda_abs_i8,  tcuda_abs_int_kernel, int8_t)
+DEF_UNOP_T_WRAPPER(cuda_abs_i16, tcuda_abs_int_kernel, int16_t)
+DEF_UNOP_T_WRAPPER(cuda_abs_i32, tcuda_abs_int_kernel, int32_t)
+DEF_UNOP_T_WRAPPER(cuda_abs_i64, tcuda_abs_int_kernel, int64_t)
+DEF_UNOP_T_WRAPPER(cuda_abs_f32, tcuda_abs_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_abs_f64, tcuda_abs_float_kernel, double)
+void cuda_abs_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_abs_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_abs_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_abs_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_sign_i8,  tcuda_sign_kernel, int8_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_u8,  tcuda_sign_kernel, uint8_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_i16, tcuda_sign_kernel, int16_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_u16, tcuda_sign_kernel, uint16_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_i32, tcuda_sign_kernel, int32_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_u32, tcuda_sign_kernel, uint32_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_i64, tcuda_sign_kernel, int64_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_u64, tcuda_sign_kernel, uint64_t)
+DEF_UNOP_T_WRAPPER(cuda_sign_f32, tcuda_sign_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_sign_f64, tcuda_sign_float_kernel, double)
+void cuda_sign_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_sign_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_sign_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_sign_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_square_i8,  tcuda_square_kernel, int8_t)
+DEF_UNOP_T_WRAPPER(cuda_square_u8,  tcuda_square_kernel, uint8_t)
+DEF_UNOP_T_WRAPPER(cuda_square_i16, tcuda_square_kernel, int16_t)
+DEF_UNOP_T_WRAPPER(cuda_square_u16, tcuda_square_kernel, uint16_t)
+DEF_UNOP_T_WRAPPER(cuda_square_i32, tcuda_square_kernel, int32_t)
+DEF_UNOP_T_WRAPPER(cuda_square_u32, tcuda_square_kernel, uint32_t)
+DEF_UNOP_T_WRAPPER(cuda_square_i64, tcuda_square_kernel, int64_t)
+DEF_UNOP_T_WRAPPER(cuda_square_u64, tcuda_square_kernel, uint64_t)
+/* Float square goes through the same kernel — multiplication is well-defined
+   on every float dtype and matches `x * x` exactly. */
+DEF_UNOP_T_WRAPPER(cuda_square_f32, tcuda_square_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_square_f64, tcuda_square_kernel, double)
+void cuda_square_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_square_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_square_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_square_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_recip_f32, tcuda_recip_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_recip_f64, tcuda_recip_float_kernel, double)
+void cuda_recip_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_recip_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_recip_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_recip_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_sqrt_f32, tcuda_sqrt_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_sqrt_f64, tcuda_sqrt_float_kernel, double)
+void cuda_sqrt_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_sqrt_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_sqrt_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_sqrt_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_rsqrt_f32, tcuda_rsqrt_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_rsqrt_f64, tcuda_rsqrt_float_kernel, double)
+void cuda_rsqrt_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_rsqrt_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_rsqrt_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_rsqrt_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+DEF_UNOP_T_WRAPPER(cuda_sinc_f32, tcuda_sinc_float_kernel, float)
+DEF_UNOP_T_WRAPPER(cuda_sinc_f64, tcuda_sinc_float_kernel, double)
+void cuda_sinc_f16(uint16_t *a, int n) {
+    GRID_FOR(n);
+    tcuda_sinc_half_kernel<<<numBlocks, blockSize>>>((__half *)a, n);
+}
+void cuda_sinc_dd(double *a, int n) {
+    GRID_FOR(n);
+    tcuda_sinc_dd_kernel<<<numBlocks, blockSize>>>(a, n);
+}
+
+#define DEF_CLIP_T_WRAPPER(NAME, T)                                                 \
+void NAME(T *a, T lo, T hi, int n) {                                                \
+    GRID_FOR(n);                                                                    \
+    tcuda_clip_kernel<T><<<numBlocks, blockSize>>>(a, lo, hi, n);                   \
+}
+DEF_CLIP_T_WRAPPER(cuda_clip_i8,  int8_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_u8,  uint8_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_i16, int16_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_u16, uint16_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_i32, int32_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_u32, uint32_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_i64, int64_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_u64, uint64_t)
+DEF_CLIP_T_WRAPPER(cuda_clip_f32, float)
+DEF_CLIP_T_WRAPPER(cuda_clip_f64, double)
+void cuda_clip_f16(uint16_t *a, float lo, float hi, int n) {
+    GRID_FOR(n);
+    tcuda_clip_half_kernel<<<numBlocks, blockSize>>>((__half *)a, lo, hi, n);
+}
+void cuda_clip_dd(double *a, double lo_hi, double lo_lo,
+                  double hi_hi, double hi_lo, int n) {
+    GRID_FOR(n);
+    tcuda_clip_dd_kernel<<<numBlocks, blockSize>>>(a, lo_hi, lo_lo, hi_hi, hi_lo, n);
+}
 
 /* float4 / float8 GPU casts. Names mirror the cuda_cast_<src>_to_<dst>
    convention. fp4 / fp8 storage on GPU is one byte per element. */
