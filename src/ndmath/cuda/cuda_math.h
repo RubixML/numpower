@@ -14,14 +14,7 @@ typedef void (*ElementWiseFloatGPUOperation1N)(int, float *, float *);
 NDArray* NDArrayMathGPU_ElementWise1N(NDArray* ndarray, ElementWiseFloatGPUOperation1N op, NDArray* val1);
 NDArray* NDArrayMathGPU_ElementWise(NDArray *ndarray, ElementWiseFloatGPUOperation op);
 void cuda_float_abs(int nblocks, float *d_array);
-void cuda_float_expm1(int nblocks, float *d_array);
-void cuda_float_exp(int nblocks, float *d_array);
 void cuda_float_sqrt(int nblocks, float *d_array);
-void cuda_float_log(int nblocks, float *d_array);
-void cuda_float_logb(int nblocks, float *d_array);
-void cuda_float_log2(int nblocks, float *d_array);
-void cuda_float_log1p(int nblocks, float *d_array);
-void cuda_float_log10(int nblocks, float *d_array);
 void cuda_add_float(int nblocks, float *a, float *b, float *rtn, int nelements);
 void cuda_subtract_float(int nblocks, float *a, float *b, float *rtn, int nelements);
 void cuda_divide_float(int nblocks, float *a, float *b, float *rtn, int nelements);
@@ -513,6 +506,50 @@ void cuda_sinc_f16(uint16_t *a, int n);
 void cuda_sinc_f32(float    *a, int n);
 void cuda_sinc_f64(double   *a, int n);
 void cuda_sinc_dd (double   *a, int n);
+
+/* Transcendental wrappers — exp/exp2/expm1/log/log1p/log2/log10/logb.
+   Buffer is updated in place; dispatch lives in
+   `unary_run_gpu_inplace`. Integer dtypes promote to float32/float64
+   upstream so these signatures cover every supported compute dtype. */
+void cuda_exp_f16(uint16_t *a, int n);
+void cuda_exp_f32(float    *a, int n);
+void cuda_exp_f64(double   *a, int n);
+void cuda_exp_dd (double   *a, int n);
+
+void cuda_exp2_f16(uint16_t *a, int n);
+void cuda_exp2_f32(float    *a, int n);
+void cuda_exp2_f64(double   *a, int n);
+void cuda_exp2_dd (double   *a, int n);
+
+void cuda_expm1_f16(uint16_t *a, int n);
+void cuda_expm1_f32(float    *a, int n);
+void cuda_expm1_f64(double   *a, int n);
+void cuda_expm1_dd (double   *a, int n);
+
+void cuda_log_f16(uint16_t *a, int n);
+void cuda_log_f32(float    *a, int n);
+void cuda_log_f64(double   *a, int n);
+void cuda_log_dd (double   *a, int n);
+
+void cuda_log1p_f16(uint16_t *a, int n);
+void cuda_log1p_f32(float    *a, int n);
+void cuda_log1p_f64(double   *a, int n);
+void cuda_log1p_dd (double   *a, int n);
+
+void cuda_log2_f16(uint16_t *a, int n);
+void cuda_log2_f32(float    *a, int n);
+void cuda_log2_f64(double   *a, int n);
+void cuda_log2_dd (double   *a, int n);
+
+void cuda_log10_f16(uint16_t *a, int n);
+void cuda_log10_f32(float    *a, int n);
+void cuda_log10_f64(double   *a, int n);
+void cuda_log10_dd (double   *a, int n);
+
+void cuda_logb_f16(uint16_t *a, int n);
+void cuda_logb_f32(float    *a, int n);
+void cuda_logb_f64(double   *a, int n);
+void cuda_logb_dd (double   *a, int n);
 
 void cuda_clip_i8 (int8_t   *a, int8_t   lo, int8_t   hi, int n);
 void cuda_clip_u8 (uint8_t  *a, uint8_t  lo, uint8_t  hi, int n);

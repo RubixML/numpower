@@ -8,14 +8,6 @@
 
 float float_abs(float val);
 float float_sqrt(float val);
-float float_exp(float val);
-float float_exp2(float val);
-float float_expm1(float val);
-float float_log(float val);
-float float_log2(float val);
-float float_log10(float val);
-float float_log1p(float val);
-float float_logb(float val);
 float float_sin(float val);
 float float_cos(float val);
 float float_tan(float val);

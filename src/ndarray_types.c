@@ -279,6 +279,131 @@ int ndarray_fp128_isnan(ndarray_fp128_t a) {
     return isnan((double)a);
 #  endif
 }
+
+/* ── Transcendental `__float128` helpers ──────────────────────────────────
+   Out-of-line wrappers around libquadmath's `expq`/`exp2q`/`expm1q`/`logq`/
+   `log1pq`/`log2q`/`log10q`/`logbq` so the libquadmath-vs-long-double
+   fallback choice is resolved once in this translation unit (where
+   `HAVE_QUADMATH` and `config.h` are in scope). Without these wrappers the
+   choice would re-resolve at every header include site and pick the
+   `long double` fallback whenever the includer pulled `ndarray_types.h`
+   via a transitive header before its own `#include "config.h"`. */
+
+/**
+ * @brief `exp(a)` at the highest precision the platform offers.
+ *
+ * Uses `expq` from libquadmath when available (full 113-bit fp128). Falls
+ * back to `expl((long double)a)` (~64 bits) when libquadmath is absent —
+ * the same fallback contract used for `ndarray_fp128_sqrt`.
+ *
+ * @param[in] a Input.
+ * @return `e^a` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_exp(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return expq(a);
+#  else
+    return (ndarray_fp128_t)expl((long double)a);
+#  endif
+}
+
+/**
+ * @brief `2^a` at fp128 precision.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input.
+ * @return `2^a` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_exp2(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return exp2q(a);
+#  else
+    return (ndarray_fp128_t)exp2l((long double)a);
+#  endif
+}
+
+/**
+ * @brief `e^a − 1` at fp128 precision, preserving precision near zero.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input.
+ * @return `e^a - 1` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_expm1(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return expm1q(a);
+#  else
+    return (ndarray_fp128_t)expm1l((long double)a);
+#  endif
+}
+
+/**
+ * @brief Natural logarithm `ln(a)` at fp128 precision.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input (positive for finite output).
+ * @return `ln(a)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_log(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return logq(a);
+#  else
+    return (ndarray_fp128_t)logl((long double)a);
+#  endif
+}
+
+/**
+ * @brief `ln(1 + a)` at fp128 precision, preserving precision near zero.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input (greater than -1 for finite output).
+ * @return `ln(1 + a)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_log1p(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return log1pq(a);
+#  else
+    return (ndarray_fp128_t)log1pl((long double)a);
+#  endif
+}
+
+/**
+ * @brief Base-2 logarithm `log₂(a)` at fp128 precision.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input (positive for finite output).
+ * @return `log₂(a)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_log2(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return log2q(a);
+#  else
+    return (ndarray_fp128_t)log2l((long double)a);
+#  endif
+}
+
+/**
+ * @brief Base-10 logarithm `log₁₀(a)` at fp128 precision.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input (positive for finite output).
+ * @return `log₁₀(a)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_log10(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return log10q(a);
+#  else
+    return (ndarray_fp128_t)log10l((long double)a);
+#  endif
+}
+
+/**
+ * @brief `logb(a)` at fp128 precision: floor(log2(|a|)) for normals.
+ * @see `ndarray_fp128_exp` for the libquadmath fallback contract.
+ * @param[in] a Input.
+ * @return `logb(a)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_logb(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return logbq(a);
+#  else
+    return (ndarray_fp128_t)logbl((long double)a);
+#  endif
+}
 #endif /* NDARRAY_HAVE_FLOAT128 */
 
 ndarray_fp128_t ndarray_double_to_fp128(double val) {

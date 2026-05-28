@@ -3323,10 +3323,11 @@ static int unary_is_wide_int_dtype(const char *dt) {
 /**
  * @brief Result dtype the unary op writes when applied to @p input_dt.
  *
- * sqrt/rsqrt/reciprocal/sinc promote integer inputs to a floating-point
- * dtype (PyTorch widening rule): narrow ints (`int8`..`uint16`) widen
- * to `float32`, the wider 32/64-bit ints widen to `float64`. Every
- * other op preserves the input dtype.
+ * sqrt/rsqrt/reciprocal/sinc/exp/exp2/expm1/log/log1p/log2/log10/logb
+ * promote integer inputs to a floating-point dtype (PyTorch widening
+ * rule): narrow ints (`int8`..`uint16`) widen to `float32`, the wider
+ * 32/64-bit ints widen to `float64`. Every other op preserves the
+ * input dtype.
  *
  * @param[in] op       Unary op selector.
  * @param[in] input_dt Source dtype string.
@@ -3338,6 +3339,14 @@ static const char *unary_result_dtype(NDArrayUnaryOp op, const char *input_dt) {
         case NDARRAY_UNOP_RSQRT:
         case NDARRAY_UNOP_RECIPROCAL:
         case NDARRAY_UNOP_SINC:
+        case NDARRAY_UNOP_EXP:
+        case NDARRAY_UNOP_EXP2:
+        case NDARRAY_UNOP_EXPM1:
+        case NDARRAY_UNOP_LOG:
+        case NDARRAY_UNOP_LOG2:
+        case NDARRAY_UNOP_LOG10:
+        case NDARRAY_UNOP_LOG1P:
+        case NDARRAY_UNOP_LOGB:
             if (unary_is_int_dtype(input_dt)) {
                 return unary_is_wide_int_dtype(input_dt)
                     ? NDARRAY_TYPE_FLOAT64
@@ -3413,11 +3422,19 @@ static const char *unary_compute_dtype(const char *result_dt) {
  * @brief CPU floating-point in-place unary loop (float32 / float64 templated).
  *
  * Handles every op including the ones that require floating-point math
- * (`sqrt`, `rsqrt`, `reciprocal`, `sinc`). Sign is implemented as the
+ * (`sqrt`, `rsqrt`, `reciprocal`, `sinc`, `exp`/`exp2`/`expm1`,
+ * `log`/`log1p`/`log2`/`log10`/`logb`). Sign is implemented as the
  * branchless three-way comparison so it returns +0/-0/+1/-1 in the
  * source dtype.
+ *
+ * The libm helpers are passed in by suffix-aware overload (`expf` /
+ * `exp` etc.) so the same macro instantiates against `float` and
+ * `double` without an extra typename hop.
  */
-#define UNARY_FLOAT_BODY(T, FN_SQRT, FN_SIN, FN_FABS, OP_TAG, LO_VAL, HI_VAL)         \
+#define UNARY_FLOAT_BODY(T, FN_SQRT, FN_SIN, FN_FABS,                                 \
+                         FN_EXP, FN_EXP2, FN_EXPM1,                                   \
+                         FN_LOG, FN_LOG1P, FN_LOG2, FN_LOG10, FN_LOGB,                \
+                         OP_TAG, LO_VAL, HI_VAL)                                      \
     do {                                                                              \
         T *p = (T *)data;                                                             \
         for (long i = 0; i < n; i++) {                                                \
@@ -3446,6 +3463,22 @@ static const char *unary_compute_dtype(const char *result_dt) {
                 case NDARRAY_UNOP_SQRT:        p[i] = FN_SQRT(x);                     \
                     break;                                                            \
                 case NDARRAY_UNOP_RSQRT:       p[i] = (T)1 / FN_SQRT(x);              \
+                    break;                                                            \
+                case NDARRAY_UNOP_EXP:         p[i] = FN_EXP(x);                      \
+                    break;                                                            \
+                case NDARRAY_UNOP_EXP2:        p[i] = FN_EXP2(x);                     \
+                    break;                                                            \
+                case NDARRAY_UNOP_EXPM1:       p[i] = FN_EXPM1(x);                    \
+                    break;                                                            \
+                case NDARRAY_UNOP_LOG:         p[i] = FN_LOG(x);                      \
+                    break;                                                            \
+                case NDARRAY_UNOP_LOG1P:       p[i] = FN_LOG1P(x);                    \
+                    break;                                                            \
+                case NDARRAY_UNOP_LOG2:        p[i] = FN_LOG2(x);                     \
+                    break;                                                            \
+                case NDARRAY_UNOP_LOG10:       p[i] = FN_LOG10(x);                    \
+                    break;                                                            \
+                case NDARRAY_UNOP_LOGB:        p[i] = FN_LOGB(x);                     \
                     break;                                                            \
                 case NDARRAY_UNOP_SINC: {                                             \
                     if (x == (T)0) p[i] = (T)1;                                       \
@@ -3611,11 +3644,17 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
     if (!strcmp(dt, "uint64")) { UNARY_INT_BODY(uint64_t, uint64_t, op, lo.u64, hi.u64); return 0; }
 
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) {
-        UNARY_FLOAT_BODY(float, sqrtf, sinf, fabsf, op, lo.f32, hi.f32);
+        UNARY_FLOAT_BODY(float, sqrtf, sinf, fabsf,
+                         expf, exp2f, expm1f,
+                         logf, log1pf, log2f, log10f, logbf,
+                         op, lo.f32, hi.f32);
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) {
-        UNARY_FLOAT_BODY(double, sqrt, sin, fabs, op, lo.f64, hi.f64);
+        UNARY_FLOAT_BODY(double, sqrt, sin, fabs,
+                         exp, exp2, expm1,
+                         log, log1p, log2, log10, logb,
+                         op, lo.f64, hi.f64);
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) {
@@ -3638,6 +3677,14 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                 case NDARRAY_UNOP_RECIPROCAL:  y = 1.0f / x; break;
                 case NDARRAY_UNOP_SQRT:        y = sqrtf(x); break;
                 case NDARRAY_UNOP_RSQRT:       y = 1.0f / sqrtf(x); break;
+                case NDARRAY_UNOP_EXP:         y = expf(x); break;
+                case NDARRAY_UNOP_EXP2:        y = exp2f(x); break;
+                case NDARRAY_UNOP_EXPM1:       y = expm1f(x); break;
+                case NDARRAY_UNOP_LOG:         y = logf(x); break;
+                case NDARRAY_UNOP_LOG1P:       y = log1pf(x); break;
+                case NDARRAY_UNOP_LOG2:        y = log2f(x); break;
+                case NDARRAY_UNOP_LOG10:       y = log10f(x); break;
+                case NDARRAY_UNOP_LOGB:        y = logbf(x); break;
                 case NDARRAY_UNOP_SINC:
                     if (x == 0.0f) y = 1.0f;
                     else { float px = 3.14159265358979323846f * x; y = sinf(px) / px; }
@@ -3685,6 +3732,14 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                 case NDARRAY_UNOP_RSQRT:
                     y = NDARRAY_FP128_DIV(NDARRAY_FP128_ONE(), NDARRAY_FP128_SQRT(x));
                     break;
+                case NDARRAY_UNOP_EXP:    y = NDARRAY_FP128_EXP(x);    break;
+                case NDARRAY_UNOP_EXP2:   y = NDARRAY_FP128_EXP2(x);   break;
+                case NDARRAY_UNOP_EXPM1:  y = NDARRAY_FP128_EXPM1(x);  break;
+                case NDARRAY_UNOP_LOG:    y = NDARRAY_FP128_LOG(x);    break;
+                case NDARRAY_UNOP_LOG1P:  y = NDARRAY_FP128_LOG1P(x);  break;
+                case NDARRAY_UNOP_LOG2:   y = NDARRAY_FP128_LOG2(x);   break;
+                case NDARRAY_UNOP_LOG10:  y = NDARRAY_FP128_LOG10(x);  break;
+                case NDARRAY_UNOP_LOGB:   y = NDARRAY_FP128_LOGB(x);   break;
                 case NDARRAY_UNOP_SINC: {
                     if (NDARRAY_FP128_ISZERO(x)) y = NDARRAY_FP128_ONE();
                     else {
@@ -3754,6 +3809,40 @@ static int unary_run_gpu_inplace(void *data, long n, const char *dt,
         memset(&hi, 0, sizeof(hi));
     }
     int ni = (int)n;
+
+    /* Transcendental dispatch (exp / exp2 / expm1 / log / log1p / log2 /
+       log10 / logb) — runs first because the existing `UNOP_GPU_DT`
+       macro's `default:` arm throws on unknown ops, which would block
+       us from extending it without re-typing every dtype line. Integer
+       inputs are promoted to fp32 / fp64 upstream by
+       `unary_result_dtype`, so only floating-point compute dtypes
+       reach this block. fp128 is handled in its own block below. */
+#define UNOP_GPU_TRANSC_DT(DTSTR, T, EXP, EXP2, EXPM1, LOG, LOG1P, LOG2, LOG10, LOGB) \
+    if (!strcmp(dt, DTSTR)) {                                                          \
+        T *p = (T *)data;                                                              \
+        switch (op) {                                                                  \
+            case NDARRAY_UNOP_EXP:   EXP  (p, ni); return 0;                           \
+            case NDARRAY_UNOP_EXP2:  EXP2 (p, ni); return 0;                           \
+            case NDARRAY_UNOP_EXPM1: EXPM1(p, ni); return 0;                           \
+            case NDARRAY_UNOP_LOG:   LOG  (p, ni); return 0;                           \
+            case NDARRAY_UNOP_LOG1P: LOG1P(p, ni); return 0;                           \
+            case NDARRAY_UNOP_LOG2:  LOG2 (p, ni); return 0;                           \
+            case NDARRAY_UNOP_LOG10: LOG10(p, ni); return 0;                           \
+            case NDARRAY_UNOP_LOGB:  LOGB (p, ni); return 0;                           \
+            default: break; /* fall through to UNOP_GPU_DT */                          \
+        }                                                                              \
+    }
+    UNOP_GPU_TRANSC_DT("float32", float,
+        cuda_exp_f32, cuda_exp2_f32, cuda_expm1_f32,
+        cuda_log_f32, cuda_log1p_f32, cuda_log2_f32, cuda_log10_f32, cuda_logb_f32)
+    UNOP_GPU_TRANSC_DT("float64", double,
+        cuda_exp_f64, cuda_exp2_f64, cuda_expm1_f64,
+        cuda_log_f64, cuda_log1p_f64, cuda_log2_f64, cuda_log10_f64, cuda_logb_f64)
+    UNOP_GPU_TRANSC_DT("float16", uint16_t,
+        cuda_exp_f16, cuda_exp2_f16, cuda_expm1_f16,
+        cuda_log_f16, cuda_log1p_f16, cuda_log2_f16, cuda_log10_f16, cuda_logb_f16)
+#undef UNOP_GPU_TRANSC_DT
+
 #define UNOP_GPU_DT(DTSTR, T, NEG, ABS, SIGN, RECIP, SQRT, RSQRT, SQUARE, SINC, CLIP) \
     if (!strcmp(dt, DTSTR)) {                                                          \
         T *p = (T *)data;                                                              \
@@ -3872,6 +3961,14 @@ static int unary_run_gpu_inplace(void *data, long n, const char *dt,
             case NDARRAY_UNOP_RSQRT:      cuda_rsqrt_dd(p, ni); break;
             case NDARRAY_UNOP_SQUARE:     cuda_square_dd(p, ni); break;
             case NDARRAY_UNOP_SINC:       cuda_sinc_dd (p, ni); break;
+            case NDARRAY_UNOP_EXP:        cuda_exp_dd   (p, ni); break;
+            case NDARRAY_UNOP_EXP2:       cuda_exp2_dd  (p, ni); break;
+            case NDARRAY_UNOP_EXPM1:      cuda_expm1_dd (p, ni); break;
+            case NDARRAY_UNOP_LOG:        cuda_log_dd   (p, ni); break;
+            case NDARRAY_UNOP_LOG1P:      cuda_log1p_dd (p, ni); break;
+            case NDARRAY_UNOP_LOG2:       cuda_log2_dd  (p, ni); break;
+            case NDARRAY_UNOP_LOG10:      cuda_log10_dd (p, ni); break;
+            case NDARRAY_UNOP_LOGB:       cuda_logb_dd  (p, ni); break;
             case NDARRAY_UNOP_CLIP:
                 cuda_clip_dd(p, lo_hi, lo_lo, hi_hi, hi_lo, ni); break;
             default:

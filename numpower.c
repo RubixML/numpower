@@ -49,9 +49,9 @@
 // float_cosh,     float_tanh,       float_arcsinh, float_arccosh, float_arctanh,
 // float_rint,     float_fix,        float_trunc,   float_sinc,    float_negate,
 // float_positive, float_reciprocal, float_sign,    float_clip,    float_ceil,
-// float_round,    float_floor,      float_radians, float_sqrt,    float_exp,
-// float_exp2,     float_expm1,      float_log,     float_logb,    float_log10,
-// float_log1p,    float_log2
+// float_round,    float_floor,      float_radians, float_sqrt,    float_abs
+// (exp/exp2/expm1/log/log1p/log2/log10/logb now live in the typed
+//  unary dispatcher — see src/ndmath/arithmetics.c)
 #include "src/ndmath/double_math.h"
 
 // NDArray_Matmul, NDArray_Inner,      NDArray_Outer, NDArray_Dot,   NDArray_Trace,
@@ -96,11 +96,12 @@
 #ifdef HAVE_CUBLAS
   // cuda_float_sin,        cuda_float_cos,     cuda_float_tan,     cuda_float_arcsin,  cuda_float_arccos,
   // cuda_float_arctan,     cuda_float_arctan2, cuda_float_degrees, cuda_float_sinh,    cuda_float_cosh,
-  // cuda_float_tanh,       cuda_float_arcsinh, cuda_float_arccosh, cuda_float_arctanh, cuda_float_rint, 
+  // cuda_float_tanh,       cuda_float_arcsinh, cuda_float_arccosh, cuda_float_arctanh, cuda_float_rint,
   // cuda_float_fix,        cuda_float_trunc,   cuda_float_sinc,    cuda_float_negate,  cuda_float_positive,
   // cuda_float_reciprocal, cuda_float_sign,    cuda_float_clip,    cuda_float_ceil,    cuda_float_round,
-  // cuda_float_floor,      cuda_float_radians, cuda_float_sqrt,    cuda_float_exp,     cuda_float_expm1, 
-  // cuda_float_log,        cuda_float_logb,    cuda_float_log10,   cuda_float_log1p,   cuda_float_log2
+  // cuda_float_floor,      cuda_float_radians, cuda_float_sqrt,    cuda_float_abs
+  // (cuda_exp/exp2/expm1/log/log1p/log2/log10/logb now per-dtype —
+  //  see src/ndmath/cuda/cuda_math.h transcendental section)
 # include "src/ndmath/cuda/cuda_math.h"
 
 // vmemcheck
@@ -4984,258 +4985,118 @@ PHP_METHOD(NumPower, square) {
 /**
  * NumPower::exp
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `e^x`. Integer inputs widen to float32 (narrow ints) or
+ * float64 (32/64-bit ints) per PyTorch widening; every other dtype is
+ * preserved. Computation stays on the input's device — GPU inputs are
+ * served by typed `cuda_exp_*` kernels (fp32 / fp64 / fp16 / dd for
+ * fp128) without CPU staging.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_exp, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, exp) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_exp);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_exp);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_EXP);
 }
 
 /**
  * NumPower::exp2
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `2^x`. Integer inputs widen to float32 (narrow ints)
+ * or float64 (32/64-bit ints) per PyTorch widening; every other dtype
+ * is preserved.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_exp2, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, exp2) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    rtn = NDArray_Map(nda, float_exp2);
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_EXP2);
 }
 
 /**
- * NumPower::exp2
+ * NumPower::expm1
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `e^x − 1` at higher precision than `exp(x) − 1` near
+ * zero. Same dtype/device contract as `NumPower::exp`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_expm1, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, expm1) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_expm1);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_expm1);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_EXPM1);
 }
 
 /**
  * NumPower::log
  *
- * @param execute_data
- * @param return_value
+ * Element-wise natural logarithm `ln(x)`. Same dtype/device contract
+ * as `NumPower::exp`; non-positive inputs return -inf or NaN per
+ * IEEE 754.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, log) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_log);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_log);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_LOG);
 }
 
 /**
  * NumPower::logb
  *
- * @param execute_data
- * @param return_value
+ * Element-wise floating-point binary exponent `logb(x)` = floor(log2(|x|))
+ * for normal numbers. Same dtype/device contract as `NumPower::exp`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_logb, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, logb) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_logb);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_logb);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    CHECK_INPUT_AND_FREE(array, nda);
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_LOGB);
 }
 
 /**
  * NumPower::log10
  *
- * @param execute_data
- * @param return_value
+ * Element-wise base-10 logarithm `log₁₀(x)`. Same dtype/device contract
+ * as `NumPower::exp`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log10, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, log10) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_log10);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_log10);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    CHECK_INPUT_AND_FREE(array, nda);
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_LOG10);
 }
 
 /**
  * NumPower::log1p
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `ln(1 + x)` at higher precision than `log(1 + x)` near
+ * zero. Same dtype/device contract as `NumPower::exp`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log1p, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, log1p) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_log1p);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_log1p);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    CHECK_INPUT_AND_FREE(array, nda);
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_LOG1P);
 }
 
 /**
- * NumPower::log1p
+ * NumPower::log2
  *
- * @param execute_data
- * @param return_value
+ * Element-wise base-2 logarithm `log₂(x)`. Same dtype/device contract
+ * as `NumPower::exp`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_log2, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, log2) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_log2);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_log2);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    CHECK_INPUT_AND_FREE(array, nda);
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_LOG2);
 }
 
 /**

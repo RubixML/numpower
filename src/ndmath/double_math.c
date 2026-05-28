@@ -23,80 +23,14 @@ float_sqrt(float val) {
 }
 
 /**
- * @param val
- * @return
- */
-float
-float_exp(float val) {
-    return expf(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_exp2(float val) {
-    return exp2f(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_expm1(float val) {
-    return expm1f(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_log(float val) {
-    return logf(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_log10(float val) {
-    return log10f(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_log1p(float val) {
-    return log1pf(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_logb(float val) {
-    return logbf(val);
-}
-
-/**
- * @param val
- * @return
- */
-float
-float_log2(float val) {
-    return log2f(val);
-}
-
-/**
- * @param val
- * @return
+ * @brief Compute `sin(val)` at float precision.
+ *
+ * Kept for the legacy `NDArray_Map(arr, float_sin)` callers in the
+ * trigonometry path; the exp/log family has been fully replaced by
+ * the typed unary dispatcher and no longer needs scalar helpers.
+ *
+ * @param[in] val Input.
+ * @return `sinf(val)`.
  */
 float float_sin(float val) {
     return sinf(val);

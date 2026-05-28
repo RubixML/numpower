@@ -52,9 +52,25 @@ uint16_t ndarray_double_to_fp16(double val);
       `#include "config.h"`. */
    ndarray_fp128_t ndarray_fp128_sqrt(ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_sin (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_exp  (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_exp2 (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_expm1(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_log  (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_log1p(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_log2 (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_log10(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_logb (ndarray_fp128_t a);
    int             ndarray_fp128_isnan(ndarray_fp128_t a);
 #  define NDARRAY_FP128_SQRT(a)     ndarray_fp128_sqrt(a)
 #  define NDARRAY_FP128_SIN(a)      ndarray_fp128_sin(a)
+#  define NDARRAY_FP128_EXP(a)      ndarray_fp128_exp(a)
+#  define NDARRAY_FP128_EXP2(a)     ndarray_fp128_exp2(a)
+#  define NDARRAY_FP128_EXPM1(a)    ndarray_fp128_expm1(a)
+#  define NDARRAY_FP128_LOG(a)      ndarray_fp128_log(a)
+#  define NDARRAY_FP128_LOG1P(a)    ndarray_fp128_log1p(a)
+#  define NDARRAY_FP128_LOG2(a)     ndarray_fp128_log2(a)
+#  define NDARRAY_FP128_LOG10(a)    ndarray_fp128_log10(a)
+#  define NDARRAY_FP128_LOGB(a)     ndarray_fp128_logb(a)
 #  define NDARRAY_FP128_ISNAN(a)    ndarray_fp128_isnan(a)
 #  define NDARRAY_FP128_FROM_D(d)   ((ndarray_fp128_t)(d))
 #  define NDARRAY_FP128_FROM_LD(ld) ((ndarray_fp128_t)(ld))
@@ -88,6 +104,20 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_ABS(a)      ndarray_dd_abs(a)
 #  define NDARRAY_FP128_SQRT(a)     ndarray_dd_sqrt(a)
 #  define NDARRAY_FP128_SIN(a)      ndarray_dd_from_double(sin(ndarray_dd_to_double(a)))
+   /* Transcendental fp128 ops on the DD backend route through `double`
+      so the macro contract stays platform-portable; accuracy is the same
+      tier as the GPU `dd_*` reference path that already promotes
+      `dd → double → libm → dd` for sin/cos/exp/log. Linux GCC x86-64 with
+      libquadmath is the only configuration that yields full 113-bit
+      transcendentals — every other platform tops out at fp64 here. */
+#  define NDARRAY_FP128_EXP(a)      ndarray_dd_from_double(exp(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_EXP2(a)     ndarray_dd_from_double(exp2(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_EXPM1(a)    ndarray_dd_from_double(expm1(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_LOG(a)      ndarray_dd_from_double(log(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_LOG1P(a)    ndarray_dd_from_double(log1p(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_LOG2(a)     ndarray_dd_from_double(log2(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_LOG10(a)    ndarray_dd_from_double(log10(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_LOGB(a)     ndarray_dd_from_double(logb(ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_EQ(a, b)    (ndarray_dd_cmp((a), (b)) == 0)
 #  define NDARRAY_FP128_LT(a, b)    (ndarray_dd_cmp((a), (b)) <  0)
 #  define NDARRAY_FP128_ISZERO(a)   ndarray_dd_iszero(a)
