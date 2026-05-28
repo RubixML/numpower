@@ -1710,10 +1710,11 @@ DD_UNOP_KERNEL(tcuda_sinc_dd_kernel,   dd_sinc(x))
    runs the libdevice intrinsic, and writes the result back as a DD pair
    with a zero `lo` word. The accuracy ceiling is therefore fp64 (~15.95
    decimal digits) regardless of how many DD bits the host packed in,
-   matching the documented contract for `dd_sin` / `dd_sinc` and
-   `dd_pow`. Full 113-bit transcendentals require libquadmath on the
-   CPU side (Linux GCC x86-64); GPU compute stops at the libdevice fp64
-   intrinsics. */
+   matching the contract of the existing GPU `dd_sinc` (`tcuda_sinc_dd_kernel`)
+   and `dd_pow` (`tcuda_pow_dd_kernel`) reference paths above, which
+   likewise route through fp64. Full 113-bit transcendentals require
+   libquadmath on the CPU side (Linux GCC x86-64); GPU compute stops at
+   the libdevice fp64 intrinsics. */
 DD_UNOP_KERNEL(tcuda_exp_dd_kernel,    dd_make(exp  (dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_exp2_dd_kernel,   dd_make(exp2 (dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_expm1_dd_kernel,  dd_make(expm1(dd_to_double(x)), 0.0))

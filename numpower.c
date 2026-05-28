@@ -44,14 +44,11 @@
 // NDArray_ColumnStack, NDArray_ConcatenateFlat, NDArray_Concatenate, NDArray_Slice
 #include "src/manipulation.h"
 
-// float_sin,      float_cos,        float_tan,     float_arcsin,  float_rsqrt,
-// float_arccos,   float_arctan,     float_arctan2, float_degrees, float_sinh,
-// float_cosh,     float_tanh,       float_arcsinh, float_arccosh, float_arctanh,
-// float_rint,     float_fix,        float_trunc,   float_sinc,    float_negate,
-// float_positive, float_reciprocal, float_sign,    float_clip,    float_ceil,
-// float_round,    float_floor,      float_radians, float_sqrt,    float_abs
-// (exp/exp2/expm1/log/log1p/log2/log10/logb now live in the typed
-//  unary dispatcher — see src/ndmath/arithmetics.c)
+// Live exports of double_math.h: float_abs, float_sqrt, float_round
+// (precision arg, legacy), float_arctan2 (binary, legacy).
+// Every other float_* scalar helper (sin/cos/.../floor/ceil + exp/log
+// family + sinc + negate/positive/sign/clip/reciprocal/rsqrt) was
+// retired by the typed-unary dispatcher in src/ndmath/arithmetics.c.
 #include "src/ndmath/double_math.h"
 
 // NDArray_Matmul, NDArray_Inner,      NDArray_Outer, NDArray_Dot,   NDArray_Trace,
@@ -94,14 +91,13 @@
 #include "src/ndarray/frontend/manipulations.h"
 
 #ifdef HAVE_CUBLAS
-  // cuda_float_sin,        cuda_float_cos,     cuda_float_tan,     cuda_float_arcsin,  cuda_float_arccos,
-  // cuda_float_arctan,     cuda_float_arctan2, cuda_float_degrees, cuda_float_sinh,    cuda_float_cosh,
-  // cuda_float_tanh,       cuda_float_arcsinh, cuda_float_arccosh, cuda_float_arctanh, cuda_float_rint,
-  // cuda_float_fix,        cuda_float_trunc,   cuda_float_sinc,    cuda_float_negate,  cuda_float_positive,
-  // cuda_float_reciprocal, cuda_float_sign,    cuda_float_clip,    cuda_float_ceil,    cuda_float_round,
-  // cuda_float_floor,      cuda_float_radians, cuda_float_sqrt,    cuda_float_abs
-  // (cuda_exp/exp2/expm1/log/log1p/log2/log10/logb now per-dtype —
-  //  see src/ndmath/cuda/cuda_math.h transcendental section)
+  // Live cuda_float_* exports: cuda_float_abs, cuda_float_sqrt,
+  // cuda_float_round (precision arg, legacy), cuda_float_arctan2
+  // (binary, legacy). All other cuda_float_* trig / hyperbolic /
+  // angle / rounding / sinc / negate / positive / sign / clip /
+  // reciprocal / rsqrt helpers were retired by the typed-unary
+  // GPU dispatcher (`cuda_<op>_{f16,f32,f64,dd}` per-dtype kernels)
+  // — see the transcendental section in src/ndmath/cuda/cuda_math.h.
 # include "src/ndmath/cuda/cuda_math.h"
 
 // vmemcheck
@@ -3498,10 +3494,23 @@ PHP_METHOD(NumPower, flatten) {
 }
 
 /**
- * @brief Run a typed unary op (`abs`, `negative`, `positive`,
- *        `reciprocal`, `sign`, `sqrt`, `rsqrt`, `square`, `sinc`,
- *        `exp`, `exp2`, `expm1`, `log`, `log1p`, `log2`, `log10`,
- *        `logb`) on a single zval argument and install the result.
+ * @brief Run a typed unary op on a single zval argument and install
+ *        the result.
+ *
+ * Covers every op enumerated by `NDArrayUnaryOp` that takes exactly
+ * one NDArray input and no extra parameters: the basic family (`abs`,
+ * `negative`, `positive`, `reciprocal`, `sign`, `sqrt`, `rsqrt`,
+ * `square`, `sinc`), the transcendental family (`exp`, `exp2`,
+ * `expm1`, `log`, `log1p`, `log2`, `log10`, `logb`), the
+ * trigonometric / hyperbolic family (`sin`, `cos`, `tan`, `arcsin`,
+ * `arccos`, `arctan`, `sinh`, `cosh`, `tanh`, `arcsinh`, `arccosh`,
+ * `arctanh`), the angle-conversion ops (`degrees`, `radians`), and
+ * the rounding ops (`rint`, `fix`, `trunc`, `floor`, `ceil`).
+ *
+ * The clip op uses its own entry because of the lo / hi parameters;
+ * `arctan2` (binary) and `round` (precision param) likewise still
+ * ride bespoke entry points until the dispatcher grows
+ * binary-unary / extra-arg support.
  *
  * Centralises the PHP-binding plumbing every unary method needs:
  *  - resolves the input zval to an NDArray (array / int / float / NDArray);
@@ -3635,8 +3644,9 @@ PHP_METHOD(NumPower, rsqrt) {
 /**
  * NumPower::arccos
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `arccos(x)` (inverse cosine). Same dtype / device
+ * contract as `NumPower::sin`. Inputs outside [-1, 1] return NaN
+ * per IEEE 754; result range is [0, π].
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arccos, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
@@ -3663,8 +3673,13 @@ PHP_METHOD(NumPower, arctan) {
 /**
  * NumPower::arctan2
  *
- * @param execute_data
- * @param return_value
+ * Two-argument arctangent `atan2(x, y)` element-wise. Returns the
+ * angle in radians between the positive x-axis and the point `(y, x)`,
+ * choosing the quadrant from the signs of both args.
+ *
+ * Out of scope of the typed-unary refactor — `arctan2` is a binary op
+ * and still rides the legacy `NDArray_Map1ND` / `cuda_float_arctan2`
+ * path which assumes float32. See [[sin-cos-trig-dtype-bug]] follow-up.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctan2, 0, 0, 2)
     ZEND_ARG_INFO(0, x)
@@ -3678,8 +3693,12 @@ PHP_METHOD(NumPower, arctan2) {
             Z_PARAM_ZVAL(y)
     ZEND_PARSE_PARAMETERS_END();
     NDArray *ndx = ZVAL_TO_NDARRAY(x);
+    if (ndx == NULL) {
+        return;
+    }
     NDArray *ndy = ZVAL_TO_NDARRAY(y);
-    if (x == NULL || y == NULL) {
+    if (ndy == NULL) {
+        CHECK_INPUT_AND_FREE(x, ndx);
         return;
     }
 
@@ -3700,8 +3719,9 @@ PHP_METHOD(NumPower, arctan2) {
 /**
  * NumPower::degrees
  *
- * @param execute_data
- * @param return_value
+ * Element-wise radians → degrees conversion (multiplies by 180/π).
+ * Integer inputs widen to float32 (narrow) / float64 (32/64-bit) per
+ * PyTorch widening; every floating-point dtype is preserved.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_degrees, 0, 0, 1)
 ZEND_ARG_INFO(0, array)

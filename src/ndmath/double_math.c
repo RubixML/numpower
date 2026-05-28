@@ -39,8 +39,9 @@ float_sqrt(float val) {
  *
  * Kept on the legacy `NDArray_Map1F` path because `NumPower::round`
  * accepts an extra precision argument that the typed unary
- * dispatcher does not yet support. See [[sin-cos-trig-dtype-bug]]
- * for context.
+ * dispatcher does not yet support. Like every legacy `NDArray_Map*`
+ * caller, this silently truncates non-fp32 inputs to fp32 — a known
+ * carry-over from the trig family bug fix that is out of scope here.
  *
  * @param[in] number   Input value.
  * @param[in] decimals Number of decimal places to keep.

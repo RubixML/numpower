@@ -122,6 +122,13 @@ typedef enum {
     NDARRAY_UNOP_LOG10,
     NDARRAY_UNOP_LOG1P,
     NDARRAY_UNOP_LOGB,
+    /* ── Trig / hyperbolic / angle / rounding block ──────────────────────
+       The contiguous range `[SIN, CEIL]` is required by
+       `unary_op_is_trig` in src/ndmath/arithmetics.c, which uses a single
+       range check (`op >= SIN && op <= CEIL`) to pick `UNARY_TRIG_BODY`
+       over `UNARY_FLOAT_BODY`. New ops inserted between `SIN` and `CEIL`
+       must also live in `UNARY_TRIG_BODY`'s switch; new non-trig ops
+       must NOT land inside this block. */
     /* Trigonometric */
     NDARRAY_UNOP_SIN,
     NDARRAY_UNOP_COS,
