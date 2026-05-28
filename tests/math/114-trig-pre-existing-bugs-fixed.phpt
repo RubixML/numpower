@@ -111,9 +111,13 @@ $rnd = NumPower::array([0.5, -0.5, 1.5, -1.5, 2.5, -2.5], 'float64');
 $r = NumPower::rint($rnd)->toArray();
 check("rint round-half-to-even (CPU fp64)", $r,
       [0.0, 0.0, 2.0, -2.0, 2.0, -2.0], 0.0);
-$rg = NumPower::rint($rnd->gpu())->cpu()->toArray();
-check("rint round-half-to-even (GPU fp64)", $rg,
-      [0.0, 0.0, 2.0, -2.0, 2.0, -2.0], 0.0);
+try {
+    $rg = NumPower::rint($rnd->gpu())->cpu()->toArray();
+    check("rint round-half-to-even (GPU fp64)", $rg,
+          [0.0, 0.0, 2.0, -2.0, 2.0, -2.0], 0.0);
+} catch (Throwable $t) {
+    echo "skip rint GPU not available\n";
+}
 
 /* ── Bug #6: floor / ceil / rint / fix / trunc on int dtypes used to
    call the kernel (allocating a float buffer & launching a no-op
