@@ -69,11 +69,15 @@ if (abs($sq_f64[1] - (1.0e14 - 1.0e7 + 0.25)) < 100)
 else
     echo "FAIL square f64: got=", $sq_f64[1], "\n";
 
-/* fp128: 32-digit precision survives end-to-end. */
+/* fp128: 30-digit precision survives end-to-end.
+   libquadmath outputs the expanded form '1234567890...01.23',
+   DD emulation outputs scientific '1.2345...012e+30'; strip
+   non-digits so we compare the underlying digit sequence. */
 $f128 = NumPower::array(['1.23456789012345678901234567890123e30'], 'float128');
 $abs_f128 = NumPower::abs($f128)->toArray();
 $exp = '1234567890123456789012345678901';   /* 31 sig-digits */
-if (str_starts_with($abs_f128[0], substr($exp, 0, 30)))
+$digits_only = preg_replace('/[^0-9]/', '', $abs_f128[0]);
+if (str_starts_with($digits_only, substr($exp, 0, 30)))
     echo "OK abs preserves fp128 precision\n";
 else
     echo "FAIL abs fp128: got=", $abs_f128[0], "\n";

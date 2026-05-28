@@ -37,11 +37,16 @@ echo "clip float bounds: ", json_encode($out), "\n";
 $out = NumPower::clip($arr, '-1.0', '2.0')->toArray();
 echo "clip string bounds: ", json_encode($out), "\n";
 
-/* fp128 with full-precision string bounds. */
+/* fp128 with full-precision string bounds. libquadmath and DD emulation
+   stringify large fp128 values differently ('1e+29' vs '100...000'),
+   so verify per-element with a portable form rather than print_r. */
 $f = NumPower::array(['-1e30', '0', '1e30',
                        '1.23456789012345678901234567890123e29'], 'float128');
 $cl = NumPower::clip($f, '0', '1e29')->toArray();
-print_r($cl);
+echo "fp128 clip[0]: ", ((float)$cl[0] === 0.0) ? "0" : "?{$cl[0]}", "\n";
+echo "fp128 clip[1]: ", ((float)$cl[1] === 0.0) ? "0" : "?{$cl[1]}", "\n";
+echo "fp128 clip[2]: ", (abs(((float)$cl[2]) / 1e29 - 1.0) < 1e-10) ? "1e29" : "?{$cl[2]}", "\n";
+echo "fp128 clip[3]: ", (abs(((float)$cl[3]) / 1e29 - 1.0) < 1e-10) ? "1e29" : "?{$cl[3]}", "\n";
 
 /* uint64 with bounds beyond PHP int range. */
 $u = NumPower::array(['0', '9223372036854775807', '18446744073709551615'], 'uint64');
@@ -64,13 +69,10 @@ OK clip([1],'','5'): NDArray clip: 'min' is empty.
 clip int bounds: [-1,0.5,2]
 clip float bounds: [-1.5,0.5,2.5]
 clip string bounds: [-1,0.5,2]
-Array
-(
-    [0] => 0
-    [1] => 0
-    [2] => 100000000000000000000000000000
-    [3] => 100000000000000000000000000000
-)
+fp128 clip[0]: 0
+fp128 clip[1]: 0
+fp128 clip[2]: 1e29
+fp128 clip[3]: 1e29
 Array
 (
     [0] => 9223372036854775806

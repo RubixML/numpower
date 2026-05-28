@@ -109,7 +109,11 @@ check("3-D int32 abs", NumPower::abs($nd3)->toArray(), [[[2, 1], [0, 1]]]);
 /* ── float128 ─────────────────────────────────────────────────────────── */
 $f128 = NumPower::array(['-1.5', '2.25', '0'], 'float128');
 check("fp128 abs",  NumPower::abs($f128)->toArray(),       ['1.5', '2.25', '0']);
-check("fp128 neg",  NumPower::negative($f128)->toArray(),  ['1.5', '-2.25', '-0']);
+/* DD emulation (macOS) canonicalizes -0 to +0; libquadmath (Linux) keeps -0. */
+$_neg = NumPower::negative($f128)->toArray();
+$_ok  = ($_neg[0] === '1.5' && $_neg[1] === '-2.25'
+         && ($_neg[2] === '-0' || $_neg[2] === '0'));
+echo $_ok ? "OK fp128 neg\n" : "FAIL fp128 neg: got=" . json_encode($_neg) . "\n";
 check("fp128 sign", NumPower::sign($f128)->toArray(),      ['-1', '1', '0']);
 check("fp128 sq",   NumPower::square($f128)->toArray(),    ['2.25', '5.0625', '0']);
 check("fp128 sqrt", NumPower::sqrt(NumPower::array(['16', '25'], 'float128'))->toArray(), ['4', '5']);
