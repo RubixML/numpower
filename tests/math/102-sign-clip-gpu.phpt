@@ -1,13 +1,13 @@
 --TEST--
-PyTorch parity for sign(NaN) and clamp/clip NaN-bounds / lo > hi semantics (GPU)
+sign(NaN) and clip NaN-bounds / lo > hi semantics (GPU)
 --SKIPIF--
 <?php
 try { (new NDArray([1.0]))->gpu(); } catch (\Error $e) { die('skip ' . $e->getMessage()); }
 ?>
 --FILE--
 <?php
-/* GPU half of 101-pytorch-parity-sign-clip.phpt. Skipped without a CUDA
-   device — same PyTorch contract, same fp128 DD emulation path. */
+/* GPU half of 101-sign-clip.phpt. Skipped without a CUDA device —
+   same semantic contract, same fp128 DD emulation path. */
 
 function approx($a, $b, $tol = 1e-5) {
     if (is_nan((float)$a) && is_nan((float)$b)) return true;

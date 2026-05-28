@@ -1,16 +1,16 @@
 --TEST--
-PyTorch parity for sign(NaN) and clamp/clip NaN-bounds / lo > hi semantics (CPU)
+sign(NaN) and clip NaN-bounds / lo > hi semantics (CPU)
 --FILE--
 <?php
-/* PyTorch contract (Tensor methods):
-   - torch.sign(NaN) returns NaN — IEEE-754-style propagation.
+/* Semantic contract:
+   - sign(NaN) returns NaN — IEEE-754-style propagation.
      Our prior `(x > 0) - (x < 0)` idiom returned 0 instead, which
      silently zero-ed out NaN inputs on every float dtype CPU + GPU.
-   - torch.clamp(x, lo, hi) = std::min(std::max(x, lo), hi):
+   - clip(x, lo, hi) = min(max(x, lo), hi):
        • NaN in `x` propagates to the result;
        • NaN in `lo` or `hi` is swallowed (the value survives);
        • lo > hi → result is `hi`.
-   CPU half lives here; the GPU half is 102-pytorch-parity-sign-clip-gpu.phpt. */
+   CPU half lives here; the GPU half is 102-sign-clip-gpu.phpt. */
 
 function approx($a, $b, $tol = 1e-5) {
     if (is_nan((float)$a) && is_nan((float)$b)) return true;
