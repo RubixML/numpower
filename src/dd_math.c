@@ -176,6 +176,55 @@ ndarray_dd_t ndarray_dd_pow(ndarray_dd_t a, ndarray_dd_t b) {
     return ndarray_dd_from_double(pow(a.hi, b.hi));
 }
 
+/* ── sqrt / rsqrt ──────────────────────────────────────────────────────── */
+
+/**
+ * @brief Double-double square root.
+ *
+ * Computes sqrt(a) to ~106-bit precision via a single Newton refinement
+ * step starting from a fp64 seed. Identity:
+ *   y' = 0.5 * (y + a / y)
+ * Carried out in DD so the residual `a - y*y` is captured exactly.
+ *
+ * NaN propagation: returns NaN for any input with `hi < 0` or NaN.
+ * Zero is preserved exactly (no division by zero).
+ *
+ * @param[in] a Non-negative DD input.
+ * @return DD square root of @p a.
+ */
+ndarray_dd_t ndarray_dd_sqrt(ndarray_dd_t a) {
+    if (a.hi == 0.0 && a.lo == 0.0) return a;
+    if (a.hi < 0.0 || ndarray_dd_isnan(a)) {
+        return ndarray_dd_from_double(NAN);
+    }
+    double y = sqrt(a.hi);
+    /* y' = y + (a - y*y) / (2*y) — refines the seed from fp64 (53-bit) to
+       full DD precision in one pass. */
+    ndarray_dd_t y_dd  = ndarray_dd_from_double(y);
+    ndarray_dd_t y_sq  = ndarray_dd_mul(y_dd, y_dd);
+    ndarray_dd_t diff  = ndarray_dd_sub(a, y_sq);
+    ndarray_dd_t denom = ndarray_dd_from_double(2.0 * y);
+    ndarray_dd_t corr  = ndarray_dd_div(diff, denom);
+    return ndarray_dd_add(y_dd, corr);
+}
+
+/**
+ * @brief Double-double reciprocal square root, `1 / sqrt(a)`.
+ *
+ * Implemented as `1.0 / sqrt(a)` rather than a fused Newton step on
+ * `1/sqrt` because the DD division and DD sqrt are both already
+ * iteratively refined; chaining them keeps the implementation small
+ * without measurably worse precision than the fused form.
+ *
+ * @param[in] a Positive DD input.
+ * @return DD reciprocal square root of @p a; +inf for zero, NaN for
+ *         negative.
+ */
+ndarray_dd_t ndarray_dd_rsqrt(ndarray_dd_t a) {
+    ndarray_dd_t r = ndarray_dd_sqrt(a);
+    return ndarray_dd_div(ndarray_dd_from_double(1.0), r);
+}
+
 /* ── int conversion ─────────────────────────────────────────────────────── */
 
 long long ndarray_dd_to_int64(ndarray_dd_t a) {

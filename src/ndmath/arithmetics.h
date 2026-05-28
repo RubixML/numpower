@@ -91,4 +91,44 @@ NDArray* NDArray_TypedBinOp_CPU_Int(int opcode, NDArray* a, NDArray* b);
 
 NDArray* NDArray_Add(NDArray* a, NDArray* b);
 
+/* ── Typed unary dispatch ────────────────────────────────────────────────────
+   Element-wise unary operations dispatched across every supported dtype
+   (`float4`..`float128`, `int8`..`uint64`) for both CPU and GPU residency.
+   The dispatcher decides result dtype per op (sqrt/rsqrt/reciprocal/sinc
+   promote integer inputs to floating-point per PyTorch widening rules; the
+   remaining ops preserve the input dtype), allocates the destination buffer
+   on the input's device, and runs the typed kernel without a CPU fallback
+   for GPU-resident inputs.
+
+   `clip_min` / `clip_max` are decimal strings parsed losslessly into the
+   computed dtype (so `float128`/`uint64` survive end-to-end). For ops other
+   than `NDARRAY_UNOP_CLIP` both may be NULL. */
+typedef enum {
+    NDARRAY_UNOP_ABS = 0,
+    NDARRAY_UNOP_NEGATIVE,
+    NDARRAY_UNOP_POSITIVE,
+    NDARRAY_UNOP_RECIPROCAL,
+    NDARRAY_UNOP_SIGN,
+    NDARRAY_UNOP_SQRT,
+    NDARRAY_UNOP_RSQRT,
+    NDARRAY_UNOP_SQUARE,
+    NDARRAY_UNOP_CLIP,
+    NDARRAY_UNOP_SINC
+} NDArrayUnaryOp;
+
+/**
+ * @brief Dispatch the typed unary op @p op on @p nda.
+ *
+ * @param[in] op       Operation selector (see `NDArrayUnaryOp`).
+ * @param[in] nda      Input NDArray on either device.
+ * @param[in] clip_min Decimal string for the lower clamp; NULL unless
+ *                     @p op is `NDARRAY_UNOP_CLIP`.
+ * @param[in] clip_max Decimal string for the upper clamp; NULL unless
+ *                     @p op is `NDARRAY_UNOP_CLIP`.
+ * @return Caller-owned result NDArray on the same device as @p nda, or
+ *         NULL on error (PHP exception in flight).
+ */
+NDArray *NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
+                              const char *clip_min, const char *clip_max);
+
 #endif //PHPSCI_NDARRAY_ARITHMETICS_H

@@ -227,6 +227,60 @@ uint16_t ndarray_double_to_fp16(double val) {
    chosen storage can represent.
    ══════════════════════════════════════════════════════════════════════════ */
 
+#if NDARRAY_HAVE_FLOAT128
+/**
+ * @brief Square root of an `__float128` value at the highest precision the
+ *        platform offers.
+ *
+ * Uses `sqrtq` from libquadmath when present (full 113-bit precision,
+ * matching CPU `__float128` exactly). Falls back to `sqrtl((long double)x)`
+ * when libquadmath is absent — this branch is only reachable on
+ * misconfigured builds; precision drops to ~64 bits.
+ *
+ * Calling through this out-of-line helper (rather than expanding the
+ * `#if` at every header include site) ensures the libquadmath choice is
+ * made once when this translation unit is compiled with `config.h`
+ * already in scope.
+ *
+ * @param[in] a Input.
+ * @return Square root of @p a in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_sqrt(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return sqrtq(a);
+#  else
+    return (ndarray_fp128_t)sqrtl((long double)a);
+#  endif
+}
+
+/**
+ * @brief Sine of an `__float128` value at the highest available precision.
+ *        See `ndarray_fp128_sqrt` for the libquadmath-vs-fallback contract.
+ * @param[in] a Input in radians.
+ * @return sin(@p a) in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_sin(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return sinq(a);
+#  else
+    return (ndarray_fp128_t)sinl((long double)a);
+#  endif
+}
+
+/**
+ * @brief NaN detection for `__float128`. Returns 1 for NaN, 0 otherwise.
+ * @param[in] a Input.
+ * @return Non-zero iff @p a is NaN.
+ */
+int ndarray_fp128_isnan(ndarray_fp128_t a) {
+#  if HAVE_QUADMATH
+    return isnanq(a);
+#  else
+    return isnan((double)a);
+#  endif
+}
+#endif /* NDARRAY_HAVE_FLOAT128 */
+
 ndarray_fp128_t ndarray_double_to_fp128(double val) {
     return NDARRAY_FP128_FROM_D(val);
 }

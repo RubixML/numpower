@@ -436,6 +436,99 @@ void cuda_div_dd(double *a, double *b, double *rtn, int n);
 void cuda_pow_dd(double *a, double *b, double *rtn, int n);
 void cuda_mod_dd(double *a, double *b, double *rtn, int n);
 
+/* ── Typed unary in-place kernels ───────────────────────────────────────────
+   Element-wise unary ops parameterised by dtype. Each wrapper runs the
+   computation in place on a device buffer of @p n elements (`2*n` doubles
+   for the `_dd` flavours, which interleave (hi, lo)). The dispatcher
+   (`NDArray_TypedUnaryOp`) prepares the buffer via `NDArray_Copy` or
+   `NDArray_AsType` before launch.
+
+   Sign / abs / square / negate / clip preserve the input dtype. Sqrt,
+   rsqrt, reciprocal and sinc only have float instantiations — the
+   dispatcher promotes integer inputs to `float32`/`float64` upstream. */
+void cuda_negate_i8 (int8_t   *a, int n);
+void cuda_negate_u8 (uint8_t  *a, int n);
+void cuda_negate_i16(int16_t  *a, int n);
+void cuda_negate_u16(uint16_t *a, int n);
+void cuda_negate_i32(int32_t  *a, int n);
+void cuda_negate_u32(uint32_t *a, int n);
+void cuda_negate_i64(int64_t  *a, int n);
+void cuda_negate_u64(uint64_t *a, int n);
+void cuda_negate_f16(uint16_t *a, int n);
+void cuda_negate_f32(float    *a, int n);
+void cuda_negate_f64(double   *a, int n);
+void cuda_negate_dd (double   *a, int n);
+
+void cuda_abs_i8 (int8_t  *a, int n);
+void cuda_abs_i16(int16_t *a, int n);
+void cuda_abs_i32(int32_t *a, int n);
+void cuda_abs_i64(int64_t *a, int n);
+void cuda_abs_f16(uint16_t *a, int n);
+void cuda_abs_f32(float   *a, int n);
+void cuda_abs_f64(double  *a, int n);
+void cuda_abs_dd (double  *a, int n);
+
+void cuda_sign_i8 (int8_t   *a, int n);
+void cuda_sign_u8 (uint8_t  *a, int n);
+void cuda_sign_i16(int16_t  *a, int n);
+void cuda_sign_u16(uint16_t *a, int n);
+void cuda_sign_i32(int32_t  *a, int n);
+void cuda_sign_u32(uint32_t *a, int n);
+void cuda_sign_i64(int64_t  *a, int n);
+void cuda_sign_u64(uint64_t *a, int n);
+void cuda_sign_f16(uint16_t *a, int n);
+void cuda_sign_f32(float    *a, int n);
+void cuda_sign_f64(double   *a, int n);
+void cuda_sign_dd (double   *a, int n);
+
+void cuda_square_i8 (int8_t   *a, int n);
+void cuda_square_u8 (uint8_t  *a, int n);
+void cuda_square_i16(int16_t  *a, int n);
+void cuda_square_u16(uint16_t *a, int n);
+void cuda_square_i32(int32_t  *a, int n);
+void cuda_square_u32(uint32_t *a, int n);
+void cuda_square_i64(int64_t  *a, int n);
+void cuda_square_u64(uint64_t *a, int n);
+void cuda_square_f16(uint16_t *a, int n);
+void cuda_square_f32(float    *a, int n);
+void cuda_square_f64(double   *a, int n);
+void cuda_square_dd (double   *a, int n);
+
+void cuda_recip_f16(uint16_t *a, int n);
+void cuda_recip_f32(float    *a, int n);
+void cuda_recip_f64(double   *a, int n);
+void cuda_recip_dd (double   *a, int n);
+
+void cuda_sqrt_f16(uint16_t *a, int n);
+void cuda_sqrt_f32(float    *a, int n);
+void cuda_sqrt_f64(double   *a, int n);
+void cuda_sqrt_dd (double   *a, int n);
+
+void cuda_rsqrt_f16(uint16_t *a, int n);
+void cuda_rsqrt_f32(float    *a, int n);
+void cuda_rsqrt_f64(double   *a, int n);
+void cuda_rsqrt_dd (double   *a, int n);
+
+void cuda_sinc_f16(uint16_t *a, int n);
+void cuda_sinc_f32(float    *a, int n);
+void cuda_sinc_f64(double   *a, int n);
+void cuda_sinc_dd (double   *a, int n);
+
+void cuda_clip_i8 (int8_t   *a, int8_t   lo, int8_t   hi, int n);
+void cuda_clip_u8 (uint8_t  *a, uint8_t  lo, uint8_t  hi, int n);
+void cuda_clip_i16(int16_t  *a, int16_t  lo, int16_t  hi, int n);
+void cuda_clip_u16(uint16_t *a, uint16_t lo, uint16_t hi, int n);
+void cuda_clip_i32(int32_t  *a, int32_t  lo, int32_t  hi, int n);
+void cuda_clip_u32(uint32_t *a, uint32_t lo, uint32_t hi, int n);
+void cuda_clip_i64(int64_t  *a, int64_t  lo, int64_t  hi, int n);
+void cuda_clip_u64(uint64_t *a, uint64_t lo, uint64_t hi, int n);
+void cuda_clip_f16(uint16_t *a, float    lo, float    hi, int n);
+void cuda_clip_f32(float    *a, float    lo, float    hi, int n);
+void cuda_clip_f64(double   *a, double   lo, double   hi, int n);
+/* DD clip: lo/hi each split into (hi, lo) doubles. */
+void cuda_clip_dd (double   *a, double lo_hi, double lo_lo,
+                                double hi_hi, double hi_lo, int n);
+
 /* GPU AsType cast wrappers. Naming: cuda_cast_<src>_to_<dst> */
 #define CUDA_CAST_DECL(SRC, DST, ST, DT) \
     void cuda_cast_##SRC##_to_##DST(ST *src, DT *dst, int n);
