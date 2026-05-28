@@ -6,6 +6,7 @@
 #include "../config.h"
 #endif
 #include "manipulation.h"
+#include "gpu_alloc.h"
 
 #ifdef HAVE_CUDNN
 #include "ndmath/cuda/cuda_dnn.cuh"
