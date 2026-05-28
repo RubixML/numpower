@@ -404,6 +404,60 @@ ndarray_fp128_t ndarray_fp128_logb(ndarray_fp128_t a) {
     return (ndarray_fp128_t)logbl((long double)a);
 #  endif
 }
+
+/* ── Trigonometric / hyperbolic / rounding helpers ─────────────────────────
+   Same out-of-line wrapper pattern as the exp/log family: the
+   libquadmath choice is resolved once in this translation unit (where
+   `HAVE_QUADMATH` is in scope) instead of at every header-include site.
+   For each, the body is `if HAVE_QUADMATH return Xq(a); else return
+   (ndarray_fp128_t)Xl((long double)a);`. The macro keeps the 15 bodies
+   uniform while preserving function-level Doxygen on the prototype
+   (`ndarray_types.h`). */
+#define NDARRAY_FP128_LIBM_WRAPPER(NAME, Q_FN, L_FN)                              \
+    ndarray_fp128_t NAME(ndarray_fp128_t a) {                                     \
+        return Q_FN(a);                                                           \
+    }
+#define NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(NAME, L_FN)                           \
+    ndarray_fp128_t NAME(ndarray_fp128_t a) {                                     \
+        return (ndarray_fp128_t)L_FN((long double)a);                             \
+    }
+
+#  if HAVE_QUADMATH
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_cos,     cosq,     cosl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_tan,     tanq,     tanl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arcsin,  asinq,    asinl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arccos,  acosq,    acosl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arctan,  atanq,    atanl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_sinh,    sinhq,    sinhl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_cosh,    coshq,    coshl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_tanh,    tanhq,    tanhl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arcsinh, asinhq,   asinhl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arccosh, acoshq,   acoshl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_arctanh, atanhq,   atanhl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_rint,    rintq,    rintl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_trunc,   truncq,   truncl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_floor,   floorq,   floorl)
+NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_ceil,    ceilq,    ceill)
+#  else
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_cos,     cosl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_tan,     tanl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arcsin,  asinl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arccos,  acosl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arctan,  atanl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_sinh,    sinhl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_cosh,    coshl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_tanh,    tanhl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arcsinh, asinhl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arccosh, acoshl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_arctanh, atanhl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_rint,    rintl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_trunc,   truncl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_floor,   floorl)
+NDARRAY_FP128_LIBM_WRAPPER_FALLBACK(ndarray_fp128_ceil,    ceill)
+#  endif
+
+#undef NDARRAY_FP128_LIBM_WRAPPER
+#undef NDARRAY_FP128_LIBM_WRAPPER_FALLBACK
 #endif /* NDARRAY_HAVE_FLOAT128 */
 
 ndarray_fp128_t ndarray_double_to_fp128(double val) {

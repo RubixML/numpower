@@ -60,6 +60,24 @@ uint16_t ndarray_double_to_fp16(double val);
    ndarray_fp128_t ndarray_fp128_log2 (ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_log10(ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_logb (ndarray_fp128_t a);
+   /* Trigonometric and hyperbolic — sinq/cosq/...q from libquadmath
+      when present, otherwise long-double libm fallback. */
+   ndarray_fp128_t ndarray_fp128_cos    (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_tan    (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arcsin (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arccos (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arctan (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_sinh   (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_cosh   (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_tanh   (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arcsinh(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arccosh(ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_arctanh(ndarray_fp128_t a);
+   /* Rounding — rintq/truncq/floorq/ceilq from libquadmath. */
+   ndarray_fp128_t ndarray_fp128_rint   (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_trunc  (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_floor  (ndarray_fp128_t a);
+   ndarray_fp128_t ndarray_fp128_ceil   (ndarray_fp128_t a);
    int             ndarray_fp128_isnan(ndarray_fp128_t a);
 #  define NDARRAY_FP128_SQRT(a)     ndarray_fp128_sqrt(a)
 #  define NDARRAY_FP128_SIN(a)      ndarray_fp128_sin(a)
@@ -71,6 +89,21 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_LOG2(a)     ndarray_fp128_log2(a)
 #  define NDARRAY_FP128_LOG10(a)    ndarray_fp128_log10(a)
 #  define NDARRAY_FP128_LOGB(a)     ndarray_fp128_logb(a)
+#  define NDARRAY_FP128_COS(a)      ndarray_fp128_cos(a)
+#  define NDARRAY_FP128_TAN(a)      ndarray_fp128_tan(a)
+#  define NDARRAY_FP128_ARCSIN(a)   ndarray_fp128_arcsin(a)
+#  define NDARRAY_FP128_ARCCOS(a)   ndarray_fp128_arccos(a)
+#  define NDARRAY_FP128_ARCTAN(a)   ndarray_fp128_arctan(a)
+#  define NDARRAY_FP128_SINH(a)     ndarray_fp128_sinh(a)
+#  define NDARRAY_FP128_COSH(a)     ndarray_fp128_cosh(a)
+#  define NDARRAY_FP128_TANH(a)     ndarray_fp128_tanh(a)
+#  define NDARRAY_FP128_ARCSINH(a)  ndarray_fp128_arcsinh(a)
+#  define NDARRAY_FP128_ARCCOSH(a)  ndarray_fp128_arccosh(a)
+#  define NDARRAY_FP128_ARCTANH(a)  ndarray_fp128_arctanh(a)
+#  define NDARRAY_FP128_RINT(a)     ndarray_fp128_rint(a)
+#  define NDARRAY_FP128_TRUNC(a)    ndarray_fp128_trunc(a)
+#  define NDARRAY_FP128_FLOOR(a)    ndarray_fp128_floor(a)
+#  define NDARRAY_FP128_CEIL(a)     ndarray_fp128_ceil(a)
 #  define NDARRAY_FP128_ISNAN(a)    ndarray_fp128_isnan(a)
 #  define NDARRAY_FP128_FROM_D(d)   ((ndarray_fp128_t)(d))
 #  define NDARRAY_FP128_FROM_LD(ld) ((ndarray_fp128_t)(ld))
@@ -118,6 +151,21 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_LOG2(a)     ndarray_dd_from_double(log2(ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_LOG10(a)    ndarray_dd_from_double(log10(ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_LOGB(a)     ndarray_dd_from_double(logb(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_COS(a)      ndarray_dd_from_double(cos    (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_TAN(a)      ndarray_dd_from_double(tan    (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCSIN(a)   ndarray_dd_from_double(asin   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCCOS(a)   ndarray_dd_from_double(acos   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCTAN(a)   ndarray_dd_from_double(atan   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_SINH(a)     ndarray_dd_from_double(sinh   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_COSH(a)     ndarray_dd_from_double(cosh   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_TANH(a)     ndarray_dd_from_double(tanh   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCSINH(a)  ndarray_dd_from_double(asinh  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCCOSH(a)  ndarray_dd_from_double(acosh  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ARCTANH(a)  ndarray_dd_from_double(atanh  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_RINT(a)     ndarray_dd_from_double(rint   (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_TRUNC(a)    ndarray_dd_from_double(trunc  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_FLOOR(a)    ndarray_dd_from_double(floor  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_CEIL(a)     ndarray_dd_from_double(ceil   (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_EQ(a, b)    (ndarray_dd_cmp((a), (b)) == 0)
 #  define NDARRAY_FP128_LT(a, b)    (ndarray_dd_cmp((a), (b)) <  0)
 #  define NDARRAY_FP128_ISZERO(a)   ndarray_dd_iszero(a)

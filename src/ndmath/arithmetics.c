@@ -3321,13 +3321,33 @@ static int unary_is_wide_int_dtype(const char *dt) {
 }
 
 /**
+ * @brief Test whether @p op belongs to the trig / hyperbolic / angle /
+ *        rounding family handled by `UNARY_TRIG_BODY`.
+ *
+ * The enum reserves a contiguous block (`SIN` .. `CEIL`) so the test
+ * is a single range check. The float CPU dispatcher uses this to
+ * pick between `UNARY_FLOAT_BODY` (basic + exp/log) and
+ * `UNARY_TRIG_BODY` (trig/hyperbolic/angle/rounding), keeping each
+ * macro focused.
+ *
+ * @param[in] op Unary op selector.
+ * @return 1 if @p op is in the trig family, 0 otherwise.
+ */
+static int unary_op_is_trig(NDArrayUnaryOp op) {
+    return op >= NDARRAY_UNOP_SIN && op <= NDARRAY_UNOP_CEIL;
+}
+
+/**
  * @brief Result dtype the unary op writes when applied to @p input_dt.
  *
- * sqrt/rsqrt/reciprocal/sinc/exp/exp2/expm1/log/log1p/log2/log10/logb
- * promote integer inputs to a floating-point dtype (PyTorch widening
- * rule): narrow ints (`int8`..`uint16`) widen to `float32`, the wider
- * 32/64-bit ints widen to `float64`. Every other op preserves the
- * input dtype.
+ * sqrt / rsqrt / reciprocal / sinc / exp{,2,m1} / log{,1p,2,10,b} and
+ * the trig/hyperbolic/angle family (sin/cos/tan/asin/acos/atan,
+ * sinh/cosh/tanh/asinh/acosh/atanh, degrees, radians) promote integer
+ * inputs to a floating-point dtype (PyTorch widening rule): narrow
+ * ints (`int8`..`uint16`) widen to `float32`, the wider 32/64-bit
+ * ints widen to `float64`. The rounding family (rint, fix, trunc,
+ * floor, ceil) preserves integer dtypes — an integer is already its
+ * own rounded value. Every other op preserves the input dtype.
  *
  * @param[in] op       Unary op selector.
  * @param[in] input_dt Source dtype string.
@@ -3347,6 +3367,20 @@ static const char *unary_result_dtype(NDArrayUnaryOp op, const char *input_dt) {
         case NDARRAY_UNOP_LOG10:
         case NDARRAY_UNOP_LOG1P:
         case NDARRAY_UNOP_LOGB:
+        case NDARRAY_UNOP_SIN:
+        case NDARRAY_UNOP_COS:
+        case NDARRAY_UNOP_TAN:
+        case NDARRAY_UNOP_ARCSIN:
+        case NDARRAY_UNOP_ARCCOS:
+        case NDARRAY_UNOP_ARCTAN:
+        case NDARRAY_UNOP_SINH:
+        case NDARRAY_UNOP_COSH:
+        case NDARRAY_UNOP_TANH:
+        case NDARRAY_UNOP_ARCSINH:
+        case NDARRAY_UNOP_ARCCOSH:
+        case NDARRAY_UNOP_ARCTANH:
+        case NDARRAY_UNOP_DEGREES:
+        case NDARRAY_UNOP_RADIANS:
             if (unary_is_int_dtype(input_dt)) {
                 return unary_is_wide_int_dtype(input_dt)
                     ? NDARRAY_TYPE_FLOAT64
@@ -3354,6 +3388,8 @@ static const char *unary_result_dtype(NDArrayUnaryOp op, const char *input_dt) {
             }
             return input_dt;
         default:
+            /* RINT / FIX / TRUNC / FLOOR / CEIL preserve dtype — integers
+               are already integer-valued, so the rounded result == input. */
             return input_dt;
     }
 }
@@ -3510,6 +3546,57 @@ static const char *unary_compute_dtype(const char *result_dt) {
     } while (0)
 
 /**
+ * @brief CPU floating-point in-place loop for the trig / hyperbolic /
+ *        angle-conversion / rounding op family.
+ *
+ * The 19 ops in this family share a common shape: one libm intrinsic
+ * call per element with no extra parameters. The macro is parameterised
+ * by the dtype @p T and the libm suffix @p S (`f` for `float`, empty
+ * for `double`) so a single body covers both float32 and float64. The
+ * `##` token concatenation produces `sin##f → sinf` and `sin## → sin`,
+ * matching the dtype-correct libm intrinsic.
+ *
+ * `degrees` / `radians` are linear; we inline the conversion constant
+ * instead of routing through libm. `fix` is numpy's `np.fix` (round
+ * toward zero), which equals `trunc` for IEEE 754 floats.
+ *
+ * @param T       Element type (`float` or `double`).
+ * @param S       libm suffix (`f` for float, empty for double).
+ * @param OP_TAG  Unary op selector — must be in the trig family.
+ */
+#define UNARY_TRIG_BODY(T, S, OP_TAG)                                                 \
+    do {                                                                              \
+        T *p = (T *)data;                                                             \
+        const T _deg_factor = (T)(180.0 / 3.14159265358979323846);                    \
+        const T _rad_factor = (T)(3.14159265358979323846 / 180.0);                    \
+        for (long i = 0; i < n; i++) {                                                \
+            T x = p[i];                                                               \
+            switch (OP_TAG) {                                                         \
+                case NDARRAY_UNOP_SIN:      p[i] = sin##S(x);      break;             \
+                case NDARRAY_UNOP_COS:      p[i] = cos##S(x);      break;             \
+                case NDARRAY_UNOP_TAN:      p[i] = tan##S(x);      break;             \
+                case NDARRAY_UNOP_ARCSIN:   p[i] = asin##S(x);     break;             \
+                case NDARRAY_UNOP_ARCCOS:   p[i] = acos##S(x);     break;             \
+                case NDARRAY_UNOP_ARCTAN:   p[i] = atan##S(x);     break;             \
+                case NDARRAY_UNOP_SINH:     p[i] = sinh##S(x);     break;             \
+                case NDARRAY_UNOP_COSH:     p[i] = cosh##S(x);     break;             \
+                case NDARRAY_UNOP_TANH:     p[i] = tanh##S(x);     break;             \
+                case NDARRAY_UNOP_ARCSINH:  p[i] = asinh##S(x);    break;             \
+                case NDARRAY_UNOP_ARCCOSH:  p[i] = acosh##S(x);    break;             \
+                case NDARRAY_UNOP_ARCTANH:  p[i] = atanh##S(x);    break;             \
+                case NDARRAY_UNOP_DEGREES:  p[i] = x * _deg_factor; break;            \
+                case NDARRAY_UNOP_RADIANS:  p[i] = x * _rad_factor; break;            \
+                case NDARRAY_UNOP_RINT:     p[i] = rint##S(x);     break;             \
+                case NDARRAY_UNOP_FIX:                                                \
+                case NDARRAY_UNOP_TRUNC:    p[i] = trunc##S(x);    break;             \
+                case NDARRAY_UNOP_FLOOR:    p[i] = floor##S(x);    break;             \
+                case NDARRAY_UNOP_CEIL:     p[i] = ceil##S(x);     break;             \
+                default: break;                                                       \
+            }                                                                         \
+        }                                                                             \
+    } while (0)
+
+/**
  * @brief Skip leading ASCII whitespace and an optional sign. Returns a
  *        pointer into @p str pointing at the first digit / dot / digit-like
  *        character that the numeric parsers consume.
@@ -3644,17 +3731,25 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
     if (!strcmp(dt, "uint64")) { UNARY_INT_BODY(uint64_t, uint64_t, op, lo.u64, hi.u64); return 0; }
 
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) {
-        UNARY_FLOAT_BODY(float, sqrtf, sinf, fabsf,
-                         expf, exp2f, expm1f,
-                         logf, log1pf, log2f, log10f, logbf,
-                         op, lo.f32, hi.f32);
+        if (unary_op_is_trig(op)) {
+            UNARY_TRIG_BODY(float, f, op);
+        } else {
+            UNARY_FLOAT_BODY(float, sqrtf, sinf, fabsf,
+                             expf, exp2f, expm1f,
+                             logf, log1pf, log2f, log10f, logbf,
+                             op, lo.f32, hi.f32);
+        }
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) {
-        UNARY_FLOAT_BODY(double, sqrt, sin, fabs,
-                         exp, exp2, expm1,
-                         log, log1p, log2, log10, logb,
-                         op, lo.f64, hi.f64);
+        if (unary_op_is_trig(op)) {
+            UNARY_TRIG_BODY(double, , op);
+        } else {
+            UNARY_FLOAT_BODY(double, sqrt, sin, fabs,
+                             exp, exp2, expm1,
+                             log, log1p, log2, log10, logb,
+                             op, lo.f64, hi.f64);
+        }
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) {
@@ -3689,6 +3784,26 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                     if (x == 0.0f) y = 1.0f;
                     else { float px = 3.14159265358979323846f * x; y = sinf(px) / px; }
                     break;
+                /* Trigonometric / hyperbolic / angle / rounding via float32. */
+                case NDARRAY_UNOP_SIN:      y = sinf(x);    break;
+                case NDARRAY_UNOP_COS:      y = cosf(x);    break;
+                case NDARRAY_UNOP_TAN:      y = tanf(x);    break;
+                case NDARRAY_UNOP_ARCSIN:   y = asinf(x);   break;
+                case NDARRAY_UNOP_ARCCOS:   y = acosf(x);   break;
+                case NDARRAY_UNOP_ARCTAN:   y = atanf(x);   break;
+                case NDARRAY_UNOP_SINH:     y = sinhf(x);   break;
+                case NDARRAY_UNOP_COSH:     y = coshf(x);   break;
+                case NDARRAY_UNOP_TANH:     y = tanhf(x);   break;
+                case NDARRAY_UNOP_ARCSINH:  y = asinhf(x);  break;
+                case NDARRAY_UNOP_ARCCOSH:  y = acoshf(x);  break;
+                case NDARRAY_UNOP_ARCTANH:  y = atanhf(x);  break;
+                case NDARRAY_UNOP_DEGREES:  y = x * (float)(180.0 / 3.14159265358979323846); break;
+                case NDARRAY_UNOP_RADIANS:  y = x * (float)(3.14159265358979323846 / 180.0); break;
+                case NDARRAY_UNOP_RINT:     y = rintf(x);   break;
+                case NDARRAY_UNOP_FIX:
+                case NDARRAY_UNOP_TRUNC:    y = truncf(x);  break;
+                case NDARRAY_UNOP_FLOOR:    y = floorf(x);  break;
+                case NDARRAY_UNOP_CEIL:     y = ceilf(x);   break;
                 case NDARRAY_UNOP_CLIP: {
                     /* min(max(x, lo), hi) per PyTorch clamp; see UNARY_FLOAT_BODY. */
                     float _yc = (x < lo_f) ? lo_f : x;
@@ -3740,6 +3855,34 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                 case NDARRAY_UNOP_LOG2:   y = NDARRAY_FP128_LOG2(x);   break;
                 case NDARRAY_UNOP_LOG10:  y = NDARRAY_FP128_LOG10(x);  break;
                 case NDARRAY_UNOP_LOGB:   y = NDARRAY_FP128_LOGB(x);   break;
+                case NDARRAY_UNOP_SIN:     y = NDARRAY_FP128_SIN(x);     break;
+                case NDARRAY_UNOP_COS:     y = NDARRAY_FP128_COS(x);     break;
+                case NDARRAY_UNOP_TAN:     y = NDARRAY_FP128_TAN(x);     break;
+                case NDARRAY_UNOP_ARCSIN:  y = NDARRAY_FP128_ARCSIN(x);  break;
+                case NDARRAY_UNOP_ARCCOS:  y = NDARRAY_FP128_ARCCOS(x);  break;
+                case NDARRAY_UNOP_ARCTAN:  y = NDARRAY_FP128_ARCTAN(x);  break;
+                case NDARRAY_UNOP_SINH:    y = NDARRAY_FP128_SINH(x);    break;
+                case NDARRAY_UNOP_COSH:    y = NDARRAY_FP128_COSH(x);    break;
+                case NDARRAY_UNOP_TANH:    y = NDARRAY_FP128_TANH(x);    break;
+                case NDARRAY_UNOP_ARCSINH: y = NDARRAY_FP128_ARCSINH(x); break;
+                case NDARRAY_UNOP_ARCCOSH: y = NDARRAY_FP128_ARCCOSH(x); break;
+                case NDARRAY_UNOP_ARCTANH: y = NDARRAY_FP128_ARCTANH(x); break;
+                case NDARRAY_UNOP_DEGREES:
+                    /* libquadmath path: M_PIq has full 113-bit pi; DD path
+                       gets ~64 bits via long-double — both adequate for the
+                       linear conversion x · 180/π. */
+                    y = NDARRAY_FP128_MUL(x, NDARRAY_FP128_FROM_LD(
+                            (long double)(180.0L / 3.14159265358979323846L)));
+                    break;
+                case NDARRAY_UNOP_RADIANS:
+                    y = NDARRAY_FP128_MUL(x, NDARRAY_FP128_FROM_LD(
+                            (long double)(3.14159265358979323846L / 180.0L)));
+                    break;
+                case NDARRAY_UNOP_RINT:    y = NDARRAY_FP128_RINT(x);    break;
+                case NDARRAY_UNOP_FIX:
+                case NDARRAY_UNOP_TRUNC:   y = NDARRAY_FP128_TRUNC(x);   break;
+                case NDARRAY_UNOP_FLOOR:   y = NDARRAY_FP128_FLOOR(x);   break;
+                case NDARRAY_UNOP_CEIL:    y = NDARRAY_FP128_CEIL(x);    break;
                 case NDARRAY_UNOP_SINC: {
                     if (NDARRAY_FP128_ISZERO(x)) y = NDARRAY_FP128_ONE();
                     else {
@@ -3842,6 +3985,42 @@ static int unary_run_gpu_inplace(void *data, long n, const char *dt,
         cuda_exp_f16, cuda_exp2_f16, cuda_expm1_f16,
         cuda_log_f16, cuda_log1p_f16, cuda_log2_f16, cuda_log10_f16, cuda_logb_f16)
 #undef UNOP_GPU_TRANSC_DT
+
+    /* Trig / hyperbolic / angle / rounding dispatch — same fall-through
+       contract as the transcendental block: switch on op, fall through
+       to `UNOP_GPU_DT` only for ops outside this family. Token-pasting
+       the dtype suffix (`f32` / `f64` / `f16`) into the wrapper name
+       keeps the 19-op block legible without a 20-arg macro. */
+#define UNOP_GPU_TRIG_DT(DTSTR, T, S)                                                  \
+    if (!strcmp(dt, DTSTR)) {                                                          \
+        T *p = (T *)data;                                                              \
+        switch (op) {                                                                  \
+            case NDARRAY_UNOP_SIN:      cuda_sin_##S      (p, ni); return 0;           \
+            case NDARRAY_UNOP_COS:      cuda_cos_##S      (p, ni); return 0;           \
+            case NDARRAY_UNOP_TAN:      cuda_tan_##S      (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCSIN:   cuda_arcsin_##S   (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCCOS:   cuda_arccos_##S   (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCTAN:   cuda_arctan_##S   (p, ni); return 0;           \
+            case NDARRAY_UNOP_SINH:     cuda_sinh_##S     (p, ni); return 0;           \
+            case NDARRAY_UNOP_COSH:     cuda_cosh_##S     (p, ni); return 0;           \
+            case NDARRAY_UNOP_TANH:     cuda_tanh_##S     (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCSINH:  cuda_arcsinh_##S  (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCCOSH:  cuda_arccosh_##S  (p, ni); return 0;           \
+            case NDARRAY_UNOP_ARCTANH:  cuda_arctanh_##S  (p, ni); return 0;           \
+            case NDARRAY_UNOP_DEGREES:  cuda_degrees_##S  (p, ni); return 0;           \
+            case NDARRAY_UNOP_RADIANS:  cuda_radians_##S  (p, ni); return 0;           \
+            case NDARRAY_UNOP_RINT:     cuda_rint_##S     (p, ni); return 0;           \
+            case NDARRAY_UNOP_FIX:                                                     \
+            case NDARRAY_UNOP_TRUNC:    cuda_trunc_##S    (p, ni); return 0;           \
+            case NDARRAY_UNOP_FLOOR:    cuda_floor_##S    (p, ni); return 0;           \
+            case NDARRAY_UNOP_CEIL:     cuda_ceil_##S     (p, ni); return 0;           \
+            default: break;                                                            \
+        }                                                                              \
+    }
+    UNOP_GPU_TRIG_DT("float32", float,    f32)
+    UNOP_GPU_TRIG_DT("float64", double,   f64)
+    UNOP_GPU_TRIG_DT("float16", uint16_t, f16)
+#undef UNOP_GPU_TRIG_DT
 
 #define UNOP_GPU_DT(DTSTR, T, NEG, ABS, SIGN, RECIP, SQRT, RSQRT, SQUARE, SINC, CLIP) \
     if (!strcmp(dt, DTSTR)) {                                                          \
@@ -3969,6 +4148,25 @@ static int unary_run_gpu_inplace(void *data, long n, const char *dt,
             case NDARRAY_UNOP_LOG2:       cuda_log2_dd  (p, ni); break;
             case NDARRAY_UNOP_LOG10:      cuda_log10_dd (p, ni); break;
             case NDARRAY_UNOP_LOGB:       cuda_logb_dd  (p, ni); break;
+            case NDARRAY_UNOP_SIN:       cuda_sin_dd     (p, ni); break;
+            case NDARRAY_UNOP_COS:       cuda_cos_dd     (p, ni); break;
+            case NDARRAY_UNOP_TAN:       cuda_tan_dd     (p, ni); break;
+            case NDARRAY_UNOP_ARCSIN:    cuda_arcsin_dd  (p, ni); break;
+            case NDARRAY_UNOP_ARCCOS:    cuda_arccos_dd  (p, ni); break;
+            case NDARRAY_UNOP_ARCTAN:    cuda_arctan_dd  (p, ni); break;
+            case NDARRAY_UNOP_SINH:      cuda_sinh_dd    (p, ni); break;
+            case NDARRAY_UNOP_COSH:      cuda_cosh_dd    (p, ni); break;
+            case NDARRAY_UNOP_TANH:      cuda_tanh_dd    (p, ni); break;
+            case NDARRAY_UNOP_ARCSINH:   cuda_arcsinh_dd (p, ni); break;
+            case NDARRAY_UNOP_ARCCOSH:   cuda_arccosh_dd (p, ni); break;
+            case NDARRAY_UNOP_ARCTANH:   cuda_arctanh_dd (p, ni); break;
+            case NDARRAY_UNOP_DEGREES:   cuda_degrees_dd (p, ni); break;
+            case NDARRAY_UNOP_RADIANS:   cuda_radians_dd (p, ni); break;
+            case NDARRAY_UNOP_RINT:      cuda_rint_dd    (p, ni); break;
+            case NDARRAY_UNOP_FIX:
+            case NDARRAY_UNOP_TRUNC:     cuda_trunc_dd   (p, ni); break;
+            case NDARRAY_UNOP_FLOOR:     cuda_floor_dd   (p, ni); break;
+            case NDARRAY_UNOP_CEIL:      cuda_ceil_dd    (p, ni); break;
             case NDARRAY_UNOP_CLIP:
                 cuda_clip_dd(p, lo_hi, lo_lo, hi_hi, hi_lo, ni); break;
             default:
@@ -4003,6 +4201,20 @@ NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
         if (ndim > 0) memcpy(shape, NDArray_SHAPE(nda), sizeof(int) * ndim);
         else          shape[0] = 1;
         return NDArray_Empty(shape, ndim, result_dt, device);
+    }
+
+    /* Rounding ops on integer dtypes are identity: an integer is already
+       its own rounded value (positive/negative). Short-circuit to a
+       device-preserving NDArray_Copy so we never launch a no-op kernel
+       — `unary_run_gpu_inplace` doesn't dispatch integer cases for the
+       rounding family (they have no work to do on the GPU side either).
+       This applies even on CPU: skipping the loop saves a pass and
+       keeps the contract uniform. */
+    if (unary_is_int_dtype(input_dt) &&
+        (op == NDARRAY_UNOP_RINT  || op == NDARRAY_UNOP_FIX   ||
+         op == NDARRAY_UNOP_TRUNC || op == NDARRAY_UNOP_FLOOR ||
+         op == NDARRAY_UNOP_CEIL)) {
+        return NDArray_Copy(nda, device);
     }
 
     /* Stage the result on the same device as the input. Two cases:

@@ -121,7 +121,30 @@ typedef enum {
     NDARRAY_UNOP_LOG2,
     NDARRAY_UNOP_LOG10,
     NDARRAY_UNOP_LOG1P,
-    NDARRAY_UNOP_LOGB
+    NDARRAY_UNOP_LOGB,
+    /* Trigonometric */
+    NDARRAY_UNOP_SIN,
+    NDARRAY_UNOP_COS,
+    NDARRAY_UNOP_TAN,
+    NDARRAY_UNOP_ARCSIN,
+    NDARRAY_UNOP_ARCCOS,
+    NDARRAY_UNOP_ARCTAN,
+    /* Hyperbolic */
+    NDARRAY_UNOP_SINH,
+    NDARRAY_UNOP_COSH,
+    NDARRAY_UNOP_TANH,
+    NDARRAY_UNOP_ARCSINH,
+    NDARRAY_UNOP_ARCCOSH,
+    NDARRAY_UNOP_ARCTANH,
+    /* Angle conversion */
+    NDARRAY_UNOP_DEGREES,
+    NDARRAY_UNOP_RADIANS,
+    /* Rounding (preserves dtype for floats; integers pass through) */
+    NDARRAY_UNOP_RINT,
+    NDARRAY_UNOP_FIX,
+    NDARRAY_UNOP_TRUNC,
+    NDARRAY_UNOP_FLOOR,
+    NDARRAY_UNOP_CEIL
 } NDArrayUnaryOp;
 
 /**

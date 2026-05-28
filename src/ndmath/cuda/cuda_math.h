@@ -31,36 +31,21 @@ void cuda_fill_float(float *a, float value, int n);
 void cuda_fill_double(double *a, double value, int n);
 
 int cuda_det_float(float *a, float *result, int n);
-void cuda_float_sin(int nblocks, float *d_array);
-void cuda_float_cos(int nblocks, float *d_array);
-void cuda_float_tan(int nblocks, float *d_array);
-void cuda_float_arcsin(int nblocks, float *d_array);
-void cuda_float_arccos(int nblocks, float *d_array);
-void cuda_float_arctan(int nblocks, float *d_array);
+/* Legacy single-precision trig / hyperbolic / angle / rounding /
+   sinc / negate / sign / clip helpers were removed from the public
+   API by the typed-unary refactor — all dispatch goes through
+   `cuda_<op>_{f32,f64,f16,dd}` now. The only legacy float-only
+   wrapper still on a non-typed path is `cuda_float_arctan2` (binary)
+   and `cuda_float_round` (precision arg); they sit on the legacy
+   `NDArray_Map1ND` / `NDArray_Map1F` rails until binary-unary /
+   precision-arg support lands in the dispatcher. */
 void cuda_float_arctan2(int nblocks, float *d_array, float *y_array);
-void cuda_float_degrees(int nblocks, float *d_array);
-void cuda_float_radians(int nblocks, float *d_array);
-void cuda_float_sinh(int nblocks, float *d_array);
-void cuda_float_cosh(int nblocks, float *d_array);
-void cuda_float_tanh(int nblocks, float *d_array);
-void cuda_float_arcsinh(int nblocks, float *d_array);
-void cuda_float_arccosh(int nblocks, float *d_array);
-void cuda_float_arctanh(int nblocks, float *d_array);
-void cuda_float_rint(int nblocks, float *d_array);
-void cuda_float_fix(int nblocks, float *d_array);
-void cuda_float_ceil(int nblocks, float *d_array);
-void cuda_float_floor(int nblocks, float *d_array);
-void cuda_float_sinc(int nblocks, float *d_array);
-void cuda_float_trunc(int nblocks, float *d_array);
-void cuda_float_negate(int nblocks, float *d_array);
-void cuda_float_sign(int nblocks, float *d_array);
-void cuda_float_clip(int nblocks, float *d_array, float minVal, float maxVal);
 void cuda_float_multiply_matrix_vector(int nblocks, float *a_array, float *b_array, float *result, int rows, int cols);
 void cuda_float_compare_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_matrix_float_inverse(float* matrix, int n);
 void cuda_float_lu(float *matrix, float *L, float *U, float *P, int size);
 void cuda_prod_float(int nblocks, float *a, float *rtn, int nelements);
-void cuda_float_round(int nblocks, float *d_array, float decimals);
+void cuda_float_round(int nblocks, float *d_array, float decimals);  /* precision-arg legacy */
 void cuda_calculate_outer_product(int m, int n, float *a_array, float *b_array, float *r_array);
 void cuda_float_compare_greater(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_float_compare_greater_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
@@ -75,8 +60,10 @@ void cuda_float_compare_not_equal(int nblocks, float *a_array, float *b_array, f
 NDArray* NDArrayMathGPU_ElementWise2F(NDArray* ndarray, ElementWiseFloatGPUOperation2F op, float val1, float val2);
 NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOperation1F op, float val1);
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
-void cuda_float_positive(int nblocks, float *d_array);
-void cuda_float_reciprocal(int nblocks, float *d_array);
+/* `cuda_float_positive` / `cuda_float_reciprocal` removed from the
+   public API by the typed-unary refactor — use cuda_recip_{f16,f32,
+   f64,dd} (reciprocal) or omit (positive is a no-op for floats and
+   handled by the dispatcher). */
 /**
  * @brief Fill a GPU float32 buffer with truncated-Gaussian samples.
  *
@@ -550,6 +537,37 @@ void cuda_logb_f16(uint16_t *a, int n);
 void cuda_logb_f32(float    *a, int n);
 void cuda_logb_f64(double   *a, int n);
 void cuda_logb_dd (double   *a, int n);
+
+/* Trig / hyperbolic / angle / rounding wrappers — same shape and
+   in-place contract as the transcendental block above. Integer
+   inputs are promoted to fp32/fp64 upstream (rounding ops are no-ops
+   on int, so they short-circuit before dispatch). */
+#define DECLARE_UNOP_FP_WRAPPERS(OP)                                             \
+    void cuda_##OP##_f16(uint16_t *a, int n);                                    \
+    void cuda_##OP##_f32(float    *a, int n);                                    \
+    void cuda_##OP##_f64(double   *a, int n);                                    \
+    void cuda_##OP##_dd (double   *a, int n);
+
+DECLARE_UNOP_FP_WRAPPERS(sin)
+DECLARE_UNOP_FP_WRAPPERS(cos)
+DECLARE_UNOP_FP_WRAPPERS(tan)
+DECLARE_UNOP_FP_WRAPPERS(arcsin)
+DECLARE_UNOP_FP_WRAPPERS(arccos)
+DECLARE_UNOP_FP_WRAPPERS(arctan)
+DECLARE_UNOP_FP_WRAPPERS(sinh)
+DECLARE_UNOP_FP_WRAPPERS(cosh)
+DECLARE_UNOP_FP_WRAPPERS(tanh)
+DECLARE_UNOP_FP_WRAPPERS(arcsinh)
+DECLARE_UNOP_FP_WRAPPERS(arccosh)
+DECLARE_UNOP_FP_WRAPPERS(arctanh)
+DECLARE_UNOP_FP_WRAPPERS(degrees)
+DECLARE_UNOP_FP_WRAPPERS(radians)
+DECLARE_UNOP_FP_WRAPPERS(rint)
+DECLARE_UNOP_FP_WRAPPERS(trunc)
+DECLARE_UNOP_FP_WRAPPERS(floor)
+DECLARE_UNOP_FP_WRAPPERS(ceil)
+
+#undef DECLARE_UNOP_FP_WRAPPERS
 
 void cuda_clip_i8 (int8_t   *a, int8_t   lo, int8_t   hi, int n);
 void cuda_clip_u8 (uint8_t  *a, uint8_t  lo, uint8_t  hi, int n);

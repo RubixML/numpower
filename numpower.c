@@ -3499,8 +3499,9 @@ PHP_METHOD(NumPower, flatten) {
 
 /**
  * @brief Run a typed unary op (`abs`, `negative`, `positive`,
- *        `reciprocal`, `sign`, `sqrt`, `rsqrt`, `square`, `sinc`) on
- *        a single zval argument and install the result.
+ *        `reciprocal`, `sign`, `sqrt`, `rsqrt`, `square`, `sinc`,
+ *        `exp`, `exp2`, `expm1`, `log`, `log1p`, `log2`, `log10`,
+ *        `logb`) on a single zval argument and install the result.
  *
  * Centralises the PHP-binding plumbing every unary method needs:
  *  - resolves the input zval to an NDArray (array / int / float / NDArray);
@@ -3563,141 +3564,56 @@ PHP_METHOD(NumPower, abs) {
 /**
  * NumPower::sin
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `sin(x)`. Integer inputs widen to float32 (narrow) or
+ * float64 (32/64-bit) per PyTorch widening; every floating-point dtype
+ * is preserved. Computation stays on the input's device.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sin, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, sin) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_sin);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_sin);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_SIN);
 }
 
 /**
  * NumPower::cos
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `cos(x)`. Same dtype / device contract as `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_cos, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, cos) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_cos);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_cos);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_COS);
 }
 
 /**
- * NumPower::sin
+ * NumPower::tan
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `tan(x)`. Same dtype / device contract as `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_tan, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, tan) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_tan);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_tan);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_TAN);
 }
 
 /**
  * NumPower::arcsin
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `arcsin(x)`. Same dtype / device contract as
+ * `NumPower::sin`. Inputs outside [-1, 1] return NaN per IEEE 754.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arcsin, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arcsin) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arcsin);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arcsin);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCSIN);
 }
 
 /**
@@ -3726,64 +3642,22 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arccos, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arccos) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arccos);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arccos);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCCOS);
 }
 
 /**
- * NumPower::arccos
+ * NumPower::arctan
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `arctan(x)`. Same dtype / device contract as
+ * `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctan, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arctan) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arctan);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arctan);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCTAN);
 }
 
 /**
@@ -3833,204 +3707,78 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_degrees, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, degrees) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_degrees);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_degrees);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_DEGREES);
 }
 
 /**
  * NumPower::sinh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `sinh(x)`. Same dtype / device contract as
+ * `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_sinh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, sinh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_sinh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_sinh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_SINH);
 }
 
 /**
  * NumPower::cosh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `cosh(x)`. Same dtype / device contract as
+ * `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_cosh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, cosh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_cosh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_cosh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_COSH);
 }
 
 /**
  * NumPower::tanh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise `tanh(x)`. Same dtype / device contract as
+ * `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_tanh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, tanh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_tanh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_tanh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_TANH);
 }
 
 /**
  * NumPower::arcsinh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise inverse hyperbolic sine. Same dtype / device contract
+ * as `NumPower::sin`.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arcsinh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arcsinh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arcsinh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arcsinh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCSINH);
 }
 
 /**
  * NumPower::arccosh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise inverse hyperbolic cosine. Same dtype / device
+ * contract as `NumPower::sin`. Inputs `< 1` return NaN per IEEE 754.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arccosh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arccosh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arccosh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arccosh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCCOSH);
 }
 
 /**
@@ -4111,141 +3859,59 @@ PHP_METHOD(NumPower, fromImage) {
 /**
  * NumPower::arctanh
  *
- * @param execute_data
- * @param return_value
+ * Element-wise inverse hyperbolic tangent. Same dtype / device
+ * contract as `NumPower::sin`. Inputs outside (-1, 1) return ±Inf
+ * (at ±1) or NaN (outside) per IEEE 754.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctanh, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arctanh) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_arctanh);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_arctanh);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_ARCTANH);
 }
 
 /**
  * NumPower::rint
  *
- * @param execute_data
- * @param return_value
+ * Element-wise IEEE 754 round-to-nearest-even (banker's rounding).
+ * Dtype is preserved; integer inputs pass through unchanged.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_rint, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, rint) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_rint);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_rint);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_RINT);
 }
 
 /**
  * NumPower::fix
  *
- * @param execute_data
- * @param return_value
+ * Element-wise truncation toward zero (numpy's `np.fix`, equal to
+ * `trunc` for IEEE 754). Dtype is preserved; integer inputs pass
+ * through unchanged.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_fix, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, fix) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_fix);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_fix);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_FIX);
 }
 
 /**
  * NumPower::trunc
  *
- * @param execute_data
- * @param return_value
+ * Element-wise truncation toward zero. Dtype is preserved; integer
+ * inputs pass through unchanged.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_trunc, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, trunc) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_trunc);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_trunc);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_TRUNC);
 }
 
 /**
@@ -4814,36 +4480,15 @@ PHP_METHOD(NumPower, variance) {
 /**
  * NumPower::ceil
  *
- * @param execute_data
- * @param return_value
+ * Element-wise smallest integer not less than `x`. Dtype is
+ * preserved; integer inputs pass through unchanged.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_ceil, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, ceil) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_ceil);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_ceil);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_CEIL);
 }
 
 /**
@@ -4887,71 +4532,30 @@ PHP_METHOD(NumPower, round) {
 /**
  * NumPower::floor
  *
- * @param execute_data
- * @param return_value
+ * Element-wise largest integer not greater than `x`. Dtype is
+ * preserved; integer inputs pass through unchanged.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_floor, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, floor) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_floor);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_floor);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_FLOOR);
 }
 
 /**
- * NumPower::arccos
+ * NumPower::radians
  *
- * @param execute_data
- * @param return_value
+ * Element-wise degrees → radians conversion (multiplies by π/180).
+ * Integer inputs widen to float32 (narrow) / float64 (32/64-bit) per
+ * PyTorch widening; every floating-point dtype is preserved.
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_radians, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, radians) {
-    NDArray *rtn = NULL;
-    zval *array;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-    Z_PARAM_ZVAL(array)
-    ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
-    }
-
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map(nda, float_radians);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise(nda, cuda_float_radians);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
-    }
-    ndarray_init_new_object(rtn, return_value);
+    ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAM_PASSTHRU,
+                             NDARRAY_UNOP_RADIANS);
 }
 
 /**
