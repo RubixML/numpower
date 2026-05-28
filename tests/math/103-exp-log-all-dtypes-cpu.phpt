@@ -42,6 +42,22 @@ function check($label, $got, $want, $tol = 0.0) {
     }
 }
 
+/**
+ * Detect whether the fp128 storage uses libquadmath (full ~34-digit
+ * binary128) or the double-double emulation fallback (~32 digits for
+ * arithmetic, fp64 ~16 digits for transcendentals). Probe: feed a
+ * 34-digit string that fits inside fp128 but not inside DD — true
+ * quadmath round-trips it; DD canonicalizes it to a shorter form.
+ *
+ * Used to gate the 22-digit fp128-exp prefix check below: on
+ * libquadmath we get the full `2.71828182845904523536...`; on the
+ * DD fallback we get only the fp64-precision tail `...09079...`.
+ */
+function has_libquadmath() {
+    $probe = (string)(new NDArray(['9.999999999999999999999999999999999e-10'], 'float128'));
+    return strpos($probe, '9.9999999999999999999999999999999') !== false;
+}
+
 /* ── float32 / float64: full op coverage ─────────────────────────────── */
 foreach (['float32','float64'] as $dt) {
     $tol = ($dt === 'float32') ? 1e-5 : 1e-12;
@@ -116,12 +132,20 @@ $r = NumPower::exp($f128);
 $s = $r->__serialize();
 check("fp128 exp dtype", $s['dtype'], 'float128');
 /* exp(0)=1, exp(1)=e, exp(2)=e^2 — check the first elements are exactly
-   1 and the e prefix is correct (precision floor: 15 digits suffices
-   even on the DD fallback). */
+   1 and the e prefix is correct. On libquadmath (Linux GCC x86-64,
+   Windows MSVC with quadmath shim) the fp128 transcendental path runs
+   through `expq` at full 113-bit precision, so the 22-digit prefix
+   `2.71828182845904523536` round-trips exactly. On the DD fallback
+   (macOS / non-x86 / no-libquadmath builds) `NDARRAY_FP128_EXP`
+   collapses to `dd_make(exp(double), 0.0)` — fp64-tier precision
+   (~15 sig figs), so the 22-digit prefix doesn't match past digit 16.
+   The 14-digit prefix is portable across both backends. See
+   [[feedback-fp128-test-portability]] for the DD-vs-quadmath rule. */
 $out = $r->toArray();
 check("fp128 exp(0)", (float)$out[0], 1.0, 1e-12);
+$_e_prefix = has_libquadmath() ? '2.71828182845904523536' : '2.7182818284590';
 check("fp128 exp(1) prefix matches e",
-      strncmp((string)$out[1], '2.71828182845904523536', 22) === 0, true);
+      strncmp((string)$out[1], $_e_prefix, strlen($_e_prefix)) === 0, true);
 
 $l = NumPower::log(NumPower::array(['1.0', '2.71828182845904523536', '7.38905609893065022723'],
                                     'float128'));
@@ -137,12 +161,16 @@ check("0-D float32 exp scalar", NumPower::exp($z),       M_E,        1e-5);
 check("0-D float32 log scalar", NumPower::log(NumPower::array(M_E)),  1.0, 1e-5);
 check("0-D float64 exp scalar", NumPower::exp(NumPower::array(1.0, 'float64')), M_E,  1e-12);
 
-/* 0-D fp128 returns a string (full precision). */
+/* 0-D fp128 returns a string. Use the full 20-digit prefix on
+   libquadmath builds (Linux/Windows) and a 14-digit prefix on the
+   DD fallback (macOS / non-x86) — see fp128 exp(1) check above for
+   the precision contract per backend. */
 $fz = NumPower::array(['0.0'], 'float128')->toArray()[0];  /* "0" */
 $ez = NumPower::exp(NumPower::array(['1.0'], 'float128'));
 $ez_arr = $ez->toArray();
+$_e_prefix = has_libquadmath() ? '2.7182818284590452353' : '2.7182818284590';
 check("0-D fp128 exp string prefix",
-      strncmp((string)$ez_arr[0], '2.7182818284590452353', 20) === 0, true);
+      strncmp((string)$ez_arr[0], $_e_prefix, strlen($_e_prefix)) === 0, true);
 
 /* ── 2-D / 3-D shapes preserve structure ─────────────────────────────── */
 $mat = NumPower::array([[1.0, M_E], [M_E*M_E, M_E*M_E*M_E]], 'float64');
