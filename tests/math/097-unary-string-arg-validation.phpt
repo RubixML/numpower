@@ -1,11 +1,15 @@
 --TEST--
-NumPower unary ops: bare-string scalars throw a useful error; clip accepts int / float / string bounds
+NumPower unary ops: bare-string scalars infer dtype (fp128 / int64 / uint64); clip accepts int / float / string bounds
 --FILE--
 <?php
-/* Bare-string scalar input has no peer dtype to anchor on, so the
-   dispatcher throws a clear error pointing the caller at the correct
-   string-intake path. clip's min / max accept int / float / string
-   so fp128 / uint64 callers can pass loss-free bounds. */
+/* Bare-string scalar input is now accepted by the unary dispatcher and
+   by clip. The dtype is inferred from the literal:
+     - decimal / exponent / inf / nan → float128 (full ~34-digit precision);
+     - non-negative integer above INT64_MAX → uint64;
+     - everything else → int64.
+   This is the single-call intake path for fp128 / uint64 precision.
+   Empty / whitespace-only strings throw a distinct error.
+   clip's min / max also accept int / float / string. */
 
 function expect_throw($label, $thunk) {
     try {
@@ -16,12 +20,44 @@ function expect_throw($label, $thunk) {
     }
 }
 
-expect_throw("abs('1.5')",   fn() => NumPower::abs('1.5'));
-expect_throw("sqrt('4')",    fn() => NumPower::sqrt('4'));
-expect_throw("clip('5',0,1)",fn() => NumPower::clip('5', 0, 1));
+/* ── Bare-string input now succeeds ─────────────────────────────────── */
+echo "abs('1.5')=",            (string)NumPower::abs('1.5'),                 "\n";
+echo "abs('-100')=",            (string)NumPower::abs('-100'),                "\n";
+echo "abs('18446744073709551615')=",
+                                (string)NumPower::abs('18446744073709551615'), "\n";
+echo "sqrt('4')=",              (string)NumPower::sqrt('4'),                  "\n";
+echo "sqrt('16.0')=",           (string)NumPower::sqrt('16.0'),               "\n";
+echo "clip('5',0,1)=",          (string)NumPower::clip('5', 0, 1),            "\n";
+echo "clip('5.5',0,1)=",        (string)NumPower::clip('5.5', 0, 1),          "\n";
 
-/* The new strict validator rejects malformed numeric bounds (was silent
-   `strtod` → 0 before this branch). */
+/* ── Empty / whitespace-only / malformed strings throw ──────────────── */
+expect_throw("abs('')",         fn() => NumPower::abs(''));
+expect_throw("sqrt('   ')",     fn() => NumPower::sqrt('   '));
+expect_throw("clip('',0,1)",    fn() => NumPower::clip('', 0, 1));
+/* Stricter validation also rejects partial / illegal literals. */
+expect_throw("abs('0xff')",     fn() => NumPower::abs('0xff'));
+expect_throw("abs('abc')",      fn() => NumPower::abs('abc'));
+expect_throw("abs('1.5.5')",    fn() => NumPower::abs('1.5.5'));
+expect_throw("abs('1.5a')",     fn() => NumPower::abs('1.5a'));
+expect_throw("abs('1,5')",      fn() => NumPower::abs('1,5'));
+expect_throw("abs('1.5e')",     fn() => NumPower::abs('1.5e'));
+expect_throw("abs('+')",        fn() => NumPower::abs('+'));
+expect_throw("abs('-')",        fn() => NumPower::abs('-'));
+expect_throw("abs('.')",        fn() => NumPower::abs('.'));
+expect_throw("abs('  -  1.5')", fn() => NumPower::abs('  -  1.5'));
+
+/* ── Magnitudes past UINT64_MAX escalate to float128 (not saturate) ──── */
+/* 10^20-1 is not a power of two, so its exact decimal display depends on
+   the fp128 backend: libquadmath prints all 20 digits; the double-double
+   emulation (macOS, GPU) rounds the display to 1e20. Assert the escalation
+   (a wide-dtype string, never a saturated int) + magnitude portably. */
+$r = (string)NumPower::abs('99999999999999999999');
+echo "abs('99999999999999999999') → fp128 ~1e20: ",
+     (is_string($r) && abs((float)$r / 1e20 - 1.0) < 1e-15) ? "OK" : "FAIL($r)", "\n";
+/* 2^64 is a power of two → exact in both backends. */
+echo "abs('18446744073709551616')=",        (string)NumPower::abs('18446744073709551616'),  "\n";
+
+/* The strict validator on clip bounds still rejects malformed numbers. */
 expect_throw("clip([1],'abc','5')",  fn() => NumPower::clip([1.0], 'abc', '5'));
 expect_throw("clip([1],'5','1.5e')", fn() => NumPower::clip([1.0], '5', '1.5e'));
 expect_throw("clip([1],'','5')",     fn() => NumPower::clip([1.0], '', '5'));
@@ -60,9 +96,28 @@ expect_throw("clip([],null,null)",
 echo "DONE\n";
 ?>
 --EXPECTF--
-OK abs('1.5'): Cannot infer dtype for a bare string.%s
-OK sqrt('4'): Cannot infer dtype for a bare string.%s
-OK clip('5',0,1): Cannot infer dtype for a bare string.%s
+abs('1.5')=1.5
+abs('-100')=100
+abs('18446744073709551615')=18446744073709551615
+sqrt('4')=2
+sqrt('16.0')=4
+clip('5',0,1)=1
+clip('5.5',0,1)=1
+OK abs(''): Numeric string expected, got an empty value.
+OK sqrt('   '): Numeric string expected, got a whitespace-only value.
+OK clip('',0,1): Numeric string expected, got an empty value.
+OK abs('0xff'): Numeric string expected, got malformed literal: "0xff".
+OK abs('abc'): Numeric string expected, got malformed literal: "abc".
+OK abs('1.5.5'): Numeric string expected, got malformed literal: "1.5.5".
+OK abs('1.5a'): Numeric string expected, got malformed literal: "1.5a".
+OK abs('1,5'): Numeric string expected, got malformed literal: "1,5".
+OK abs('1.5e'): Numeric string expected, got malformed literal: "1.5e".
+OK abs('+'): Numeric string expected, got malformed literal: "+".
+OK abs('-'): Numeric string expected, got malformed literal: "-".
+OK abs('.'): Numeric string expected, got malformed literal: ".".
+OK abs('  -  1.5'): Numeric string expected, got malformed literal: "  -  1.5".
+abs('99999999999999999999') → fp128 ~1e20: OK
+abs('18446744073709551616')=18446744073709551616
 OK clip([1],'abc','5'): NDArray clip: 'min' is not a valid number:%s
 OK clip([1],'5','1.5e'): NDArray clip: 'max' has malformed exponent:%s
 OK clip([1],'','5'): NDArray clip: 'min' is empty.

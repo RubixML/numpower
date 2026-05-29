@@ -225,6 +225,263 @@ ndarray_dd_t ndarray_dd_rsqrt(ndarray_dd_t a) {
     return ndarray_dd_div(ndarray_dd_from_double(1.0), r);
 }
 
+/* ── DD-precision transcendentals ───────────────────────────────────────── */
+
+/* Pre-computed DD constants, accurate to ~106 bits. Each is split so
+   `hi` is the closest fp64 approximation and `lo` is the residual.
+   Verified against libquadmath: `(double)ln2_hi + (double)ln2_lo` matches
+   `logq(2.0Q)` to within 1 DD ULP. */
+static const ndarray_dd_t DD_LN2 = {
+    /* ln(2)  = 0.69314718055994530941723212145817... */
+     0.6931471805599453,    /* hi: 0.693147180559945286... (closest double) */
+     2.3190468138462996e-17 /* lo: residual = ln2 - hi   */
+};
+static const ndarray_dd_t DD_LOG2_E = {
+    /* 1/ln(2) = 1.44269504088896340735992468100... */
+     1.4426950408889634,
+     2.0355273740931033e-17
+};
+static const ndarray_dd_t DD_LOG10_E = {
+    /* 1/ln(10) = 0.43429448190325182765112891891... */
+     0.4342944819032518,
+     1.0983196502167645e-17
+};
+
+/**
+ * @brief DD-precision exp(x).
+ *
+ * Range reduction: write x = k·ln(2) + r with k = round(x / ln(2)) and
+ * |r| ≤ ln(2)/2 ≈ 0.347. Then exp(x) = 2^k · exp(r); the 2^k factor
+ * is exact in fp64 (just shifts the exponent), and exp(r) is evaluated
+ * via the Taylor series 1 + r + r²/2! + r³/3! + … in DD arithmetic
+ * using Horner's method. The series is summed through r²⁴/24!: at the
+ * worst-case |r| ≤ ln(2)/2 ≈ 0.3466 the first omitted term r²⁵/25! ≈
+ * 6.8e-37 is far below DD epsilon (~2⁻¹⁰⁶ ≈ 1.2e-32), so the result
+ * carries full ~32-digit DD precision. (Twenty terms — the original
+ * cutoff — left r²¹/21! ≈ 4.2e-30 in the remainder, capping accuracy
+ * at ~29 digits and making the GPU DD path diverge from the CPU
+ * libquadmath path at the 31st digit.)
+ *
+ * Handles overflow (`exp(x) > DBL_MAX`) by returning +inf and underflow
+ * (`exp(x) < DBL_MIN_SUBNORMAL`) by returning 0. NaN propagates.
+ *
+ * @param[in] a Input DD value.
+ * @return exp(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_exp(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (isinf(a.hi)) return ndarray_dd_from_double(a.hi > 0 ? INFINITY : 0.0);
+    /* Fast over/underflow guards — exp(±709.78…) is the fp64 edge. */
+    if (a.hi >  709.7827) return ndarray_dd_from_double(INFINITY);
+    if (a.hi < -745.1332) return ndarray_dd_from_double(0.0);
+    /* Range reduction: k = round(x · log2_e), r = x − k · ln2. */
+    double k_d = round(a.hi * 1.4426950408889634);
+    int    k   = (int)k_d;
+    ndarray_dd_t k_dd = ndarray_dd_from_double(k_d);
+    ndarray_dd_t r    = ndarray_dd_sub(a, ndarray_dd_mul(k_dd, DD_LN2));
+
+    /* Horner evaluation of 1 + r·(1 + r/2·(1 + r/3·(… + r/24))) */
+    ndarray_dd_t result = ndarray_dd_from_double(1.0);
+    for (int i = 24; i >= 1; i--) {
+        /* result = 1 + (r/i) · result */
+        ndarray_dd_t r_over_i = ndarray_dd_div(r, ndarray_dd_from_double((double)i));
+        result = ndarray_dd_add(ndarray_dd_from_double(1.0),
+                                 ndarray_dd_mul(r_over_i, result));
+    }
+
+    /* Scale by 2^k using ldexp on each limb — exact, exponent-only op. */
+    result.hi = ldexp(result.hi, k);
+    result.lo = ldexp(result.lo, k);
+    return result;
+}
+
+/**
+ * @brief DD-precision expm1(x) = exp(x) − 1.
+ *
+ * Near zero, computing `exp(x) − 1` directly suffers catastrophic
+ * cancellation. Use the Taylor series of expm1 itself for |x| ≤ 0.5:
+ *     expm1(x) = x + x²/2! + x³/3! + … = x · (1 + x/2 · (1 + x/3 · (…)))
+ * which converges with 25 terms at full DD precision. For larger |x|
+ * the cancellation is negligible — defer to `exp(x) − 1`.
+ *
+ * @param[in] a Input DD value.
+ * @return exp(a) − 1 in DD precision.
+ */
+ndarray_dd_t ndarray_dd_expm1(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi >= 0.5 || a.hi <= -0.5) {
+        return ndarray_dd_sub(ndarray_dd_exp(a), ndarray_dd_from_double(1.0));
+    }
+    /* Horner of x·(1 + x/2·(1 + x/3·(…))) — start at i=25 to capture
+       (0.5)^25/25! ≈ 1.9e-33 < DD eps. */
+    ndarray_dd_t result = ndarray_dd_from_double(1.0);
+    for (int i = 25; i >= 2; i--) {
+        ndarray_dd_t a_over_i = ndarray_dd_div(a, ndarray_dd_from_double((double)i));
+        result = ndarray_dd_add(ndarray_dd_from_double(1.0),
+                                 ndarray_dd_mul(a_over_i, result));
+    }
+    return ndarray_dd_mul(a, result);
+}
+
+/**
+ * @brief DD-precision log(x) (natural logarithm).
+ *
+ * Range reduction: write x = m · 2^e via `frexp`, so m ∈ [0.5, 1). To
+ * keep the substitution `u = (m − 1)/(m + 1)` small we conditionally
+ * shift m into [√0.5, √2) ≈ [0.707, 1.414); then |u| ≤ 0.172. The
+ * atanh-style series ln(m) = 2·(u + u³/3 + u⁵/5 + u⁷/7 + …) converges
+ * about twice as fast as the plain Taylor of ln(1+y) because the
+ * even-power terms vanish. Twenty-six odd terms (through u^51/51) give
+ * full ~32-digit DD precision at the |u| ≤ 0.172 boundary.
+ *
+ * Final: log(x) = 2·Σ + e·ln(2).
+ *
+ * NaN / negative / zero handling:
+ *   log(NaN) → NaN, log(<0) → NaN, log(0) → −inf, log(+inf) → +inf.
+ *
+ * @param[in] a Input DD value (must be > 0 for a finite result).
+ * @return log(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_log(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi < 0.0) return ndarray_dd_from_double(NAN);
+    if (a.hi == 0.0 && a.lo == 0.0) return ndarray_dd_from_double(-INFINITY);
+    if (isinf(a.hi)) return ndarray_dd_from_double(INFINITY);
+
+    /* Decompose hi = m · 2^e so m ∈ [0.5, 1). The lo limb is folded back
+       in DD multiplication. */
+    int    e;
+    double m_hi = frexp(a.hi, &e);
+    /* Re-normalize the DD pair after stripping 2^e: dd = a / 2^e. */
+    ndarray_dd_t m = ndarray_dd_from_pair(m_hi, ldexp(a.lo, -e));
+
+    /* Bring m into [sqrt(0.5), sqrt(2)) so |u| ≤ ~0.172. */
+    if (m.hi < 0.7071067811865476) {
+        m   = ndarray_dd_add(m, m);    /* m · 2 */
+        e  -= 1;
+    }
+
+    /* u = (m − 1) / (m + 1). */
+    ndarray_dd_t one = ndarray_dd_from_double(1.0);
+    ndarray_dd_t u   = ndarray_dd_div(ndarray_dd_sub(m, one),
+                                       ndarray_dd_add(m, one));
+    ndarray_dd_t u2  = ndarray_dd_mul(u, u);
+
+    /* 2·atanh(u) = 2·(u + u³/3 + u⁵/5 + … + u^(2N-1)/(2N-1)). For
+       |u| ≤ 0.172 (the post-shift range), 2N-1 = 51 gives the worst-
+       case truncated term u^51/51 ≈ 4·10⁻⁴² — well below DD epsilon.
+       Use `dd_div` for the 1/k constants; `dd_from_double(1.0 / k)`
+       would only have fp64 precision in the constant. */
+    ndarray_dd_t sum = ndarray_dd_div(one, ndarray_dd_from_double(51.0));
+    for (int k = 49; k >= 1; k -= 2) {
+        ndarray_dd_t inv_k = ndarray_dd_div(one, ndarray_dd_from_double((double)k));
+        sum = ndarray_dd_add(inv_k, ndarray_dd_mul(u2, sum));
+    }
+    /* Multiply by 2u to get the series sum. */
+    ndarray_dd_t log_m = ndarray_dd_mul(u, sum);
+    log_m = ndarray_dd_add(log_m, log_m);  /* · 2 */
+
+    /* log(x) = log(m) + e · ln(2). */
+    ndarray_dd_t e_dd = ndarray_dd_from_double((double)e);
+    return ndarray_dd_add(log_m, ndarray_dd_mul(e_dd, DD_LN2));
+}
+
+/**
+ * @brief DD-precision log1p(x) = log(1 + x).
+ *
+ * For |x| ≤ 0.5 the value 1 + x suffers catastrophic cancellation of
+ * x's sub-fp64 information (when |x| ≲ fp64 epsilon the whole of x lands
+ * in the lo limb and is rounded away by the subsequent range reduction).
+ * Use instead the area-hyperbolic-tangent identity
+ *     log1p(x) = 2·atanh( x / (2 + x) ),
+ * with u = x / (2 + x). The divisor 2 + x stays in [1.5, 2.5] so it
+ * never cancels and the DD add/divide preserve x's lo limb in full;
+ * |u| ≤ 0.2 over the branch, so the odd series 2·(u + u³/3 + … + u⁵¹/51)
+ * (26 odd terms) is below DD epsilon. For |x| > 0.5 there is no
+ * cancellation in 1 + x, so defer to `dd_log(1 + x)` — that path also
+ * covers the x ≤ −1 (→ NaN / −inf) and +inf edges.
+ *
+ * @param[in] a Input DD value (a > −1 for a finite result).
+ * @return log(1 + a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_log1p(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi >= 0.5 || a.hi <= -0.5) {
+        return ndarray_dd_log(ndarray_dd_add(ndarray_dd_from_double(1.0), a));
+    }
+    ndarray_dd_t one = ndarray_dd_from_double(1.0);
+    ndarray_dd_t u   = ndarray_dd_div(a,
+                           ndarray_dd_add(ndarray_dd_from_double(2.0), a));
+    ndarray_dd_t u2  = ndarray_dd_mul(u, u);
+    /* Same 26-odd-term atanh ladder as ndarray_dd_log; |u| ≤ 0.2 here so
+       the truncated term u^53/53 is far below DD epsilon. */
+    ndarray_dd_t sum = ndarray_dd_div(one, ndarray_dd_from_double(51.0));
+    for (int k = 49; k >= 1; k -= 2) {
+        ndarray_dd_t inv_k = ndarray_dd_div(one, ndarray_dd_from_double((double)k));
+        sum = ndarray_dd_add(inv_k, ndarray_dd_mul(u2, sum));
+    }
+    ndarray_dd_t r = ndarray_dd_mul(u, sum);
+    return ndarray_dd_add(r, r);  /* · 2 */
+}
+
+/**
+ * @brief DD-precision exp2(x) = 2^x.
+ *
+ * Implemented as `exp(x · ln(2))` so the existing DD exp drives the
+ * precision; the multiplication by `DD_LN2` is exact at DD precision
+ * because `x` is the only fp64-tier input.
+ *
+ * @param[in] a Input DD value.
+ * @return 2^a in DD precision.
+ */
+ndarray_dd_t ndarray_dd_exp2(ndarray_dd_t a) {
+    return ndarray_dd_exp(ndarray_dd_mul(a, DD_LN2));
+}
+
+/**
+ * @brief DD-precision log2(x) = log(x) / ln(2) = log(x) · log2(e).
+ *
+ * Special-case exact integer powers of two so `log2(2^k)` returns
+ * exactly `k` (matching the GPU `tcuda_log2_fp` short-circuit and
+ * the CPU libm guarantee on libquadmath builds).
+ *
+ * @param[in] a Input DD value (a > 0 for a finite result).
+ * @return log2(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_log2(ndarray_dd_t a) {
+    /* Power-of-2 short-circuit: frexp(2^k) = (0.5, k+1). */
+    if (a.lo == 0.0 && isfinite(a.hi) && a.hi > 0.0) {
+        int e;
+        double m = frexp(a.hi, &e);
+        if (m == 0.5) return ndarray_dd_from_double((double)(e - 1));
+    }
+    return ndarray_dd_mul(ndarray_dd_log(a), DD_LOG2_E);
+}
+
+/**
+ * @brief DD-precision log10(x) = log(x) · log10(e).
+ *
+ * @param[in] a Input DD value (a > 0 for a finite result).
+ * @return log10(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_log10(ndarray_dd_t a) {
+    return ndarray_dd_mul(ndarray_dd_log(a), DD_LOG10_E);
+}
+
+/**
+ * @brief DD-precision logb(x) — binary exponent of |x| as a DD integer.
+ *
+ * `logb(x)` is defined as `floor(log2(|x|))` for finite normal x and
+ * is already integer-valued, so the result fits exactly in fp64. The
+ * `lo` limb of the result is always 0.
+ *
+ * @param[in] a Input DD value.
+ * @return logb(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_logb(ndarray_dd_t a) {
+    return ndarray_dd_from_double(logb(a.hi));
+}
+
 /* ── int conversion ─────────────────────────────────────────────────────── */
 
 long long ndarray_dd_to_int64(ndarray_dd_t a) {

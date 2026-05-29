@@ -3494,6 +3494,274 @@ PHP_METHOD(NumPower, flatten) {
 }
 
 /**
+ * @brief Infer the loss-free dtype for a bare numeric string scalar.
+ *
+ * Bare strings carry no peer-NDArray context, so the dispatcher decides
+ * the dtype from the string's content. The rule is conservative and
+ * picks the widest dtype that can hold the value without rounding —
+ * strings are precisely the intake path callers use to escape PHP's
+ * native long/double range:
+ *  - any decimal point, exponent marker (`e`/`E`), or `inf`/`infinity`/
+ *    `nan` token (case-insensitive) → `float128` (the only dtype that
+ *    holds wide decimal literals end-to-end);
+ *  - non-negative integer literal whose magnitude exceeds UINT64_MAX
+ *    → `float128` (escalate to keep the precision rather than saturate
+ *    at `2^64 - 1`);
+ *  - non-negative integer literal with magnitude > INT64_MAX (i.e.
+ *    > 19 digits, or 19 digits exceeding the INT64_MAX prefix) →
+ *    `uint64` (the only dtype that holds the full 64-bit range);
+ *  - negative integer literal → `int64` (negatives can't fit `uint64`,
+ *    and `INT64_MIN`'s magnitude is bounded by 19 digits);
+ *  - otherwise → `int64` (every magnitude that fits both signed and
+ *    unsigned, including zero).
+ *
+ * Strict syntactic validation runs in the same pass: the function
+ * rejects any literal that is not a syntactically complete numeric
+ * value (e.g. `"0xff"`, `"abc"`, `"1.5.5"`, `"1.5a"`, `"1,5"`,
+ * `"1.5e"`, `"  -  1.5"`) by returning NULL. The caller throws
+ * `"Numeric string expected"`. This prevents the silent-zero coercion
+ * that `strtoll`/`strtoull`/`strtoflt128` would otherwise return when
+ * given a partial or malformed literal.
+ *
+ * Magnitude is compared digit-by-digit against the INT64_MAX /
+ * UINT64_MAX strings, which sidesteps the strtoull / errno boundary
+ * and works correctly even with leading-zero or leading-`+` literals.
+ * Whitespace at either end is tolerated (mirrors `strtod`).
+ *
+ * @param[in] str  String content (need not be NUL-terminated within
+ *                 @p len bytes).
+ * @param[in] len  Length in bytes.
+ * @return Canonical dtype string ("float128" / "int64" / "uint64") or
+ *         NULL when @p str is empty, all-whitespace, or syntactically
+ *         malformed (caller throws).
+ */
+static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
+{
+    if (str == NULL || len == 0) {
+        return NULL;
+    }
+    /* Trim leading whitespace (strtod-style). */
+    size_t i = 0;
+    while (i < len && (str[i] == ' ' || str[i] == '\t' ||
+                       str[i] == '\n' || str[i] == '\r')) {
+        i++;
+    }
+    /* Trim trailing whitespace. */
+    size_t end = len;
+    while (end > i && (str[end - 1] == ' ' || str[end - 1] == '\t' ||
+                       str[end - 1] == '\n' || str[end - 1] == '\r')) {
+        end--;
+    }
+    if (i == end) {
+        return NULL;
+    }
+
+    /* Detect inf / infinity / nan tokens (case-insensitive). The token
+       must consume the entire (trimmed, possibly signed) literal — the
+       silent-tail-junk problem applies here too. */
+    size_t sign_off = i;
+    if (str[sign_off] == '+' || str[sign_off] == '-') {
+        sign_off++;
+        if (sign_off == end) return NULL;  /* "+" / "-" alone */
+    }
+    size_t tail_len = end - sign_off;
+    if (tail_len == 3 || tail_len == 8) {
+        char low[9] = {0};
+        for (size_t k = 0; k < tail_len; k++) {
+            low[k] = (char)(str[sign_off + k] | 0x20);
+        }
+        if ((tail_len == 3 && (memcmp(low, "inf", 3) == 0 ||
+                               memcmp(low, "nan", 3) == 0)) ||
+            (tail_len == 8 && memcmp(low, "infinity", 8) == 0)) {
+            return "float128";
+        }
+    }
+
+    /* Strict numeric-literal scan over str[i..end). Tracks whether the
+       literal contains a fractional / exponent part (→ fp128) and where
+       the magnitude digits live (for the int64-vs-uint64 split). Any
+       character that does not fit the grammar fails the scan. */
+    size_t k      = i;
+    int    is_neg = 0;
+    if (k < end && (str[k] == '+' || str[k] == '-')) {
+        is_neg = (str[k] == '-');
+        k++;
+    }
+    /* Mantissa integer part. */
+    size_t mant_int_start = k;
+    while (k < end && str[k] >= '0' && str[k] <= '9') k++;
+    size_t mant_int_len = k - mant_int_start;
+
+    int saw_dot = 0;
+    size_t frac_len = 0;
+    if (k < end && str[k] == '.') {
+        saw_dot = 1;
+        k++;
+        size_t frac_start = k;
+        while (k < end && str[k] >= '0' && str[k] <= '9') k++;
+        frac_len = k - frac_start;
+    }
+    /* At least one digit in mantissa (integer or fractional). */
+    if (mant_int_len == 0 && frac_len == 0) {
+        return NULL;
+    }
+
+    int saw_exp = 0;
+    if (k < end && (str[k] == 'e' || str[k] == 'E')) {
+        saw_exp = 1;
+        k++;
+        if (k < end && (str[k] == '+' || str[k] == '-')) k++;
+        size_t exp_start = k;
+        while (k < end && str[k] >= '0' && str[k] <= '9') k++;
+        if (k == exp_start) {
+            /* Exponent marker without digits, e.g. "1.5e". */
+            return NULL;
+        }
+    }
+    /* Everything from i..end must have been consumed. */
+    if (k != end) {
+        return NULL;
+    }
+
+    /* Floating-point literal → fp128. */
+    if (saw_dot || saw_exp) {
+        return "float128";
+    }
+
+    /* Pure integer literal — magnitude check on the digits (skip leading
+       zeros) decides int64 vs uint64 vs float128. */
+    const char *p = str + mant_int_start;
+    size_t      m = mant_int_len;
+    while (m > 1 && *p == '0') { p++; m--; }
+
+    static const char int64_max_str[]  = "9223372036854775807";   /* 19 digits */
+    static const char int64_min_mag[]  = "9223372036854775808";   /* |INT64_MIN|, 19 digits */
+    static const char uint64_max_str[] = "18446744073709551615";  /* 20 digits */
+
+    if (is_neg) {
+        /* Negative magnitude: int64 holds down to -INT64_MIN = -9223372036854775808;
+           anything wider must escalate to float128 (uint64 cannot represent
+           negatives, and strtoll would silently saturate to INT64_MIN with
+           errno=ERANGE if we'd routed it through int64). */
+        if (m > 19) return "float128";
+        if (m == 19 && memcmp(p, int64_min_mag, 19) > 0) return "float128";
+        return "int64";
+    }
+    if (m > 20) {
+        /* Past UINT64_MAX — escalate to fp128 to keep precision rather
+           than saturate the integer dtypes. */
+        return "float128";
+    }
+    if (m == 20) {
+        if (memcmp(p, uint64_max_str, 20) > 0) return "float128";
+        return "uint64";
+    }
+    if (m == 19 && memcmp(p, int64_max_str, 19) > 0) {
+        return "uint64";
+    }
+    return "int64";
+}
+
+/**
+ * @brief Resolve the input zval of a unary op (`abs`, `exp`, `clip`, …)
+ *        into a usable NDArray, honouring the bare-string-scalar intake.
+ *
+ * Three intake forms are accepted:
+ *  - **NDArray / nested array / int / float**: routed through
+ *    `ZVAL_TO_NDARRAY`. The returned NDArray is *borrowed* from the
+ *    caller's zval — caller must release via `CHECK_INPUT_AND_FREE`
+ *    (which is a no-op when the zval already wraps an NDArray and an
+ *    `NDArray_FREE` otherwise).
+ *  - **Numeric string**: dtype inferred from the literal via
+ *    `ndarray_infer_dtype_from_string`, then encoded into a fresh 0-D
+ *    NDArray on CPU via `ndarray_make_typed_scalar`. This is the only
+ *    intake that lets a one-call expression carry full `float128` /
+ *    `uint64` precision without first allocating an NDArray. The
+ *    returned NDArray is *owned* by the caller — release via
+ *    `NDArray_FREE`.
+ *  - **Malformed / empty / whitespace-only string**: throws a clear PHP
+ *    error citing the offending literal and returns NULL.
+ *
+ * Shared by every unary method that funnels through
+ * `ndarray_run_simple_unary` and by `clip`, which has extra lo/hi
+ * bound parameters but otherwise the same intake contract.
+ *
+ * @param[in]  array PHP zval supplied as the array argument.
+ * @param[out] owned Receives 1 when the caller must release the
+ *                   returned NDArray with `NDArray_FREE`, 0 when the
+ *                   pair (zval, NDArray) must be released through
+ *                   `CHECK_INPUT_AND_FREE`. Untouched on failure.
+ * @return NDArray on success; NULL on validation failure (with a PHP
+ *         exception in flight).
+ */
+static NDArray *ndarray_resolve_unary_input(zval *array, int *owned)
+{
+    if (Z_TYPE_P(array) == IS_STRING) {
+        const char *dt = ndarray_infer_dtype_from_string(
+            Z_STRVAL_P(array), Z_STRLEN_P(array));
+        if (dt == NULL) {
+            /* Differentiate the three failure modes so callers can spot
+               typos quickly: empty literal, whitespace-only, or
+               syntactically malformed (non-empty, non-whitespace). */
+            const char *p = Z_STRVAL_P(array);
+            size_t      n = Z_STRLEN_P(array);
+            size_t      ws = 0;
+            while (ws < n && (p[ws] == ' ' || p[ws] == '\t' ||
+                              p[ws] == '\n' || p[ws] == '\r')) {
+                ws++;
+            }
+            if (n == 0) {
+                zend_throw_error(NULL,
+                    "Numeric string expected, got an empty value.");
+            } else if (ws == n) {
+                zend_throw_error(NULL,
+                    "Numeric string expected, got a whitespace-only value.");
+            } else {
+                /* Length-bounded (`%.*s`) so an embedded NUL doesn't
+                   truncate the offending literal in the diagnostic. */
+                zend_throw_error(NULL,
+                    "Numeric string expected, got malformed literal: \"%.*s\".",
+                    (int)n, p);
+            }
+            return NULL;
+        }
+        NDArray *nda = ndarray_make_typed_scalar(array, dt);
+        if (nda == NULL) {
+            return NULL;
+        }
+        *owned = 1;
+        return nda;
+    }
+    *owned = 0;
+    return ZVAL_TO_NDARRAY(array);
+}
+
+/**
+ * @brief Release the NDArray resolved by `ndarray_resolve_unary_input`,
+ *        choosing the right free path for the ownership flag.
+ *
+ * Owned NDArrays come from `ndarray_make_typed_scalar` and are released
+ * directly via `NDArray_FREE`. Borrowed NDArrays go through
+ * `CHECK_INPUT_AND_FREE`, which is a no-op when the zval already wraps
+ * an NDArray (so the user's reference survives) and an `NDArray_FREE`
+ * when the zval was a literal array / int / float (so the transient
+ * `ZVAL_TO_NDARRAY` buffer is returned to the pool).
+ *
+ * @param[in] array Original input zval.
+ * @param[in] nda   NDArray previously returned by
+ *                  `ndarray_resolve_unary_input`.
+ * @param[in] owned The matching ownership flag.
+ */
+static void ndarray_release_unary_input(zval *array, NDArray *nda, int owned)
+{
+    if (owned) {
+        NDArray_FREE(nda);
+    } else {
+        CHECK_INPUT_AND_FREE(array, nda);
+    }
+}
+
+/**
  * @brief Run a typed unary op on a single zval argument and install
  *        the result.
  *
@@ -3513,14 +3781,18 @@ PHP_METHOD(NumPower, flatten) {
  * binary-unary / extra-arg support.
  *
  * Centralises the PHP-binding plumbing every unary method needs:
- *  - resolves the input zval to an NDArray (array / int / float / NDArray);
- *  - bare strings are rejected with a clear error pointing the caller at
- *    `NumPower::array(['…'], 'dtype')`, the only loss-free string intake
- *    path for `float128` / `int64` / `uint64`;
+ *  - resolves the input zval to an NDArray via
+ *    `ndarray_resolve_unary_input` (handles NDArray / array / scalar /
+ *    numeric string, infers dtype for the string intake). String-scalar
+ *    inputs always materialize a 0-D NDArray on CPU because there is no
+ *    peer NDArray to anchor a device choice on — pre-existing GPU
+ *    NDArrays passed as inputs still execute on GPU per the device
+ *    contract below;
  *  - dispatches through `NDArray_TypedUnaryOp`, which keeps GPU inputs on
  *    GPU and matches CPU bit-for-bit on every supported dtype;
- *  - releases the transient NDArray when the caller passed a literal
- *    array / int / float so no buffer slot survives the call;
+ *  - releases the resolved NDArray via `ndarray_release_unary_input`,
+ *    routing to the right free path for owned vs borrowed inputs so no
+ *    buffer slot survives the call;
  *  - installs the result via `ndarray_init_new_object`, which collapses
  *    a 0-D result to the dtype-correct PHP scalar.
  *
@@ -3534,21 +3806,14 @@ ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAMETERS, NDArrayUnaryOp op) {
         Z_PARAM_ZVAL(array)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (Z_TYPE_P(array) == IS_STRING) {
-        zend_throw_error(NULL,
-            "Cannot infer dtype for a bare string. Wrap it as "
-            "NumPower::array(['%s'], 'float128'|'int64'|'uint64'|...).",
-            Z_STRVAL_P(array));
-        return;
-    }
-
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
+    int nda_owned;
+    NDArray *nda = ndarray_resolve_unary_input(array, &nda_owned);
     if (nda == NULL) {
         return;
     }
 
     NDArray *rtn = NDArray_TypedUnaryOp(op, nda, NULL, NULL);
-    CHECK_INPUT_AND_FREE(array, nda);
+    ndarray_release_unary_input(array, nda, nda_owned);
     if (rtn == NULL) {
         return;
     }
@@ -4070,27 +4335,23 @@ PHP_METHOD(NumPower, clip) {
         Z_PARAM_ZVAL(max_zv)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (Z_TYPE_P(array) == IS_STRING) {
-        zend_throw_error(NULL,
-            "Cannot infer dtype for a bare string. Wrap it as "
-            "NumPower::array(['%s'], 'float128'|'int64'|'uint64'|...).",
-            Z_STRVAL_P(array));
-        return;
-    }
-
     char *min_str = ndarray_clip_bound_to_string(min_zv, "min");
     if (min_str == NULL) return;
     char *max_str = ndarray_clip_bound_to_string(max_zv, "max");
     if (max_str == NULL) { efree(min_str); return; }
 
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
+    /* Bare numeric string `$array` is accepted here too: the shared
+       helper infers fp128 / uint64 / int64 from the literal and builds
+       a 0-D scalar via `ndarray_make_typed_scalar`. */
+    int nda_owned;
+    NDArray *nda = ndarray_resolve_unary_input(array, &nda_owned);
     if (nda == NULL) { efree(min_str); efree(max_str); return; }
 
     NDArray *rtn = NDArray_TypedUnaryOp(NDARRAY_UNOP_CLIP, nda,
                                          min_str, max_str);
     efree(min_str);
     efree(max_str);
-    CHECK_INPUT_AND_FREE(array, nda);
+    ndarray_release_unary_input(array, nda, nda_owned);
     if (rtn == NULL) return;
     ndarray_init_new_object(rtn, return_value);
 }

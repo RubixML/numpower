@@ -130,13 +130,29 @@ check("1025-element log shape",  $lb->shape(), [1025]);
 check("1025-element log[0]=0",   $lb->toArray()[0], 0.0, 1e-15);
 check("1025-element log[1024]",  $lb->toArray()[1024], log(1025), 1e-12);
 
-/* ── String-input throws on every op ─────────────────────────────────── */
+/* ── String input is accepted: "1.0" → fp128 0-D scalar ──────────────── */
+/* Each op returns an fp128 0-D scalar (string) for a decimal literal.
+   Spot-check the result is finite and non-empty. */
 foreach (['exp','exp2','expm1','log','log1p','log2','log10','logb'] as $op) {
     try {
-        NumPower::$op("1.0");
-        echo "FAIL $op(string) did not throw\n";
+        $r = (string)NumPower::$op("1.0");
+        $ok = is_finite((float)$r) || ($op === 'logb' && (float)$r === 0.0);
+        if (strlen($r) > 0 && $ok) {
+            echo "OK $op('1.0') -> $r\n";
+        } else {
+            echo "FAIL $op('1.0') unexpected result: '$r'\n";
+        }
     } catch (Error $e) {
-        echo "OK $op(string) throws\n";
+        echo "FAIL $op('1.0') threw: ", $e->getMessage(), "\n";
+    }
+}
+/* Empty / whitespace-only strings still throw on every op. */
+foreach (['exp','exp2','expm1','log','log1p','log2','log10','logb'] as $op) {
+    try {
+        NumPower::$op("");
+        echo "FAIL $op('') did not throw\n";
+    } catch (Error $e) {
+        echo "OK $op('') throws\n";
     }
 }
 

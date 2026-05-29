@@ -232,15 +232,28 @@ foreach (['float32', 'float64', 'float16'] as $dt) {
     check("$dt sin(empty[0,5]) dtype", $r->__serialize()['dtype'], $dt);
 }
 
-/* ─── Bare string rejection on every op ─── */
+/* ─── Bare string input accepted on every op: "1.0" → fp128 scalar ─── */
 foreach (['sin','cos','tan','arcsin','arccos','arctan',
           'sinh','cosh','tanh','arcsinh','arccosh','arctanh',
           'degrees','radians','rint','fix','trunc','floor','ceil'] as $op) {
     try {
-        NumPower::$op("1.0");
-        echo "FAIL $op(bare string) did not throw\n";
+        $r = (string)NumPower::$op("1.0");
+        if (strlen($r) === 0) {
+            echo "FAIL $op(bare string) empty result\n";
+        } else {
+            echo "OK $op(bare string) -> $r\n";
+        }
     } catch (Error $e) {
-        echo "OK $op(bare string) throws\n";
+        echo "FAIL $op(bare string) threw: ", $e->getMessage(), "\n";
+    }
+}
+/* ─── Empty / whitespace-only strings still throw ─── */
+foreach (['sin','cos','floor'] as $op) {
+    try {
+        NumPower::$op("");
+        echo "FAIL $op('') did not throw\n";
+    } catch (Error $e) {
+        echo "OK $op('') throws\n";
     }
 }
 
