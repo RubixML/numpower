@@ -9,7 +9,6 @@ extern "C" {
 
 typedef void (*ElementWiseFloatGPUOperation)(int, float *);
 typedef void (*ElementWiseFloatGPUOperation2F)(int, float *, float, float);
-typedef void (*ElementWiseFloatGPUOperation1F)(int, float *, float);
 typedef void (*ElementWiseFloatGPUOperation1N)(int, float *, float *);
 NDArray* NDArrayMathGPU_ElementWise1N(NDArray* ndarray, ElementWiseFloatGPUOperation1N op, NDArray* val1);
 NDArray* NDArrayMathGPU_ElementWise(NDArray *ndarray, ElementWiseFloatGPUOperation op);
@@ -36,16 +35,14 @@ int cuda_det_float(float *a, float *result, int n);
    API by the typed-unary refactor — all dispatch goes through
    `cuda_<op>_{f32,f64,f16,dd}` now. `arctan2` joined the typed binary
    dispatch (`cuda_atan2_{f32,f64,dd}`, declared with the other typed
-   binops below); the only legacy float-only wrapper still on a
-   non-typed path is `cuda_float_round` (precision arg), which sits on
-   the legacy `NDArray_Map1F` rail until precision-arg support lands in
-   the dispatcher. */
+   binops below) and `round` joined the typed unary dispatch
+   (`cuda_round_{f16,f32,f64,dd}`, declared below). No legacy float-only
+   element-wise wrapper remains. */
 void cuda_float_multiply_matrix_vector(int nblocks, float *a_array, float *b_array, float *result, int rows, int cols);
 void cuda_float_compare_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_matrix_float_inverse(float* matrix, int n);
 void cuda_float_lu(float *matrix, float *L, float *U, float *P, int size);
 void cuda_prod_float(int nblocks, float *a, float *rtn, int nelements);
-void cuda_float_round(int nblocks, float *d_array, float decimals);  /* precision-arg legacy */
 void cuda_calculate_outer_product(int m, int n, float *a_array, float *b_array, float *r_array);
 void cuda_float_compare_greater(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_float_compare_greater_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
@@ -58,7 +55,6 @@ void cuda_float_compare_not_equal(int nblocks, float *a_array, float *b_array, f
    non-existent symbol. Re-add the declaration here when the GPU kernel
    actually lands. */
 NDArray* NDArrayMathGPU_ElementWise2F(NDArray* ndarray, ElementWiseFloatGPUOperation2F op, float val1, float val2);
-NDArray* NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOperation1F op, float val1);
 void cuda_float_transpose(int tiledim, int blockrows, const float *d_in, float *d_out, int width, int height);
 /* `cuda_float_positive` / `cuda_float_reciprocal` removed from the
    public API by the typed-unary refactor — use cuda_recip_{f16,f32,
@@ -575,6 +571,14 @@ DECLARE_UNOP_FP_WRAPPERS(floor)
 DECLARE_UNOP_FP_WRAPPERS(ceil)
 
 #undef DECLARE_UNOP_FP_WRAPPERS
+
+/* Precision-aware round (`round(x, decimals)`). Distinct signature from the
+   wrappers above — it carries the `decimals` precision. The factor is
+   computed on the host inside each wrapper; `decimals` may be negative. */
+void cuda_round_f16(uint16_t *a, int decimals, int n);
+void cuda_round_f32(float    *a, int decimals, int n);
+void cuda_round_f64(double   *a, int decimals, int n);
+void cuda_round_dd (double   *a, int decimals, int n);
 
 void cuda_clip_i8 (int8_t   *a, int8_t   lo, int8_t   hi, int n);
 void cuda_clip_u8 (uint8_t  *a, uint8_t  lo, uint8_t  hi, int n);

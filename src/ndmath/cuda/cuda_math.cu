@@ -267,15 +267,6 @@ __global__ void luFloatDecompositionKernel(float *matrix, float *L, float *U, fl
     }
 }
 
-__global__ void roundToDecimalsFloatKernel(float* numbers, int decimals, int size) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (tid < size) {
-        float factor = powf(10, decimals);
-        numbers[tid] = round(numbers[tid] * factor) / factor;
-    }
-}
-
 __global__ void matrixL1NormFloatKernel(const float* matrix, float* result, int rows, int cols) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     float sum = 0.0f;
@@ -2396,6 +2387,52 @@ __global__ void tcuda_strided_copy_kernel(
     }
 }
 
+/* ── round-to-decimals kernels (precision-aware) ──────────────────────────
+   `round(x, decimals)` = round-half-to-even of x on a 10^decimals grid.
+   The `10^|decimals|` factor is computed once on the host inside the
+   `cuda_round_*` wrappers (the legacy per-thread `powf` was both slower and
+   float-only) and passed in. For `decimals >= 0` we scale up then divide;
+   for `decimals < 0` we divide then scale up so the factor is always a
+   positive, exactly-representable (|decimals| <= 22) power of ten — exactly
+   PyTorch's `round_decimals` kernel. round-to-nearest-even comes from
+   `rint` / libdevice's default rounding mode, so `round(2.5) == 2`. These
+   kernels live outside the `extern "C"` block below because templates and
+   `__global__` definitions cannot carry C linkage; the host wrappers that
+   launch them do. */
+template <typename T>
+__global__ void tcuda_round_float_kernel(T *a, T pw, int neg, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        T x = a[i];
+        a[i] = neg ? tcuda_rint_fp<T>(x / pw) * pw
+                   : tcuda_rint_fp<T>(x * pw) / pw;
+    }
+}
+__global__ void tcuda_round_half_kernel(__half *a, float pw, int neg, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        float x = __half2float(a[i]);
+        float y = neg ? rintf(x / pw) * pw : rintf(x * pw) / pw;
+        a[i] = __float2half(y);
+    }
+}
+/* DD round: scale in double-double, round the scaled value at the fp64 tier
+   (dd → double → rint → dd, matching `tcuda_rint_dd_kernel`), unscale in DD.
+   The host passes `10^|decimals|` as the (hi, lo) DD pair. */
+__global__ void tcuda_round_dd_kernel(double *a, double pw_hi, double pw_lo,
+                                      int neg, int n) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i < n) {
+        dd_real x  = dd_make(a[2 * i], a[2 * i + 1]);
+        dd_real pw = dd_make(pw_hi, pw_lo);
+        dd_real s  = neg ? dd_div(x, pw) : dd_mul(x, pw);
+        s = dd_make(rint(dd_to_double(s)), 0.0);
+        dd_real r  = neg ? dd_mul(s, pw) : dd_div(s, pw);
+        a[2 * i]     = r.hi;
+        a[2 * i + 1] = r.lo;
+    }
+}
+
 extern "C" {
 
     int
@@ -2863,13 +2900,6 @@ extern "C" {
     }
 
     void
-    cuda_float_round(int nblocks, float *d_array, float decimals) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        roundToDecimalsFloatKernel<<<numBlocks, blockSize>>>(d_array, (int)decimals, nblocks);
-    }
-
-    void
     cuda_float_floor(int nblocks, float *d_array) {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
@@ -3047,13 +3077,6 @@ extern "C" {
     NDArrayMathGPU_ElementWise(NDArray* ndarray, ElementWiseFloatGPUOperation op) {
         NDArray *rtn = NDArray_Copy(ndarray, NDArray_DEVICE(ndarray));
         op(NDArray_NUMELEMENTS(rtn), NDArray_F32DATA(rtn));
-        return rtn;
-    }
-
-    NDArray*
-    NDArrayMathGPU_ElementWise1F(NDArray* ndarray, ElementWiseFloatGPUOperation1F op, float val1) {
-        NDArray *rtn = NDArray_Copy(ndarray, NDArray_DEVICE(ndarray));
-        op(NDArray_NUMELEMENTS(rtn), NDArray_F32DATA(rtn), val1);
         return rtn;
     }
 
@@ -3688,6 +3711,40 @@ DEF_TRANSC_WRAPPERS(floor,    tcuda_floor)
 DEF_TRANSC_WRAPPERS(ceil,     tcuda_ceil)
 
 #undef DEF_TRANSC_WRAPPERS
+
+/* Precision-aware round wrappers. The `tcuda_round_*` kernels are defined
+   above the `extern "C"` block (templates / `__global__` can't take C
+   linkage); each wrapper computes the `10^|decimals|` factor on the host
+   and launches its kernel. See those kernels for the round-half-to-even
+   contract. */
+void cuda_round_f32(float *a, int decimals, int n) {
+    GRID_FOR(n);
+    int neg = decimals < 0;
+    int k = neg ? -decimals : decimals;
+    float pw = powf(10.0f, (float)k);
+    tcuda_round_float_kernel<float><<<numBlocks, blockSize>>>(a, pw, neg, n);
+}
+void cuda_round_f64(double *a, int decimals, int n) {
+    GRID_FOR(n);
+    int neg = decimals < 0;
+    int k = neg ? -decimals : decimals;
+    double pw = pow(10.0, (double)k);
+    tcuda_round_float_kernel<double><<<numBlocks, blockSize>>>(a, pw, neg, n);
+}
+void cuda_round_f16(uint16_t *a, int decimals, int n) {
+    GRID_FOR(n);
+    int neg = decimals < 0;
+    int k = neg ? -decimals : decimals;
+    float pw = powf(10.0f, (float)k);
+    tcuda_round_half_kernel<<<numBlocks, blockSize>>>((__half *)a, pw, neg, n);
+}
+void cuda_round_dd(double *a, int decimals, int n) {
+    GRID_FOR(n);
+    int neg = decimals < 0;
+    int k = neg ? -decimals : decimals;
+    double pw = pow(10.0, (double)k);  /* exact for k <= 22; lo word 0 */
+    tcuda_round_dd_kernel<<<numBlocks, blockSize>>>(a, pw, 0.0, neg, n);
+}
 
 #define DEF_CLIP_T_WRAPPER(NAME, T)                                                 \
 void NAME(T *a, T lo, T hi, int n) {                                                \

@@ -3492,8 +3492,9 @@ static const char *unary_result_dtype(NDArrayUnaryOp op, const char *input_dt) {
             }
             return input_dt;
         default:
-            /* RINT / FIX / TRUNC / FLOOR / CEIL preserve dtype — integers
-               are already integer-valued, so the rounded result == input. */
+            /* RINT / FIX / TRUNC / FLOOR / CEIL / ROUND preserve dtype —
+               integers are already integer-valued, so the rounded result
+               == input. */
             return input_dt;
     }
 }
@@ -3954,6 +3955,81 @@ static int unary_parse_typed_scalar(const char *dt, const char *str,
 }
 
 /**
+ * @brief Round every CPU element to @p decimals decimal places using
+ *        round-half-to-even, in place.
+ *
+ * Implements PyTorch's `torch.round(x, decimals=…)` element kernel:
+ * `rint(x · 10^decimals) / 10^decimals` for `decimals >= 0`, and the
+ * numerically safer `rint(x / 10^|decimals|) · 10^|decimals|` for
+ * `decimals < 0` (a positive power of ten is exactly representable for
+ * `|decimals| <= 22`, a negative one is not). `rint` honours the default
+ * round-to-nearest-even mode, so `round(0.5) == 0` and `round(2.5) == 2`,
+ * matching PyTorch and NumPy.
+ *
+ * Only floating-point compute dtypes reach here — integer inputs are
+ * short-circuited to an identity copy by `NDArray_TypedUnaryOp`, and
+ * fp4 / fp8 arrive pre-cast to float32.
+ *
+ * @param[in,out] data     Buffer of @p n elements in dtype @p dt.
+ * @param[in]     n        Element count (n > 0).
+ * @param[in]     dt       Compute dtype: float16 / float32 / float64 / float128.
+ * @param[in]     decimals Decimal places (may be negative).
+ * @return 0 on success, -1 if @p dt is not a supported float dtype
+ *         (PHP exception in flight).
+ */
+static int unary_round_cpu_inplace(void *data, long n, const char *dt,
+                                   long decimals) {
+    int neg = decimals < 0;
+    long k = neg ? -decimals : decimals;
+
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) {
+        float *p = (float *)data;
+        float pw = powf(10.0f, (float)k);
+        for (long i = 0; i < n; i++)
+            p[i] = neg ? rintf(p[i] / pw) * pw : rintf(p[i] * pw) / pw;
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) {
+        double *p = (double *)data;
+        double pw = pow(10.0, (double)k);
+        for (long i = 0; i < n; i++)
+            p[i] = neg ? rint(p[i] / pw) * pw : rint(p[i] * pw) / pw;
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) {
+        /* Compute through float32 to keep accuracy, mirroring the fp16
+           arm of `unary_run_cpu_inplace`. */
+        uint16_t *p = (uint16_t *)data;
+        float pw = powf(10.0f, (float)k);
+        for (long i = 0; i < n; i++) {
+            float x = (float)ndarray_fp16_to_double(p[i]);
+            float y = neg ? rintf(x / pw) * pw : rintf(x * pw) / pw;
+            p[i] = ndarray_double_to_fp16((double)y);
+        }
+        return 0;
+    }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT128)) {
+        ndarray_fp128_t *p = (ndarray_fp128_t *)data;
+        /* 10^k is exact in fp64 (hence fp128) for k <= 22; for larger k the
+           factor is the fp64-rounded power, which matches the GPU dd path so
+           CPU and GPU stay in agreement. */
+        ndarray_fp128_t pw =
+            NDARRAY_FP128_FROM_LD((long double)pow(10.0, (double)k));
+        for (long i = 0; i < n; i++) {
+            ndarray_fp128_t x = p[i];
+            ndarray_fp128_t s = neg ? NDARRAY_FP128_DIV(x, pw)
+                                    : NDARRAY_FP128_MUL(x, pw);
+            s = NDARRAY_FP128_RINT(s);
+            p[i] = neg ? NDARRAY_FP128_MUL(s, pw) : NDARRAY_FP128_DIV(s, pw);
+        }
+        return 0;
+    }
+    zend_throw_error(NULL,
+        "NDArray_TypedUnaryOp: unsupported round compute dtype \"%s\".", dt);
+    return -1;
+}
+
+/**
  * @brief Execute the unary op on a CPU buffer in place.
  *
  * @param[in,out] data      Buffer of length @p n × elsize(@p dt) bytes.
@@ -3962,11 +4038,18 @@ static int unary_parse_typed_scalar(const char *dt, const char *str,
  * @param[in]     op        Unary op selector.
  * @param[in]     clip_min  Decimal string (clip only); NULL otherwise.
  * @param[in]     clip_max  Decimal string (clip only); NULL otherwise.
+ * @param[in]     decimals  Decimal places (round only); ignored otherwise.
  * @return 0 on success, -1 on dispatch error (PHP exception in flight).
  */
 static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                                   NDArrayUnaryOp op,
-                                  const char *clip_min, const char *clip_max) {
+                                  const char *clip_min, const char *clip_max,
+                                  long decimals) {
+    /* `round` carries a precision argument the generic per-dtype macros
+       don't model, so it has its own dtype-correct kernel. */
+    if (op == NDARRAY_UNOP_ROUND) {
+        return unary_round_cpu_inplace(data, n, dt, decimals);
+    }
     /* Pre-parse clip bounds into the right dtype so the inner loop stays
        cheap. The bound buffers are at most 16 bytes (float128). */
     union {
@@ -4196,6 +4279,36 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
 
 #ifdef HAVE_CUBLAS
 /**
+ * @brief Round a typed GPU buffer to @p decimals places in place,
+ *        round-half-to-even, matching `unary_round_cpu_inplace`.
+ *
+ * Routes to the per-dtype `cuda_round_*` wrapper, which computes the
+ * `10^|decimals|` factor on the host and applies `rint(x · f) / f`
+ * (decimals ≥ 0) or `rint(x / f) · f` (decimals < 0) on device. Only
+ * floating-point compute dtypes reach here (integers are short-circuited
+ * to a copy upstream; fp4 / fp8 arrive pre-cast to float32).
+ *
+ * @param[in,out] data     Device buffer of @p n elements in dtype @p dt.
+ * @param[in]     n        Element count (n > 0).
+ * @param[in]     dt       Compute dtype: float16 / float32 / float64 / float128.
+ * @param[in]     decimals Decimal places (may be negative).
+ * @return 0 on success, -1 if @p dt is not a supported float dtype
+ *         (PHP exception in flight).
+ */
+static int unary_round_gpu_inplace(void *data, long n, const char *dt,
+                                   long decimals) {
+    int ni = (int)n;
+    int dec = (int)decimals;
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) { cuda_round_f32((float    *)data, dec, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) { cuda_round_f64((double   *)data, dec, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) { cuda_round_f16((uint16_t *)data, dec, ni); return 0; }
+    if (!strcmp(dt, "float128"))           { cuda_round_dd ((double   *)data, dec, ni); return 0; }
+    zend_throw_error(NULL,
+        "NDArray_TypedUnaryOp GPU: unsupported round compute dtype \"%s\".", dt);
+    return -1;
+}
+
+/**
  * @brief Dispatch the unary op against a typed GPU buffer in place.
  *
  * Routes to the right `cuda_<op>_<tag>` wrapper for every supported
@@ -4203,11 +4316,18 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
  * dtype on GPU via `NDArray_AsType` / `NDArray_Copy`.
  *
  * `clip_min` / `clip_max` are decimal strings parsed losslessly into
- * the typed bound for the clip op.
+ * the typed bound for the clip op; `decimals` is the precision for the
+ * round op (ignored by every other op).
  */
 static int unary_run_gpu_inplace(void *data, long n, const char *dt,
                                   NDArrayUnaryOp op,
-                                  const char *clip_min, const char *clip_max) {
+                                  const char *clip_min, const char *clip_max,
+                                  long decimals) {
+    /* `round` carries a precision argument; dispatch to its dedicated
+       per-dtype kernels rather than the generic `UNOP_GPU_*` blocks. */
+    if (op == NDARRAY_UNOP_ROUND) {
+        return unary_round_gpu_inplace(data, n, dt, decimals);
+    }
     union {
         int8_t   i8;  uint8_t  u8;
         int16_t  i16; uint16_t u16;
@@ -4457,8 +4577,17 @@ static int unary_run_gpu_inplace(void *data, long n, const char *dt,
 
 NDArray *
 NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
-                     const char *clip_min, const char *clip_max) {
+                     const char *clip_min, const char *clip_max,
+                     long round_decimals) {
     if (nda == NULL) return NULL;
+
+    /* round(x, 0) is bit-identical to rint(x) on every dtype and device,
+       so reuse the existing rint path (the integer short-circuit and the
+       dedicated rint kernels). With a non-zero precision the op stays
+       ROUND and flows through `unary_round_*_inplace`. */
+    if (op == NDARRAY_UNOP_ROUND && round_decimals == 0) {
+        op = NDARRAY_UNOP_RINT;
+    }
 
     const char *input_dt   = NDArray_TYPE(nda);
     const char *result_dt  = unary_result_dtype(op, input_dt);
@@ -4482,11 +4611,16 @@ NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
        — `unary_run_gpu_inplace` doesn't dispatch integer cases for the
        rounding family (they have no work to do on the GPU side either).
        This applies even on CPU: skipping the loop saves a pass and
-       keeps the contract uniform. */
+       keeps the contract uniform. `round` with a non-zero precision is
+       included here too: NumPower's rounding family preserves integer
+       dtypes (an integer is already integer-valued), so it returns the
+       input unchanged for any precision — cast to a float dtype to round
+       integers to negative decimal places. (round with precision 0 was
+       already rewritten to RINT above.) */
     if (unary_is_int_dtype(input_dt) &&
         (op == NDARRAY_UNOP_RINT  || op == NDARRAY_UNOP_FIX   ||
          op == NDARRAY_UNOP_TRUNC || op == NDARRAY_UNOP_FLOOR ||
-         op == NDARRAY_UNOP_CEIL)) {
+         op == NDARRAY_UNOP_CEIL  || op == NDARRAY_UNOP_ROUND)) {
         return NDArray_Copy(nda, device);
     }
 
@@ -4509,11 +4643,11 @@ NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
     int rc;
     if (device == NDARRAY_DEVICE_CPU) {
         rc = unary_run_cpu_inplace(NDArray_DATA(work), n, compute_dt,
-                                   op, clip_min, clip_max);
+                                   op, clip_min, clip_max, round_decimals);
     } else {
 #ifdef HAVE_CUBLAS
         rc = unary_run_gpu_inplace(NDArray_DATA(work), n, compute_dt,
-                                   op, clip_min, clip_max);
+                                   op, clip_min, clip_max, round_decimals);
 #else
         zend_throw_error(NULL,
             "NDArray_TypedUnaryOp: GPU input but extension built without CUDA.");
