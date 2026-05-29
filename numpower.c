@@ -3717,9 +3717,11 @@ static NDArray *ndarray_resolve_unary_input(zval *array, int *owned)
                 zend_throw_error(NULL,
                     "Numeric string expected, got a whitespace-only value.");
             } else {
+                /* Length-bounded (`%.*s`) so an embedded NUL doesn't
+                   truncate the offending literal in the diagnostic. */
                 zend_throw_error(NULL,
-                    "Numeric string expected, got malformed literal: \"%s\".",
-                    p);
+                    "Numeric string expected, got malformed literal: \"%.*s\".",
+                    (int)n, p);
             }
             return NULL;
         }

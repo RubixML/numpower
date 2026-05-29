@@ -1226,12 +1226,19 @@ __device__ inline dd_real dd_rsqrt(dd_real a) {
 }
 
 /* ── DD-precision transcendentals (device side) ─────────────────────────
-   Identical algorithms to the CPU helpers in `src/dd_math.c`; the
-   constants below are byte-equal to `DD_LN2` / `DD_LN10` / `DD_LOG2_E`
-   / `DD_LOG10_E` there so CPU↔GPU parity is preserved. Every step
-   runs in DD arithmetic — no internal collapse to fp64 — so the
-   result holds ~30 decimal digits of precision the same as the
-   libquadmath path on the host. */
+   Identical algorithms to the CPU helpers in `src/dd_math.c`; the shared
+   DD constants below are byte-equal to `DD_LN2` / `DD_LOG2_E` /
+   `DD_LOG10_E` there so CPU↔GPU parity is preserved. Every step runs in
+   DD arithmetic — no internal collapse to fp64 — so the result holds
+   ~32 decimal digits of precision the same as the libquadmath path on
+   the host. Each function mirrors the doxygen on its CPU twin in
+   `src/dd_math.c`; see there for the per-function range-reduction and
+   series rationale. */
+__device__ inline dd_real dd_ln2(void)    { return dd_make(0.6931471805599453, 2.3190468138462996e-17); }
+__device__ inline dd_real dd_log2e(void)  { return dd_make(1.4426950408889634, 2.0355273740931033e-17); }
+__device__ inline dd_real dd_log10e(void) { return dd_make(0.4342944819032518, 1.0983196502167645e-17); }
+
+/** @brief DD-precision exp(x); see ndarray_dd_exp in src/dd_math.c. */
 __device__ inline dd_real dd_exp(dd_real a) {
     if (isnan(a.hi)) return a;
     if (isinf(a.hi)) return dd_make(a.hi > 0 ? a.hi : 0.0, 0.0);
@@ -1241,12 +1248,12 @@ __device__ inline dd_real dd_exp(dd_real a) {
     double  k_d  = round(a.hi * 1.4426950408889634);
     int     k    = (int)k_d;
     dd_real k_dd = dd_make(k_d, 0.0);
-    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
-    dd_real r = dd_sub(a, dd_mul(k_dd, LN2));
+    dd_real r = dd_sub(a, dd_mul(k_dd, dd_ln2()));
 
-    /* Horner of 1 + r·(1 + r/2·(1 + r/3·(… + r/20))). */
+    /* Horner of 1 + r·(1 + r/2·(1 + r/3·(… + r/24))). 24 terms keep the
+       worst-case remainder r²⁵/25! below DD epsilon (see CPU twin). */
     dd_real result = dd_make(1.0, 0.0);
-    for (int i = 20; i >= 1; i--) {
+    for (int i = 24; i >= 1; i--) {
         dd_real r_over_i = dd_div(r, dd_make((double)i, 0.0));
         result = dd_add(dd_make(1.0, 0.0), dd_mul(r_over_i, result));
     }
@@ -1257,6 +1264,7 @@ __device__ inline dd_real dd_exp(dd_real a) {
     return result;
 }
 
+/** @brief DD-precision expm1(x); see ndarray_dd_expm1 in src/dd_math.c. */
 __device__ inline dd_real dd_expm1(dd_real a) {
     if (isnan(a.hi)) return a;
     if (a.hi >= 0.5 || a.hi <= -0.5) {
@@ -1272,6 +1280,7 @@ __device__ inline dd_real dd_expm1(dd_real a) {
     return dd_mul(a, result);
 }
 
+/** @brief DD-precision natural log(x); see ndarray_dd_log in src/dd_math.c. */
 __device__ inline dd_real dd_log(dd_real a) {
     if (isnan(a.hi)) return a;
     if (a.hi < 0.0)              return dd_make(nan(""), 0.0);
@@ -1307,27 +1316,37 @@ __device__ inline dd_real dd_log(dd_real a) {
     dd_real log_m = dd_mul(u, sum);
     log_m = dd_add(log_m, log_m);  /* · 2 */
 
-    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
-    return dd_add(log_m, dd_mul(dd_make((double)e, 0.0), LN2));
+    return dd_add(log_m, dd_mul(dd_make((double)e, 0.0), dd_ln2()));
 }
 
+/** @brief DD-precision log1p(x); see ndarray_dd_log1p in src/dd_math.c. */
 __device__ inline dd_real dd_log1p(dd_real a) {
     if (isnan(a.hi)) return a;
-    /* `dd_add(1, a)` preserves DD precision even when |a| is at DD
-       epsilon — the lo limb of the sum captures the contribution of `a`
-       past fp64's 53 bits. So `dd_log(1 + a)` is precision-faithful
-       across the full input range without needing a Taylor branch.
-       The argument `1 + a` is well within `dd_log`'s domain (it's
-       positive whenever the result is finite; the NaN / −inf edge
-       cases fall through to dd_log's own handling). */
-    return dd_log(dd_add(dd_make(1.0, 0.0), a));
+    if (a.hi >= 0.5 || a.hi <= -0.5) {
+        return dd_log(dd_add(dd_make(1.0, 0.0), a));
+    }
+    /* |a| ≤ 0.5: log1p(a) = 2·atanh(a/(2+a)). Forming a/(2+a) keeps a's
+       lo limb (2+a never cancels), unlike forming 1+a which would round
+       sub-fp64 information away. |u| ≤ 0.2 → 26-odd-term atanh ladder is
+       below DD epsilon. Mirrors the CPU twin exactly for parity. */
+    const dd_real one = dd_make(1.0, 0.0);
+    dd_real u   = dd_div(a, dd_add(dd_make(2.0, 0.0), a));
+    dd_real u2  = dd_mul(u, u);
+    dd_real sum = dd_div(one, dd_make(51.0, 0.0));
+    for (int k = 49; k >= 1; k -= 2) {
+        dd_real inv_k = dd_div(one, dd_make((double)k, 0.0));
+        sum = dd_add(inv_k, dd_mul(u2, sum));
+    }
+    dd_real r = dd_mul(u, sum);
+    return dd_add(r, r);  /* · 2 */
 }
 
+/** @brief DD-precision exp2(x) = 2^x; see ndarray_dd_exp2 in src/dd_math.c. */
 __device__ inline dd_real dd_exp2(dd_real a) {
-    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
-    return dd_exp(dd_mul(a, LN2));
+    return dd_exp(dd_mul(a, dd_ln2()));
 }
 
+/** @brief DD-precision log2(x); see ndarray_dd_log2 in src/dd_math.c. */
 __device__ inline dd_real dd_log2(dd_real a) {
     /* Power-of-2 exact short-circuit. */
     if (a.lo == 0.0 && isfinite(a.hi) && a.hi > 0.0) {
@@ -1335,15 +1354,15 @@ __device__ inline dd_real dd_log2(dd_real a) {
         double m = frexp(a.hi, &e);
         if (m == 0.5) return dd_make((double)(e - 1), 0.0);
     }
-    const dd_real LOG2_E = dd_make(1.4426950408889634, 2.0355273740931033e-17);
-    return dd_mul(dd_log(a), LOG2_E);
+    return dd_mul(dd_log(a), dd_log2e());
 }
 
+/** @brief DD-precision log10(x); see ndarray_dd_log10 in src/dd_math.c. */
 __device__ inline dd_real dd_log10(dd_real a) {
-    const dd_real LOG10_E = dd_make(0.4342944819032518, 1.0983196502167645e-17);
-    return dd_mul(dd_log(a), LOG10_E);
+    return dd_mul(dd_log(a), dd_log10e());
 }
 
+/** @brief DD-precision logb(x); see ndarray_dd_logb in src/dd_math.c. */
 __device__ inline dd_real dd_logb(dd_real a) {
     return dd_make(logb(a.hi), 0.0);
 }
@@ -1382,15 +1401,19 @@ __device__ inline dd_real dd_clip(dd_real x, dd_real lo, dd_real hi) {
     return       dd_lt(hi, _y) ? hi : _y;    /* min(_y, hi) */
 }
 
-/* sinc(π·x) with x stored as DD. For small |x| (|πx| < ~π/10) the
-   Taylor series sinc(x) = 1 - (πx)²/6 + (πx)⁴/120 - (πx)⁶/5040 + ...
-   converges so rapidly that 5 terms give full DD precision (~32 sig
-   digits); we run it in DD arithmetic so the (hi, lo) pair is
-   meaningful — the previous fp64 fallback collapsed `sinc(1e-10)` to
-   exactly `1.0`, losing the `~1.6e-21` deviation the CPU captures.
-   For larger |x| the argument reduction in `sin(πx)` is the dominant
-   error term (precision-bound by fp64), so we keep the fp64 path
-   there — full DD trig would need a CORDIC ladder. */
+/* sinc(π·x) with x stored as DD. For small |x| ≤ 0.1 (|πx| ≤ 0.314) the
+   Maclaurin series sinc(πx) = Σ_{k≥0} (-1)^k (πx)^{2k}/(2k+1)! is summed
+   in DD arithmetic so the (hi, lo) pair stays meaningful — the previous
+   fp64 fallback collapsed `sinc(1e-10)` to exactly `1.0`, losing the
+   `~1.6e-21` deviation the CPU (libquadmath sinq) captures.  Twelve
+   terms (through (πx)^24/25!) drive the worst-case remainder at the
+   |x| = 0.1 boundary below DD epsilon (~1.2e-32); the original 5-term
+   cutoff held only ~16 digits there.  Terms are built by the recurrence
+   t_k = t_{k-1}·(-(πx)²)/((2k)(2k+1)) so every divisor (≤ 24·25) is
+   exactly representable in fp64 — unlike the high factorials 19!/21!/23!
+   which are not.  For larger |x| the argument reduction in `sin(πx)` is
+   the dominant error term (precision-bound by fp64), so we keep the fp64
+   path there — full DD trig would need a CORDIC ladder. */
 __device__ inline dd_real dd_sinc(dd_real x) {
     if (x.hi == 0.0 && x.lo == 0.0) return dd_make(1.0, 0.0);
 
@@ -1399,25 +1422,17 @@ __device__ inline dd_real dd_sinc(dd_real x) {
         /* π in double-double: hi = nearest-double(π), lo = π - hi. */
         const dd_real pi_dd = dd_make(3.141592653589793,
                                        1.2246467991473532e-16);
-        const dd_real one    = dd_make(1.0, 0.0);
-        const dd_real c_6    = dd_make(6.0, 0.0);
-        const dd_real c_120  = dd_make(120.0, 0.0);
-        const dd_real c_5040 = dd_make(5040.0, 0.0);
-        const dd_real c_362880   = dd_make(362880.0,   0.0);
-        const dd_real c_39916800 = dd_make(39916800.0, 0.0);
+        dd_real px      = dd_mul(pi_dd, x);
+        dd_real px2     = dd_mul(px, px);
+        dd_real neg_px2 = dd_make(-px2.hi, -px2.lo);  /* -(πx)² */
 
-        dd_real px  = dd_mul(pi_dd, x);
-        dd_real px2 = dd_mul(px, px);
-        dd_real term = px2;
-        dd_real result = dd_sub(one,    dd_div(term, c_6));
-        term   = dd_mul(term, px2);
-        result = dd_add(result, dd_div(term, c_120));
-        term   = dd_mul(term, px2);
-        result = dd_sub(result, dd_div(term, c_5040));
-        term   = dd_mul(term, px2);
-        result = dd_add(result, dd_div(term, c_362880));
-        term   = dd_mul(term, px2);
-        result = dd_sub(result, dd_div(term, c_39916800));
+        dd_real term   = dd_make(1.0, 0.0);           /* t_0 = 1 */
+        dd_real result = term;
+        for (int k = 1; k <= 12; k++) {
+            double denom = (double)(2 * k) * (double)(2 * k + 1);
+            term   = dd_div(dd_mul(term, neg_px2), dd_make(denom, 0.0));
+            result = dd_add(result, term);
+        }
         return result;
     }
 

@@ -236,11 +236,6 @@ static const ndarray_dd_t DD_LN2 = {
      0.6931471805599453,    /* hi: 0.693147180559945286... (closest double) */
      2.3190468138462996e-17 /* lo: residual = ln2 - hi   */
 };
-static const ndarray_dd_t DD_LN10 = {
-    /* ln(10) = 2.30258509299404568401799145468... */
-     2.302585092994046,
-    -2.1707562233822494e-16
-};
 static const ndarray_dd_t DD_LOG2_E = {
     /* 1/ln(2) = 1.44269504088896340735992468100... */
      1.4426950408889634,
@@ -259,9 +254,13 @@ static const ndarray_dd_t DD_LOG10_E = {
  * |r| ≤ ln(2)/2 ≈ 0.347. Then exp(x) = 2^k · exp(r); the 2^k factor
  * is exact in fp64 (just shifts the exponent), and exp(r) is evaluated
  * via the Taylor series 1 + r + r²/2! + r³/3! + … in DD arithmetic
- * using Horner's method. Twenty terms suffice for |r| ≤ 0.347 because
- * the (i+1)-th term shrinks by factor ≤ 0.347/(i+1) — at i = 19 the
- * term magnitude is well below DD epsilon (~2⁻¹⁰⁶ ≈ 1.2e-32).
+ * using Horner's method. The series is summed through r²⁴/24!: at the
+ * worst-case |r| ≤ ln(2)/2 ≈ 0.3466 the first omitted term r²⁵/25! ≈
+ * 6.8e-37 is far below DD epsilon (~2⁻¹⁰⁶ ≈ 1.2e-32), so the result
+ * carries full ~32-digit DD precision. (Twenty terms — the original
+ * cutoff — left r²¹/21! ≈ 4.2e-30 in the remainder, capping accuracy
+ * at ~29 digits and making the GPU DD path diverge from the CPU
+ * libquadmath path at the 31st digit.)
  *
  * Handles overflow (`exp(x) > DBL_MAX`) by returning +inf and underflow
  * (`exp(x) < DBL_MIN_SUBNORMAL`) by returning 0. NaN propagates.
@@ -281,9 +280,9 @@ ndarray_dd_t ndarray_dd_exp(ndarray_dd_t a) {
     ndarray_dd_t k_dd = ndarray_dd_from_double(k_d);
     ndarray_dd_t r    = ndarray_dd_sub(a, ndarray_dd_mul(k_dd, DD_LN2));
 
-    /* Horner evaluation of 1 + r·(1 + r/2·(1 + r/3·(… + r/20))) */
+    /* Horner evaluation of 1 + r·(1 + r/2·(1 + r/3·(… + r/24))) */
     ndarray_dd_t result = ndarray_dd_from_double(1.0);
-    for (int i = 20; i >= 1; i--) {
+    for (int i = 24; i >= 1; i--) {
         /* result = 1 + (r/i) · result */
         ndarray_dd_t r_over_i = ndarray_dd_div(r, ndarray_dd_from_double((double)i));
         result = ndarray_dd_add(ndarray_dd_from_double(1.0),
@@ -332,8 +331,8 @@ ndarray_dd_t ndarray_dd_expm1(ndarray_dd_t a) {
  * shift m into [√0.5, √2) ≈ [0.707, 1.414); then |u| ≤ 0.172. The
  * atanh-style series ln(m) = 2·(u + u³/3 + u⁵/5 + u⁷/7 + …) converges
  * about twice as fast as the plain Taylor of ln(1+y) because the
- * even-power terms vanish. Eleven odd terms (u^21/21) give ~30 sig
- * digits at the |u| ≤ 0.172 boundary.
+ * even-power terms vanish. Twenty-six odd terms (through u^51/51) give
+ * full ~32-digit DD precision at the |u| ≤ 0.172 boundary.
  *
  * Final: log(x) = 2·Σ + e·ln(2).
  *
@@ -390,22 +389,39 @@ ndarray_dd_t ndarray_dd_log(ndarray_dd_t a) {
 /**
  * @brief DD-precision log1p(x) = log(1 + x).
  *
- * For |x| ≤ 0.5 use the Taylor series directly:
- *     log1p(x) = x − x²/2 + x³/3 − x⁴/4 + …
- * evaluated via Horner so the cancellation at small x is avoided.
- * For |x| > 0.5 fall back to `log(1 + x)` — 1 + x has no cancellation
- * there.
+ * For |x| ≤ 0.5 the value 1 + x suffers catastrophic cancellation of
+ * x's sub-fp64 information (when |x| ≲ fp64 epsilon the whole of x lands
+ * in the lo limb and is rounded away by the subsequent range reduction).
+ * Use instead the area-hyperbolic-tangent identity
+ *     log1p(x) = 2·atanh( x / (2 + x) ),
+ * with u = x / (2 + x). The divisor 2 + x stays in [1.5, 2.5] so it
+ * never cancels and the DD add/divide preserve x's lo limb in full;
+ * |u| ≤ 0.2 over the branch, so the odd series 2·(u + u³/3 + … + u⁵¹/51)
+ * (26 odd terms) is below DD epsilon. For |x| > 0.5 there is no
+ * cancellation in 1 + x, so defer to `dd_log(1 + x)` — that path also
+ * covers the x ≤ −1 (→ NaN / −inf) and +inf edges.
  *
  * @param[in] a Input DD value (a > −1 for a finite result).
  * @return log(1 + a) in DD precision.
  */
 ndarray_dd_t ndarray_dd_log1p(ndarray_dd_t a) {
     if (ndarray_dd_isnan(a)) return a;
-    /* `dd_add(1, a)` preserves DD precision even when |a| is at DD
-       epsilon — the lo limb of the sum captures the contribution of `a`
-       past fp64's 53 bits. So `dd_log(1 + a)` is precision-faithful
-       across the full input range without needing a Taylor branch. */
-    return ndarray_dd_log(ndarray_dd_add(ndarray_dd_from_double(1.0), a));
+    if (a.hi >= 0.5 || a.hi <= -0.5) {
+        return ndarray_dd_log(ndarray_dd_add(ndarray_dd_from_double(1.0), a));
+    }
+    ndarray_dd_t one = ndarray_dd_from_double(1.0);
+    ndarray_dd_t u   = ndarray_dd_div(a,
+                           ndarray_dd_add(ndarray_dd_from_double(2.0), a));
+    ndarray_dd_t u2  = ndarray_dd_mul(u, u);
+    /* Same 26-odd-term atanh ladder as ndarray_dd_log; |u| ≤ 0.2 here so
+       the truncated term u^53/53 is far below DD epsilon. */
+    ndarray_dd_t sum = ndarray_dd_div(one, ndarray_dd_from_double(51.0));
+    for (int k = 49; k >= 1; k -= 2) {
+        ndarray_dd_t inv_k = ndarray_dd_div(one, ndarray_dd_from_double((double)k));
+        sum = ndarray_dd_add(inv_k, ndarray_dd_mul(u2, sum));
+    }
+    ndarray_dd_t r = ndarray_dd_mul(u, sum);
+    return ndarray_dd_add(r, r);  /* · 2 */
 }
 
 /**

@@ -3627,13 +3627,28 @@ static int unary_validate_numeric_string(const char *str, const char *which) {
         return -1;
     }
     const char *p = unary_skip_sign_ws(str);
-    /* Accept inf / nan tokens (case-insensitive, with optional trailing
-       junk consistent with strtod's contract). */
+    /* Accept inf / infinity / nan tokens (case-insensitive). The token
+       must consume the rest of the (trimmed) literal — trailing junk
+       such as "infX" / "nanZ" is rejected rather than silently read as
+       a valid prefix the way strtod would, mirroring the strict array-
+       input inferrer `ndarray_infer_dtype_from_string`. */
     char low3[4] = {0};
     for (int i = 0; i < 3 && p[i]; i++) {
         low3[i] = (char)(p[i] | 0x20);
     }
     if (!strncmp(low3, "inf", 3) || !strncmp(low3, "nan", 3)) {
+        const char *t = p + 3;
+        if (low3[0] == 'i') {                     /* maybe the "infinity" spelling */
+            char low5[6] = {0};
+            for (int i = 0; i < 5 && t[i]; i++) low5[i] = (char)(t[i] | 0x20);
+            if (!strncmp(low5, "inity", 5)) t += 5;
+        }
+        while (*t == ' ' || *t == '\t' || *t == '\n' || *t == '\r') t++;
+        if (*t != '\0') {
+            zend_throw_error(NULL,
+                "NDArray clip: '%s' is not a valid number: %s.", which, str);
+            return -1;
+        }
         return 0;
     }
     int saw_digit = 0;
@@ -3670,10 +3685,63 @@ static int unary_validate_numeric_string(const char *str, const char *which) {
 /**
  * @brief Skip leading ASCII whitespace, returning the first non-space char's
  *        pointer. Mirrors `strtoll`'s leading-whitespace handling.
+ *
+ * @param[in] s NUL-terminated string to scan.
+ * @return Pointer into @p s at the first non-whitespace character (the
+ *         terminating NUL when @p s is empty or all whitespace).
  */
 static inline const char *unary_skip_ws(const char *s) {
     while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
     return s;
+}
+
+/** Special-value kind of a validated clip-bound literal. */
+typedef enum {
+    UNARY_FINITE = 0, UNARY_POS_INF, UNARY_NEG_INF, UNARY_NAN
+} unary_special_t;
+
+/**
+ * @brief Classify an already-validated clip-bound literal as finite, ±inf,
+ *        or nan (case-insensitive, honouring an optional leading sign).
+ *
+ * @param[in] str NUL-terminated, syntactically validated literal.
+ * @return The special-value kind; `UNARY_FINITE` for an ordinary number.
+ */
+static unary_special_t unary_classify_special(const char *str) {
+    const char *p = unary_skip_ws(str);
+    int neg = 0;
+    if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+    char low3[4] = {0};
+    for (int i = 0; i < 3 && p[i]; i++) low3[i] = (char)(p[i] | 0x20);
+    if (!strncmp(low3, "inf", 3)) return neg ? UNARY_NEG_INF : UNARY_POS_INF;
+    if (!strncmp(low3, "nan", 3)) return UNARY_NAN;
+    return UNARY_FINITE;
+}
+
+/**
+ * @brief Write the representable extreme of an integer dtype into @p out_buf.
+ *
+ * Used to give an inf/nan clip bound PyTorch's "no bound" semantics on the
+ * 8 integer dtypes (strtoll/strtoull would otherwise read zero digits from
+ * the token and yield 0, collapsing the clip range).
+ *
+ * @param[in]  dt       Canonical dtype string.
+ * @param[in]  want_max Non-zero → dtype maximum; zero → dtype minimum
+ *                      (0 for the unsigned dtypes).
+ * @param[out] out_buf  Buffer of `elsize(dt)` bytes to receive the value.
+ * @return 1 when @p dt is one of the 8 integer dtypes (value written);
+ *         0 otherwise (a float dtype — caller handles it).
+ */
+static int unary_write_int_extreme(const char *dt, int want_max, void *out_buf) {
+    if (!strcmp(dt, "int8"))   { *(int8_t   *)out_buf = want_max ? INT8_MAX   : INT8_MIN;   return 1; }
+    if (!strcmp(dt, "int16"))  { *(int16_t  *)out_buf = want_max ? INT16_MAX  : INT16_MIN;  return 1; }
+    if (!strcmp(dt, "int32"))  { *(int32_t  *)out_buf = want_max ? INT32_MAX  : INT32_MIN;  return 1; }
+    if (!strcmp(dt, "int64"))  { *(int64_t  *)out_buf = want_max ? INT64_MAX  : INT64_MIN;  return 1; }
+    if (!strcmp(dt, "uint8"))  { *(uint8_t  *)out_buf = want_max ? UINT8_MAX  : 0;          return 1; }
+    if (!strcmp(dt, "uint16")) { *(uint16_t *)out_buf = want_max ? UINT16_MAX : 0;          return 1; }
+    if (!strcmp(dt, "uint32")) { *(uint32_t *)out_buf = want_max ? UINT32_MAX : 0;          return 1; }
+    if (!strcmp(dt, "uint64")) { *(uint64_t *)out_buf = want_max ? UINT64_MAX : 0;          return 1; }
+    return 0;
 }
 
 /**
@@ -3703,6 +3771,21 @@ static int unary_parse_typed_scalar(const char *dt, const char *str,
                                      const char *which, void *out_buf) {
     if (unary_validate_numeric_string(str, which) < 0) return -1;
 
+    /* inf / nan bounds on integer dtypes: strtoll/strtoull read zero
+       digits from the token and yield 0, which would collapse the clip
+       range. Map the token to the dtype's representable extreme so an
+       inf bound acts as PyTorch's "no bound" (−inf → MIN, +inf → MAX),
+       and a nan bound becomes the no-op extreme for whichever side it
+       sits on (min → MIN, max → MAX), matching how the float path
+       silently ignores a nan bound. Float dtypes fall through so strtod
+       yields a real ±inf / nan. */
+    unary_special_t sp = unary_classify_special(str);
+    if (sp != UNARY_FINITE) {
+        int want_max = (sp == UNARY_POS_INF) ||
+                       (sp == UNARY_NAN && !strcmp(which, "max"));
+        if (unary_write_int_extreme(dt, want_max, out_buf)) return 0;
+    }
+
     /* Narrow integer dtypes — saturate the bound to the dtype range so
        out-of-range literals don't wrap via the implicit `(T)strtoll(...)`
        cast inside `ndarray_set_from_string`. int64/uint64 keep the
@@ -3713,39 +3796,39 @@ static int unary_parse_typed_scalar(const char *dt, const char *str,
     if (!strcmp(dt, "uint8")) {
         if (is_neg) { *(uint8_t *)out_buf = 0; return 0; }
         unsigned long long v = strtoull(p, NULL, 10);
-        *(uint8_t *)out_buf = (uint8_t)(v > 0xFFu ? 0xFFu : v);
+        *(uint8_t *)out_buf = (uint8_t)(v > UINT8_MAX ? UINT8_MAX : v);
         return 0;
     }
     if (!strcmp(dt, "uint16")) {
         if (is_neg) { *(uint16_t *)out_buf = 0; return 0; }
         unsigned long long v = strtoull(p, NULL, 10);
-        *(uint16_t *)out_buf = (uint16_t)(v > 0xFFFFu ? 0xFFFFu : v);
+        *(uint16_t *)out_buf = (uint16_t)(v > UINT16_MAX ? UINT16_MAX : v);
         return 0;
     }
     if (!strcmp(dt, "uint32")) {
         if (is_neg) { *(uint32_t *)out_buf = 0; return 0; }
         unsigned long long v = strtoull(p, NULL, 10);
-        *(uint32_t *)out_buf = (uint32_t)(v > 0xFFFFFFFFu ? 0xFFFFFFFFu : v);
+        *(uint32_t *)out_buf = (uint32_t)(v > UINT32_MAX ? UINT32_MAX : v);
         return 0;
     }
     if (!strcmp(dt, "int8")) {
         long long v = strtoll(str, NULL, 10);
-        if (v >  0x7F)            v =  0x7F;
-        else if (v < -0x80)       v = -0x80;
+        if (v > INT8_MAX)      v = INT8_MAX;
+        else if (v < INT8_MIN) v = INT8_MIN;
         *(int8_t *)out_buf = (int8_t)v;
         return 0;
     }
     if (!strcmp(dt, "int16")) {
         long long v = strtoll(str, NULL, 10);
-        if (v >  0x7FFF)          v =  0x7FFF;
-        else if (v < -0x8000)     v = -0x8000;
+        if (v > INT16_MAX)      v = INT16_MAX;
+        else if (v < INT16_MIN) v = INT16_MIN;
         *(int16_t *)out_buf = (int16_t)v;
         return 0;
     }
     if (!strcmp(dt, "int32")) {
         long long v = strtoll(str, NULL, 10);
-        if (v >  0x7FFFFFFFLL)    v =  0x7FFFFFFFLL;
-        else if (v < -0x80000000LL) v = -0x80000000LL;
+        if (v > INT32_MAX)      v = INT32_MAX;
+        else if (v < INT32_MIN) v = INT32_MIN;
         *(int32_t *)out_buf = (int32_t)v;
         return 0;
     }

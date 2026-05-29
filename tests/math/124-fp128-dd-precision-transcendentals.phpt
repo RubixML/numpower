@@ -79,10 +79,13 @@ function check_op($op, $vals, $min_digits) {
     }
 }
 
-/* Threshold = 28 decimal digits — DD ULP is at ~10⁻³², so 28 digits
-   gives 4 digits of headroom for accumulated arithmetic error across
-   the ~30 DD ops a transcendental performs. */
-$T = 28;
+/* Threshold = 30 decimal digits. DD ULP is at ~10⁻³², and after the
+   exp (24-term) / log1p (atanh) precision fixes on this branch the
+   GPU↔CPU agreement across the value set below bottoms out at 31 digits
+   (measured), so 30 asserts full DD precision with a 1-digit margin for
+   accumulated arithmetic error. (The pre-fix exp path bottomed out at
+   ~29 digits — a 28-digit threshold would have masked that shortfall.) */
+$T = 30;
 
 /* ── exp family ────────────────────────────────────────────────────── */
 check_op('exp',   ['0.5', '1.0', '2.0', '10.0', '50.0', '100.0', '500.0'], $T);
