@@ -123,6 +123,27 @@ $re = NumPower::round(NumPower::zeros([0, 3], 'float32')->gpu(), 2);
 check("empty GPU shape", $re->shape() === [0, 3]);
 check("empty GPU dtype", gdtype($re) === 'float32');
 
+/* ── fp128 ±Inf / NaN pass through round at non-zero precision on GPU
+   (regression: the DD multiply used to corrupt ±Inf to NaN; CPU was fine) ── */
+$inf128_cpu = NumPower::round(NumPower::array(['inf', '-inf', 'nan'], 'float128'), 2)->toArray();
+$inf128_gpu = NumPower::round(NumPower::array(['inf', '-inf', 'nan'], 'float128')->gpu(), 2)->cpu()->toArray();
+check("fp128 GPU round preserves Inf/NaN", $inf128_gpu === ['inf', '-inf', 'nan']);
+check("fp128 round Inf/NaN GPU==CPU", $inf128_gpu === $inf128_cpu);
+/* native float dtypes already handled Inf via the GPU rint kernel */
+foreach (['float16', 'float32', 'float64'] as $dt) {
+    $e = NumPower::round(NumPower::array([INF, -INF, NAN], $dt)->gpu(), 2)->cpu()->toArray();
+    check("$dt GPU round Inf/NaN", is_infinite($e[0]) && $e[0] > 0 && is_infinite($e[1]) && $e[1] < 0 && is_nan($e[2]));
+}
+
+/* ── extreme precision: GPU passes the full 64-bit `decimals` (no 32-bit
+   truncation), so CPU and GPU agree (both saturate to NaN) instead of
+   diverging finite-vs-NaN ── */
+foreach ([4294967298, -4294967298, PHP_INT_MAX, PHP_INT_MIN] as $big) {
+    $c = NumPower::round(NumPower::array([3.14159], 'float64'), $big)->toArray()[0];
+    $g = NumPower::round(NumPower::array([3.14159], 'float64')->gpu(), $big)->cpu()->toArray()[0];
+    check("extreme precision $big CPU==GPU", (is_nan($c) && is_nan($g)) || $c === $g);
+}
+
 if ($fail === 0) echo "ALL OK\n";
 echo "DONE\n";
 ?>

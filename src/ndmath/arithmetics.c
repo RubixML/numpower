@@ -3450,8 +3450,8 @@ static int unary_op_is_trig(NDArrayUnaryOp op) {
  * inputs to a floating-point dtype (PyTorch widening rule): narrow
  * ints (`int8`..`uint16`) widen to `float32`, the wider 32/64-bit
  * ints widen to `float64`. The rounding family (rint, fix, trunc,
- * floor, ceil) preserves integer dtypes — an integer is already its
- * own rounded value. Every other op preserves the input dtype.
+ * floor, ceil, round) preserves integer dtypes — an integer is already
+ * its own rounded value. Every other op preserves the input dtype.
  *
  * @param[in] op       Unary op selector.
  * @param[in] input_dt Source dtype string.
@@ -3980,27 +3980,33 @@ static int unary_parse_typed_scalar(const char *dt, const char *str,
 static int unary_round_cpu_inplace(void *data, long n, const char *dt,
                                    long decimals) {
     int neg = decimals < 0;
-    long k = neg ? -decimals : decimals;
+    /* `10^|decimals|` as a double. Using `fabs((double)decimals)` rather than
+       negating an integer means `decimals == LONG_MIN` cannot trigger
+       signed-negate UB; carrying the full long through to double (no `int`
+       cast) keeps this factor bit-identical to the GPU `cuda_round_pow10`
+       path at every precision. Computing the factor in double and narrowing
+       to the dtype matches PyTorch's `static_cast<scalar_t>(std::pow(10,
+       decimals))`. */
+    double pw_d = pow(10.0, fabs((double)decimals));
 
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) {
         float *p = (float *)data;
-        float pw = powf(10.0f, (float)k);
+        float pw = (float)pw_d;
         for (long i = 0; i < n; i++)
             p[i] = neg ? rintf(p[i] / pw) * pw : rintf(p[i] * pw) / pw;
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) {
         double *p = (double *)data;
-        double pw = pow(10.0, (double)k);
         for (long i = 0; i < n; i++)
-            p[i] = neg ? rint(p[i] / pw) * pw : rint(p[i] * pw) / pw;
+            p[i] = neg ? rint(p[i] / pw_d) * pw_d : rint(p[i] * pw_d) / pw_d;
         return 0;
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) {
         /* Compute through float32 to keep accuracy, mirroring the fp16
            arm of `unary_run_cpu_inplace`. */
         uint16_t *p = (uint16_t *)data;
-        float pw = powf(10.0f, (float)k);
+        float pw = (float)pw_d;
         for (long i = 0; i < n; i++) {
             float x = (float)ndarray_fp16_to_double(p[i]);
             float y = neg ? rintf(x / pw) * pw : rintf(x * pw) / pw;
@@ -4010,13 +4016,21 @@ static int unary_round_cpu_inplace(void *data, long n, const char *dt,
     }
     if (!strcmp(dt, NDARRAY_TYPE_FLOAT128)) {
         ndarray_fp128_t *p = (ndarray_fp128_t *)data;
-        /* 10^k is exact in fp64 (hence fp128) for k <= 22; for larger k the
-           factor is the fp64-rounded power, which matches the GPU dd path so
-           CPU and GPU stay in agreement. */
-        ndarray_fp128_t pw =
-            NDARRAY_FP128_FROM_LD((long double)pow(10.0, (double)k));
+        /* 10^|decimals| is exact in fp64 (hence fp128) for |decimals| <= 22;
+           for larger magnitudes the factor is the fp64-rounded power, which
+           matches the GPU dd path so CPU and GPU stay in agreement. */
+        ndarray_fp128_t pw = NDARRAY_FP128_FROM_LD((long double)pw_d);
         for (long i = 0; i < n; i++) {
             ndarray_fp128_t x = p[i];
+            /* round(±inf)=±inf, round(nan)=nan. Pass non-finite values through
+               unchanged: scaling ±Inf through the DD multiply on the
+               non-libquadmath backend collapses it to NaN (inf-inf in the DD
+               residual). `x - x` is NaN for both ±Inf and NaN, 0 for every
+               finite value (incl. magnitudes beyond double range), so this
+               keeps every fp128 backend on the same IEEE result. */
+            if (NDARRAY_FP128_ISNAN(NDARRAY_FP128_SUB(x, x))) {
+                continue;  /* p[i] already holds x */
+            }
             ndarray_fp128_t s = neg ? NDARRAY_FP128_DIV(x, pw)
                                     : NDARRAY_FP128_MUL(x, pw);
             s = NDARRAY_FP128_RINT(s);
@@ -4297,12 +4311,14 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
  */
 static int unary_round_gpu_inplace(void *data, long n, const char *dt,
                                    long decimals) {
+    /* `decimals` is passed through at full `long` width (the wrappers narrow
+       only inside the host-side factor, in double) so the GPU result matches
+       the CPU path for every precision — no 32-bit truncation divergence. */
     int ni = (int)n;
-    int dec = (int)decimals;
-    if (!strcmp(dt, NDARRAY_TYPE_FLOAT32)) { cuda_round_f32((float    *)data, dec, ni); return 0; }
-    if (!strcmp(dt, NDARRAY_TYPE_FLOAT64)) { cuda_round_f64((double   *)data, dec, ni); return 0; }
-    if (!strcmp(dt, NDARRAY_TYPE_FLOAT16)) { cuda_round_f16((uint16_t *)data, dec, ni); return 0; }
-    if (!strcmp(dt, "float128"))           { cuda_round_dd ((double   *)data, dec, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT32))  { cuda_round_f32((float    *)data, decimals, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT64))  { cuda_round_f64((double   *)data, decimals, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT16))  { cuda_round_f16((uint16_t *)data, decimals, ni); return 0; }
+    if (!strcmp(dt, NDARRAY_TYPE_FLOAT128)) { cuda_round_dd ((double   *)data, decimals, ni); return 0; }
     zend_throw_error(NULL,
         "NDArray_TypedUnaryOp GPU: unsupported round compute dtype \"%s\".", dt);
     return -1;

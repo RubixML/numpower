@@ -573,12 +573,14 @@ DECLARE_UNOP_FP_WRAPPERS(ceil)
 #undef DECLARE_UNOP_FP_WRAPPERS
 
 /* Precision-aware round (`round(x, decimals)`). Distinct signature from the
-   wrappers above — it carries the `decimals` precision. The factor is
-   computed on the host inside each wrapper; `decimals` may be negative. */
-void cuda_round_f16(uint16_t *a, int decimals, int n);
-void cuda_round_f32(float    *a, int decimals, int n);
-void cuda_round_f64(double   *a, int decimals, int n);
-void cuda_round_dd (double   *a, int decimals, int n);
+   wrappers above — it carries the full 64-bit `decimals` precision (`long`,
+   matching the CPU path so both devices agree at every precision). The
+   factor is computed on the host inside each wrapper; `decimals` may be
+   negative. */
+void cuda_round_f16(uint16_t *a, long decimals, int n);
+void cuda_round_f32(float    *a, long decimals, int n);
+void cuda_round_f64(double   *a, long decimals, int n);
+void cuda_round_dd (double   *a, long decimals, int n);
 
 void cuda_clip_i8 (int8_t   *a, int8_t   lo, int8_t   hi, int n);
 void cuda_clip_u8 (uint8_t  *a, uint8_t  lo, uint8_t  hi, int n);

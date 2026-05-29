@@ -146,6 +146,41 @@ check("uint8 extremes identity", NumPower::round($uext, -2)->toArray(), [255, 0]
 check("parity round(2.675,2)=2.68", NumPower::round(NumPower::array([2.675], 'float64'), 2)->toArray(), [2.68], 1e-12);
 check("parity round(1.005,2)=1.0",  NumPower::round(NumPower::array([1.005], 'float64'), 2)->toArray(), [1.0], 1e-12);
 
+/* ── bare PHP float / int scalar intake (the float|int half of the union) ── */
+check("raw float scalar", NumPower::round(2.5, 0), 2.0, 1e-6);
+check("raw int scalar",   NumPower::round(25, 0),  25.0);
+check("raw float default precision", NumPower::round(3.5), 4.0, 1e-6);
+
+/* ── string-intake dtype-inference boundaries (single-call precision) ── */
+check("string >UINT64_MAX -> fp128", (string)NumPower::round("18446744073709551616", 0),
+      "18446744073709551616");
+check("string >INT64_MAX -> uint64", (string)NumPower::round("9223372036854775808", 0),
+      "9223372036854775808");
+check("string +inf -> fp128", (string)NumPower::round("inf"), "inf");
+check("string nan -> fp128",  (string)NumPower::round("nan"), "nan");
+
+/* ── malformed / empty / whitespace strings throw ── */
+foreach (['', ' ', 'abc', '1.5abc', '0x1F', '1,5'] as $bad) {
+    try {
+        NumPower::round($bad, 0);
+        echo "FAIL round('$bad') did not throw\n";
+    } catch (\Throwable $e) {
+        echo "OK round('$bad') throws\n";
+    }
+}
+
+/* ── negative precision on fp16 and fp128 (banker's), not just f32/f64 ── */
+check("fp16 round(,-2) banker", NumPower::round(NumPower::array([150.0, 250.0], 'float16'), -2)->toArray(),
+      [200.0, 200.0], 5e-2);
+check("fp128 round(,-2) banker", NumPower::round(NumPower::array(['1234.5678', '1250.0'], 'float128'), -2)->toArray(),
+      [1200.0, 1200.0], 1e-9);
+
+/* ── fp128 ±Inf / NaN pass through round at non-zero precision (regression:
+   the DD multiply used to corrupt ±Inf to NaN) ── */
+check("fp128 round(inf,2) preserves Inf/NaN",
+      NumPower::round(NumPower::array(['inf', '-inf', 'nan'], 'float128'), 2)->toArray(),
+      ['inf', '-inf', 'nan']);
+
 echo "DONE\n";
 ?>
 --EXPECT--
@@ -233,4 +268,20 @@ OK int8 extremes identity
 OK uint8 extremes identity
 OK parity round(2.675,2)=2.68
 OK parity round(1.005,2)=1.0
+OK raw float scalar
+OK raw int scalar
+OK raw float default precision
+OK string >UINT64_MAX -> fp128
+OK string >INT64_MAX -> uint64
+OK string +inf -> fp128
+OK string nan -> fp128
+OK round('') throws
+OK round(' ') throws
+OK round('abc') throws
+OK round('1.5abc') throws
+OK round('0x1F') throws
+OK round('1,5') throws
+OK fp16 round(,-2) banker
+OK fp128 round(,-2) banker
+OK fp128 round(inf,2) preserves Inf/NaN
 DONE
