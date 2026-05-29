@@ -105,6 +105,47 @@ foreach ($spec as [$op, $x, $want]) {
     ok($cpu === $want && $gpu === $want, "fp128 $op($x) special (cpu=$cpu gpu=$gpu want=$want)");
 }
 
+/* ── sinh/cosh overflow & ±inf regression guard (fp128) ─────────────────── */
+/* dd_exp saturates to ±inf beyond ~709.78; the exp-difference/sum must NOT
+   produce NaN. Below the saturation point the DD precision is preserved
+   (≥28 digits); at the boundary (≤~710.48) the value is finite (fp64-tier);
+   beyond, and for ±inf inputs, the DD result is correctly-signed inf — never
+   NaN. (CPU libquadmath keeps finite values past 710.48 — that GPU-DD vs CPU
+   divergence is the inherent fp64 exponent-range limit, shared with exp/log.) */
+$gpu128 = fn($op, $x) => (string) NumPower::$op((new NDArray([$x], 'float128'))->gpu())->cpu()[0];
+$cpu128 = fn($op, $x) => (string) NumPower::$op(new NDArray([$x], 'float128'))[0];
+foreach (['sinh', 'cosh'] as $op) {
+    foreach (['700', '-700', '709', '-709'] as $x) {        /* below cutoff: full DD */
+        ok(sig($cpu128($op, $x), $gpu128($op, $x)) >= 28, "fp128 $op($x) DD parity ≥28");
+    }
+    foreach (['710', '-710'] as $x) {                       /* boundary: finite, fp64-tier */
+        $c = $cpu128($op, $x); $g = $gpu128($op, $x);
+        ok(stripos($g, 'nan') === false && stripos($g, 'inf') === false,
+           "fp128 $op($x) finite (not nan/inf), got $g");
+        ok(near((float)$c, (float)$g, 1e-12), "fp128 $op($x) CPU≈GPU fp64 tol");
+    }
+}
+/* beyond DD range: correctly-signed inf, never NaN. */
+ok($gpu128('sinh', '711')  === 'inf',  "fp128 sinh(711)→+inf not nan");
+ok($gpu128('sinh', '-711') === '-inf', "fp128 sinh(-711)→-inf not nan");
+ok($gpu128('sinh', '1000') === 'inf',  "fp128 sinh(1000)→+inf not nan");
+ok($gpu128('cosh', '711')  === 'inf',  "fp128 cosh(711)→+inf not nan");
+ok($gpu128('cosh', '-1000')=== 'inf',  "fp128 cosh(-1000)→+inf not nan");
+/* ±inf inputs: CPU and GPU agree on the correctly-signed infinity. */
+foreach ([['sinh', INF, 'inf'], ['sinh', -INF, '-inf'],
+          ['cosh', INF, 'inf'], ['cosh', -INF, 'inf']] as [$op, $x, $want]) {
+    $c = (string) NumPower::$op(new NDArray([$x], 'float128'))[0];
+    $g = (string) NumPower::$op((new NDArray([$x], 'float128'))->gpu())->cpu()[0];
+    ok($c === $want && $g === $want, "fp128 $op(±inf) CPU==GPU==$want (cpu=$c gpu=$g)");
+}
+/* fp64 too — sinh/cosh of ±inf and overflow must match CPU, never NaN. */
+foreach ([['sinh', INF], ['sinh', -INF], ['cosh', INF], ['cosh', -INF],
+          ['sinh', 710.0], ['cosh', 710.0], ['sinh', 1000.0]] as [$op, $x]) {
+    $c = NumPower::$op(new NDArray([$x], 'float64'))[0];
+    $g = NumPower::$op((new NDArray([$x], 'float64'))->gpu())->cpu()[0];
+    ok(!is_nan((float)$g) && near($c, $g, 1e-12), "fp64 $op($x) CPU==GPU not nan");
+}
+
 /* ── multi-block (N > one CUDA block) and multi-dim parity ──────────────── */
 $n = 4097;                                  /* forces >1 block on the GPU */
 $vals = [];

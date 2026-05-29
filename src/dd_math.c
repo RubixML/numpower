@@ -497,10 +497,13 @@ ndarray_dd_t ndarray_dd_logb(ndarray_dd_t a) {
  *
  * Near zero the direct (e^x − e^−x)/2 suffers catastrophic cancellation, so
  * for |x| < 0.5 use the expm1 identity sinh(x) = u·(u+2) / (2·(u+1)) with
- * u = expm1(x), which keeps full precision. For |x| ≥ 0.5 there is no
- * harmful cancellation; the over/underflow of exp(±x) handled inside
- * `ndarray_dd_exp` yields ±inf for large |x| without an inf−inf NaN.
- * NaN propagates; sinh(±inf) = ±inf.
+ * u = expm1(x), which keeps full precision. For |x| ≥ 0.5 the difference
+ * has no harmful cancellation, but once exp(±x) saturates to ±inf (|x|
+ * beyond fp64's exp range, ~709.78) the difference would form an inf−inf
+ * NaN, so we defer to fp64 libm sinh there — finite up to |x| ≈ 710.48 and
+ * correctly-signed ±inf beyond (the fp64 exponent-range limit shared with
+ * the DD exp/log path; the magnitude is ≳1e307 so DD's extra digits are
+ * moot). NaN propagates; sinh(±inf) = ±inf.
  *
  * @param[in] a Input DD value.
  * @return sinh(a) in DD precision.
@@ -516,6 +519,7 @@ ndarray_dd_t ndarray_dd_sinh(ndarray_dd_t a) {
     }
     ndarray_dd_t ex  = ndarray_dd_exp(a);
     ndarray_dd_t enx = ndarray_dd_exp(ndarray_dd_neg(a));
+    if (isinf(ex.hi) || isinf(enx.hi)) return ndarray_dd_from_double(sinh(a.hi));
     return ndarray_dd_mul(ndarray_dd_sub(ex, enx), ndarray_dd_from_double(0.5));
 }
 
@@ -523,8 +527,11 @@ ndarray_dd_t ndarray_dd_sinh(ndarray_dd_t a) {
  * @brief DD-precision cosh(x).
  *
  * cosh(x) = (e^x + e^−x)/2. Both terms are positive so there is no
- * cancellation at any magnitude and cosh(0) = 1 stays exact. NaN
- * propagates; cosh(±inf) = +inf.
+ * cancellation and cosh(0) = 1 stays exact. Once exp(±x) saturates to ±inf
+ * (|x| beyond fp64's exp range, ~709.78) the sum would form an inf−inf NaN
+ * via two_sum, so we defer to fp64 libm cosh there — finite up to
+ * |x| ≈ 710.48, +inf beyond (the fp64 exponent-range limit shared with the
+ * DD exp/log path). NaN propagates; cosh(±inf) = +inf.
  *
  * @param[in] a Input DD value.
  * @return cosh(a) in DD precision.
@@ -533,6 +540,7 @@ ndarray_dd_t ndarray_dd_cosh(ndarray_dd_t a) {
     if (ndarray_dd_isnan(a)) return a;
     ndarray_dd_t ex  = ndarray_dd_exp(a);
     ndarray_dd_t enx = ndarray_dd_exp(ndarray_dd_neg(a));
+    if (isinf(ex.hi) || isinf(enx.hi)) return ndarray_dd_from_double(cosh(a.hi));
     return ndarray_dd_mul(ndarray_dd_add(ex, enx), ndarray_dd_from_double(0.5));
 }
 

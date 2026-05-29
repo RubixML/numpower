@@ -1395,20 +1395,31 @@ __device__ inline dd_real dd_sinh(dd_real a) {
         dd_real den = dd_mul(dd_make(2.0, 0.0), dd_add(u, dd_make(1.0, 0.0)));
         return dd_div(num, den);
     }
-    /* |x| ≥ 0.5: no harmful cancellation. exp(±inf) over/underflow is
-       handled inside dd_exp, so large |x| yields ±inf with no inf−inf. */
+    /* |x| ≥ 0.5: (e^x − e^−x)/2, no harmful cancellation. When dd_exp
+       saturates to ±inf (|x| beyond fp64's exp range, ~709.78), the
+       exp-difference would form inf−tiny → NaN inside two_sum, so defer to
+       fp64 libm sinh: it is finite up to |x| ≈ 710.48 and correctly-signed
+       ±inf beyond — the same fp64 exponent-range limit shared with the DD
+       exp/log path. The magnitude there is ≳1e307, so DD's extra digits are
+       moot. This branch also folds in the ±inf inputs (sinh(±inf) = ±inf). */
     dd_real ex  = dd_exp(a);
     dd_real enx = dd_exp(dd_neg(a));
+    if (isinf(ex.hi) || isinf(enx.hi)) return dd_make(sinh(a.hi), 0.0);
     return dd_mul(dd_sub(ex, enx), dd_make(0.5, 0.0));
 }
 
 /** @brief DD-precision cosh(x); see ndarray_dd_cosh in src/dd_math.c. */
 __device__ inline dd_real dd_cosh(dd_real a) {
     if (isnan(a.hi)) return a;
-    /* cosh(x) = (e^x + e^−x)/2 — both terms positive, so no cancellation
-       at any magnitude and cosh(0) = 1 stays exact. */
+    /* cosh(x) = (e^x + e^−x)/2 — both terms positive, so no cancellation and
+       cosh(0) = 1 stays exact. When dd_exp saturates to ±inf (|x| beyond
+       fp64's exp range, ~709.78), the sum would form inf+tiny → NaN inside
+       two_sum, so defer to fp64 libm cosh: finite up to |x| ≈ 710.48, +inf
+       beyond — the same fp64 exponent-range limit shared with the DD exp/log
+       path. cosh is even, so this also yields cosh(±inf) = +inf. */
     dd_real ex  = dd_exp(a);
     dd_real enx = dd_exp(dd_neg(a));
+    if (isinf(ex.hi) || isinf(enx.hi)) return dd_make(cosh(a.hi), 0.0);
     return dd_mul(dd_add(ex, enx), dd_make(0.5, 0.0));
 }
 
@@ -1428,7 +1439,7 @@ __device__ inline dd_real dd_tanh(dd_real a) {
 }
 
 /** @brief DD-precision asinh(x); see ndarray_dd_arcsinh in src/dd_math.c. */
-__device__ inline dd_real dd_asinh(dd_real a) {
+__device__ inline dd_real dd_arcsinh(dd_real a) {
     if (isnan(a.hi) || isinf(a.hi)) return a;   /* asinh(±inf) = ±inf */
     int     neg = (a.hi < 0.0);
     dd_real ax  = dd_abs(a);
@@ -1450,7 +1461,7 @@ __device__ inline dd_real dd_asinh(dd_real a) {
 }
 
 /** @brief DD-precision acosh(x); see ndarray_dd_arccosh in src/dd_math.c. */
-__device__ inline dd_real dd_acosh(dd_real a) {
+__device__ inline dd_real dd_arccosh(dd_real a) {
     if (isnan(a.hi))  return a;
     if (a.hi < 1.0)   return dd_make(nan(""), 0.0);  /* domain: x ≥ 1 */
     if (isinf(a.hi))  return a;                       /* acosh(+inf) = +inf */
@@ -1464,7 +1475,7 @@ __device__ inline dd_real dd_acosh(dd_real a) {
 }
 
 /** @brief DD-precision atanh(x); see ndarray_dd_arctanh in src/dd_math.c. */
-__device__ inline dd_real dd_atanh(dd_real a) {
+__device__ inline dd_real dd_arctanh(dd_real a) {
     if (isnan(a.hi)) return a;
     dd_real ax = dd_abs(a);
     if (ax.hi > 1.0) return dd_make(nan(""), 0.0);    /* domain: |x| ≤ 1 */
@@ -2044,15 +2055,15 @@ DD_UNOP_KERNEL(tcuda_arccos_dd_kernel,   dd_make(acos  (dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_arctan_dd_kernel,   dd_make(atan  (dd_to_double(x)), 0.0))
 
 /* Hyperbolic DD kernels — full DD precision (~32 digits) via the dd_sinh …
-   dd_atanh helpers above, which compose the DD exp/log/sqrt primitives.
+   dd_arctanh helpers above, which compose the DD exp/log/sqrt primitives.
    They previously degraded to fp64 (dd_make(sinh(dd_to_double(x)), 0.0));
    the dd path now matches the CPU libquadmath result to ~31–32 digits. */
 DD_UNOP_KERNEL(tcuda_sinh_dd_kernel,     dd_sinh  (x))
 DD_UNOP_KERNEL(tcuda_cosh_dd_kernel,     dd_cosh  (x))
 DD_UNOP_KERNEL(tcuda_tanh_dd_kernel,     dd_tanh  (x))
-DD_UNOP_KERNEL(tcuda_arcsinh_dd_kernel,  dd_asinh (x))
-DD_UNOP_KERNEL(tcuda_arccosh_dd_kernel,  dd_acosh (x))
-DD_UNOP_KERNEL(tcuda_arctanh_dd_kernel,  dd_atanh (x))
+DD_UNOP_KERNEL(tcuda_arcsinh_dd_kernel,  dd_arcsinh (x))
+DD_UNOP_KERNEL(tcuda_arccosh_dd_kernel,  dd_arccosh (x))
+DD_UNOP_KERNEL(tcuda_arctanh_dd_kernel,  dd_arctanh (x))
 /* Rounding ops preserve the full fp128 input bits — only the fp64 hi
    word changes, so we keep the original lo word. dd_rint/trunc/floor/
    ceil on a pure-double input value-equals libm rounding of the hi
