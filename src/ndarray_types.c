@@ -445,6 +445,28 @@ NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_floor,   floorq,   floorl)
 NDARRAY_FP128_LIBM_WRAPPER(ndarray_fp128_ceil,    ceilq,    ceill)
 
 #undef NDARRAY_FP128_LIBM_WRAPPER
+
+/**
+ * @brief Two-argument arctangent `atan2(a, b)` at fp128 precision.
+ *
+ * Binary, so it cannot share the unary `NDARRAY_FP128_LIBM_WRAPPER` macro.
+ * Uses `atan2q` from libquadmath when present (full 113-bit fp128) and
+ * `atan2l((long double)…)` (~64 bits) otherwise — the same
+ * libquadmath-vs-long-double fallback contract as `ndarray_fp128_sin`.
+ * Resolved out-of-line here (where `HAVE_QUADMATH` and `config.h` are in
+ * scope) so the choice is not re-evaluated at every header include site.
+ *
+ * @param[in] a Numerator (the `y` of the standard `atan2(y, x)`).
+ * @param[in] b Denominator (the `x`).
+ * @return `atan2(a, b)` in the native fp128 storage.
+ */
+ndarray_fp128_t ndarray_fp128_atan2(ndarray_fp128_t a, ndarray_fp128_t b) {
+#  if HAVE_QUADMATH
+    return atan2q(a, b);
+#  else
+    return (ndarray_fp128_t)atan2l((long double)a, (long double)b);
+#  endif
+}
 #endif /* NDARRAY_HAVE_FLOAT128 */
 
 ndarray_fp128_t ndarray_double_to_fp128(double val) {

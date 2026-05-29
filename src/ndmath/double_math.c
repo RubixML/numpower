@@ -51,18 +51,3 @@ float float_round(float number, float decimals) {
     float factor = powf(10, decimals);
     return roundf(number * factor) / factor;
 }
-
-/**
- * @brief Two-argument arctangent at float precision.
- *
- * Kept on the legacy `NDArray_Map1ND` path because `NumPower::arctan2`
- * is a binary op that the typed unary dispatcher does not handle.
- * Refactoring it needs a typed binary-unary dispatcher.
- *
- * @param[in] x Input.
- * @param[in] y Input.
- * @return `atan2f(x, y)`.
- */
-float float_arctan2(float x, float y) {
-    return atan2f(x, y);
-}
