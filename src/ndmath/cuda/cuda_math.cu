@@ -1089,9 +1089,15 @@ __device__ inline dd_real dd_two_sum(double a, double b) {
     double e  = (a - (s - bb)) + (b - bb);
     return dd_make(s, e);
 }
-/* TwoProd via FMA (single rounding). */
+/* TwoProd via FMA. CRITICAL: use `__dmul_rn` (round-to-nearest, NOT
+   FMA-contracted) for the leading product so the residual `fma(a, b, -p)`
+   captures the actual rounding error of `a * b`. NVCC's default `-fmad=true`
+   silently contracts `a * b` into an FMA pattern when it sees a nearby
+   FMA call, giving a different rounding than IEEE fp64 multiply and
+   collapsing DD precision to fp64 (Hida/Li/Bailey two_prod's invariant
+   `a*b == p + e` breaks if `p` isn't the correctly-rounded product). */
 __device__ inline dd_real dd_two_prod(double a, double b) {
-    double p = a * b;
+    double p = __dmul_rn(a, b);
     double e = fma(a, b, -p);
     return dd_make(p, e);
 }
@@ -1217,6 +1223,129 @@ __device__ inline dd_real dd_recip(dd_real a) {
 
 __device__ inline dd_real dd_rsqrt(dd_real a) {
     return dd_recip(dd_sqrt(a));
+}
+
+/* ── DD-precision transcendentals (device side) ─────────────────────────
+   Identical algorithms to the CPU helpers in `src/dd_math.c`; the
+   constants below are byte-equal to `DD_LN2` / `DD_LN10` / `DD_LOG2_E`
+   / `DD_LOG10_E` there so CPU↔GPU parity is preserved. Every step
+   runs in DD arithmetic — no internal collapse to fp64 — so the
+   result holds ~30 decimal digits of precision the same as the
+   libquadmath path on the host. */
+__device__ inline dd_real dd_exp(dd_real a) {
+    if (isnan(a.hi)) return a;
+    if (isinf(a.hi)) return dd_make(a.hi > 0 ? a.hi : 0.0, 0.0);
+    if (a.hi >  709.7827) return dd_make(INFINITY, 0.0);
+    if (a.hi < -745.1332) return dd_make(0.0, 0.0);
+    /* Range reduction: x = k·ln(2) + r, k = round(x/ln(2)). */
+    double  k_d  = round(a.hi * 1.4426950408889634);
+    int     k    = (int)k_d;
+    dd_real k_dd = dd_make(k_d, 0.0);
+    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
+    dd_real r = dd_sub(a, dd_mul(k_dd, LN2));
+
+    /* Horner of 1 + r·(1 + r/2·(1 + r/3·(… + r/20))). */
+    dd_real result = dd_make(1.0, 0.0);
+    for (int i = 20; i >= 1; i--) {
+        dd_real r_over_i = dd_div(r, dd_make((double)i, 0.0));
+        result = dd_add(dd_make(1.0, 0.0), dd_mul(r_over_i, result));
+    }
+
+    /* Scale by 2^k: ldexp is exact (exponent-only op). */
+    result.hi = ldexp(result.hi, k);
+    result.lo = ldexp(result.lo, k);
+    return result;
+}
+
+__device__ inline dd_real dd_expm1(dd_real a) {
+    if (isnan(a.hi)) return a;
+    if (a.hi >= 0.5 || a.hi <= -0.5) {
+        return dd_sub(dd_exp(a), dd_make(1.0, 0.0));
+    }
+    /* Horner of x·(1 + x/2·(1 + x/3·(…))) — 25 inner steps capture
+       (0.5)^25/25! < DD ULP. */
+    dd_real result = dd_make(1.0, 0.0);
+    for (int i = 25; i >= 2; i--) {
+        dd_real a_over_i = dd_div(a, dd_make((double)i, 0.0));
+        result = dd_add(dd_make(1.0, 0.0), dd_mul(a_over_i, result));
+    }
+    return dd_mul(a, result);
+}
+
+__device__ inline dd_real dd_log(dd_real a) {
+    if (isnan(a.hi)) return a;
+    if (a.hi < 0.0)              return dd_make(nan(""), 0.0);
+    if (a.hi == 0.0 && a.lo == 0.0) return dd_make(-INFINITY, 0.0);
+    if (isinf(a.hi))             return dd_make(INFINITY, 0.0);
+
+    int     e;
+    double  m_hi = frexp(a.hi, &e);
+    dd_real m    = dd_make(m_hi, ldexp(a.lo, -e));
+
+    /* Bring m into [sqrt(0.5), sqrt(2)) so |u| ≤ ~0.172. */
+    if (m.hi < 0.7071067811865476) {
+        m  = dd_add(m, m);
+        e -= 1;
+    }
+
+    const dd_real one = dd_make(1.0, 0.0);
+    dd_real u   = dd_div(dd_sub(m, one), dd_add(m, one));
+    dd_real u2  = dd_mul(u, u);
+
+    /* 2·atanh(u) = 2·(u + u³/3 + u⁵/5 + … + u^(2N-1)/(2N-1)).
+       For |u| ≤ ~0.172 (the post-shift range), the truncated-series
+       error after the last term u^(2N-1)/(2N-1) is below DD epsilon
+       (~10⁻³²) once 2N-1 ≥ ~41. Take 2N-1 = 51 for headroom and use
+       full DD-precision reciprocal constants (`dd_div(one, k)`; an
+       fp64 `1.0 / k` carries only ~16 digits and collapses the
+       series back to fp64 precision). */
+    dd_real sum = dd_div(one, dd_make(51.0, 0.0));
+    for (int k = 49; k >= 1; k -= 2) {
+        dd_real inv_k = dd_div(one, dd_make((double)k, 0.0));
+        sum = dd_add(inv_k, dd_mul(u2, sum));
+    }
+    dd_real log_m = dd_mul(u, sum);
+    log_m = dd_add(log_m, log_m);  /* · 2 */
+
+    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
+    return dd_add(log_m, dd_mul(dd_make((double)e, 0.0), LN2));
+}
+
+__device__ inline dd_real dd_log1p(dd_real a) {
+    if (isnan(a.hi)) return a;
+    /* `dd_add(1, a)` preserves DD precision even when |a| is at DD
+       epsilon — the lo limb of the sum captures the contribution of `a`
+       past fp64's 53 bits. So `dd_log(1 + a)` is precision-faithful
+       across the full input range without needing a Taylor branch.
+       The argument `1 + a` is well within `dd_log`'s domain (it's
+       positive whenever the result is finite; the NaN / −inf edge
+       cases fall through to dd_log's own handling). */
+    return dd_log(dd_add(dd_make(1.0, 0.0), a));
+}
+
+__device__ inline dd_real dd_exp2(dd_real a) {
+    const dd_real LN2 = dd_make(0.6931471805599453, 2.3190468138462996e-17);
+    return dd_exp(dd_mul(a, LN2));
+}
+
+__device__ inline dd_real dd_log2(dd_real a) {
+    /* Power-of-2 exact short-circuit. */
+    if (a.lo == 0.0 && isfinite(a.hi) && a.hi > 0.0) {
+        int e;
+        double m = frexp(a.hi, &e);
+        if (m == 0.5) return dd_make((double)(e - 1), 0.0);
+    }
+    const dd_real LOG2_E = dd_make(1.4426950408889634, 2.0355273740931033e-17);
+    return dd_mul(dd_log(a), LOG2_E);
+}
+
+__device__ inline dd_real dd_log10(dd_real a) {
+    const dd_real LOG10_E = dd_make(0.4342944819032518, 1.0983196502167645e-17);
+    return dd_mul(dd_log(a), LOG10_E);
+}
+
+__device__ inline dd_real dd_logb(dd_real a) {
+    return dd_make(logb(a.hi), 0.0);
 }
 
 /**
@@ -1763,23 +1892,20 @@ DD_UNOP_KERNEL(tcuda_rsqrt_dd_kernel,  dd_rsqrt(x))
 DD_UNOP_KERNEL(tcuda_square_dd_kernel, dd_mul(x, x))
 DD_UNOP_KERNEL(tcuda_sinc_dd_kernel,   dd_sinc(x))
 
-/* Transcendental DD kernels — every op rounds the DD pair to a `double`,
-   runs the libdevice intrinsic, and writes the result back as a DD pair
-   with a zero `lo` word. The accuracy ceiling is therefore fp64 (~15.95
-   decimal digits) regardless of how many DD bits the host packed in,
-   matching the contract of the existing GPU `dd_sinc` (`tcuda_sinc_dd_kernel`)
-   and `dd_pow` (`tcuda_pow_dd_kernel`) reference paths above, which
-   likewise route through fp64. Full 113-bit transcendentals require
-   libquadmath on the CPU side (Linux GCC x86-64); GPU compute stops at
-   the libdevice fp64 intrinsics. */
-DD_UNOP_KERNEL(tcuda_exp_dd_kernel,    dd_make(exp  (dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_exp2_dd_kernel,   dd_make(exp2 (dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_expm1_dd_kernel,  dd_make(expm1(dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_log_dd_kernel,    dd_make(log  (dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_log1p_dd_kernel,  dd_make(log1p(dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_log2_dd_kernel,   dd_make(tcuda_log2_fp<double>(dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_log10_dd_kernel,  dd_make(log10(dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_logb_dd_kernel,   dd_make(logb (dd_to_double(x)), 0.0))
+/* Transcendental DD kernels — each op runs entirely in DD arithmetic
+   (range reduction + Horner-evaluated DD Taylor / atanh series), so
+   the (hi, lo) pair carries ~30 decimal digits of precision matching
+   the CPU libquadmath path. The previous fp64 fallback (`dd_make(exp
+   (dd_to_double(x)), 0.0)`) collapsed every result to ~15 digits;
+   the new path uses `dd_exp` / `dd_log` / etc. defined above. */
+DD_UNOP_KERNEL(tcuda_exp_dd_kernel,    dd_exp   (x))
+DD_UNOP_KERNEL(tcuda_exp2_dd_kernel,   dd_exp2  (x))
+DD_UNOP_KERNEL(tcuda_expm1_dd_kernel,  dd_expm1 (x))
+DD_UNOP_KERNEL(tcuda_log_dd_kernel,    dd_log   (x))
+DD_UNOP_KERNEL(tcuda_log1p_dd_kernel,  dd_log1p (x))
+DD_UNOP_KERNEL(tcuda_log2_dd_kernel,   dd_log2  (x))
+DD_UNOP_KERNEL(tcuda_log10_dd_kernel,  dd_log10 (x))
+DD_UNOP_KERNEL(tcuda_logb_dd_kernel,   dd_logb  (x))
 
 /* Trig / hyperbolic / rounding DD kernels — same fp64 precision tier
    as the exp/log dd kernels above. Full 113-bit fp128 transcendentals

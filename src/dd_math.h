@@ -43,6 +43,23 @@ ndarray_dd_t ndarray_dd_pow(ndarray_dd_t a, ndarray_dd_t b);
 ndarray_dd_t ndarray_dd_sqrt(ndarray_dd_t a);
 ndarray_dd_t ndarray_dd_rsqrt(ndarray_dd_t a);
 
+/* Full-DD-precision transcendentals (~30 sig digits). All are evaluated
+   in DD arithmetic — no internal collapse to fp64 — so the result
+   matches libquadmath's expq/logq/etc. to the last few DD bits when
+   the value stays within fp64's exponent range. Outside that range
+   (e.g. exp(-1000), where the true value 5e-435 is below fp64's
+   underflow threshold) the DD representation cannot hold the answer
+   regardless of arithmetic precision and clamps to 0 or +inf the same
+   way fp64 would. */
+ndarray_dd_t ndarray_dd_exp   (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_expm1 (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_exp2  (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_log   (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_log1p (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_log2  (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_log10 (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_logb  (ndarray_dd_t a);
+
 /* ── comparisons ────────────────────────────────────────────────────────── */
 int  ndarray_dd_cmp(ndarray_dd_t a, ndarray_dd_t b);   /* -1, 0, 1 */
 int  ndarray_dd_iszero(ndarray_dd_t a);

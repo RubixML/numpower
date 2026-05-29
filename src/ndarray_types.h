@@ -143,14 +143,14 @@ uint16_t ndarray_double_to_fp16(double val);
       `dd → double → libm → dd` for sin/cos/exp/log. Linux GCC x86-64 with
       libquadmath is the only configuration that yields full 113-bit
       transcendentals — every other platform tops out at fp64 here. */
-#  define NDARRAY_FP128_EXP(a)      ndarray_dd_from_double(exp(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_EXP2(a)     ndarray_dd_from_double(exp2(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_EXPM1(a)    ndarray_dd_from_double(expm1(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_LOG(a)      ndarray_dd_from_double(log(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_LOG1P(a)    ndarray_dd_from_double(log1p(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_LOG2(a)     ndarray_dd_from_double(log2(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_LOG10(a)    ndarray_dd_from_double(log10(ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_LOGB(a)     ndarray_dd_from_double(logb(ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_EXP(a)      ndarray_dd_exp   (a)
+#  define NDARRAY_FP128_EXP2(a)     ndarray_dd_exp2  (a)
+#  define NDARRAY_FP128_EXPM1(a)    ndarray_dd_expm1 (a)
+#  define NDARRAY_FP128_LOG(a)      ndarray_dd_log   (a)
+#  define NDARRAY_FP128_LOG1P(a)    ndarray_dd_log1p (a)
+#  define NDARRAY_FP128_LOG2(a)     ndarray_dd_log2  (a)
+#  define NDARRAY_FP128_LOG10(a)    ndarray_dd_log10 (a)
+#  define NDARRAY_FP128_LOGB(a)     ndarray_dd_logb  (a)
 #  define NDARRAY_FP128_COS(a)      ndarray_dd_from_double(cos    (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_TAN(a)      ndarray_dd_from_double(tan    (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_ARCSIN(a)   ndarray_dd_from_double(asin   (ndarray_dd_to_double(a)))
