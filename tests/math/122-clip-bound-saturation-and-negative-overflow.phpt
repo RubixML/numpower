@@ -25,8 +25,17 @@ clip() bound saturation for integer dtypes + negative-magnitude string overflow 
       escalate to float128.
 */
 
-function check_arr($label, $got, $want) {
-    if ($got === $want) { echo "OK $label\n"; return; }
+/* GPU assertions are SILENT on success (only failures print) so this
+   single test passes identically on a CPU-only build (CI) and on a GPU
+   box: the GPU branch runs only when a device is present and emits no
+   stdout unless it diverges — a real GPU regression still breaks the
+   test. */
+$hasGpu = false;
+try { $hasGpu = NumPower::array([1.0])->gpu()->isGPU(); }
+catch (\Throwable $t) { $hasGpu = false; }
+
+function check_arr($label, $got, $want, $silent = false) {
+    if ($got === $want) { if (!$silent) echo "OK $label\n"; return; }
     echo "FAIL $label: got=", json_encode($got), " want=", json_encode($want), "\n";
 }
 
@@ -47,8 +56,10 @@ foreach (['uint8' => false, 'uint16' => false,
     $expected = $is_wide ? ['10','50','100','100'] : [10, 50, 100, 100];
     $r = NumPower::clip($a, -50, 100)->toArray();
     check_arr("clip($dt, -50, 100) CPU", $r, $expected);
-    $r = NumPower::clip($a->gpu(), -50, 100)->cpu()->toArray();
-    check_arr("clip($dt, -50, 100) GPU", $r, $expected);
+    if ($hasGpu) {
+        $r = NumPower::clip($a->gpu(), -50, 100)->cpu()->toArray();
+        check_arr("clip($dt, -50, 100) GPU", $r, $expected, true);
+    }
 }
 
 /* Over-max bound: `max` greater than dtype's MAX saturates to MAX. */
@@ -124,13 +135,9 @@ echo "DONE\n";
 ?>
 --EXPECT--
 OK clip(uint8, -50, 100) CPU
-OK clip(uint8, -50, 100) GPU
 OK clip(uint16, -50, 100) CPU
-OK clip(uint16, -50, 100) GPU
 OK clip(uint32, -50, 100) CPU
-OK clip(uint32, -50, 100) GPU
 OK clip(uint64, -50, 100) CPU
-OK clip(uint64, -50, 100) GPU
 OK clip(uint8, 0, 300) CPU
 OK clip(uint8, 0, 1000000) CPU
 OK clip(int8, -300, 200) CPU
