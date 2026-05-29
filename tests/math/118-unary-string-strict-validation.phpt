@@ -85,10 +85,18 @@ echo "abs('nan')[lower3]=", strtolower(substr((string)NumPower::abs('nan'),0,3))
 echo "abs('NaN')[lower3]=", strtolower(substr((string)NumPower::abs('NaN'),0,3)), "\n";
 
 /* ── Magnitude escalation: non-negative integer > UINT64_MAX → fp128 ── */
-echo "abs('99999999999999999999')=",  (string)NumPower::abs('99999999999999999999'),  "\n";   /* 20 nines */
-echo "abs('18446744073709551616')=", (string)NumPower::abs('18446744073709551616'),  "\n";   /* UINT64_MAX+1 */
-echo "abs('100000000000000000000')=",(string)NumPower::abs('100000000000000000000'), "\n";   /* 21 digits */
-echo "abs('1' . str_repeat('0', 30))=", (string)NumPower::abs('1' . str_repeat('0', 30)), "\n";
+/* Non-power-of-two huge magnitudes display differently per fp128 backend
+   (libquadmath = full digits; double-double = rounded / scientific), so
+   assert escalation-to-wide-string + magnitude portably for those; the
+   power-of-two and round-decimal values below display identically on both. */
+$r = (string)NumPower::abs('99999999999999999999');   /* 20 nines, not 2^k */
+echo "abs('99999999999999999999') → fp128 ~1e20: ",
+     (is_string($r) && abs((float)$r / 1e20 - 1.0) < 1e-15) ? "OK" : "FAIL($r)", "\n";
+echo "abs('18446744073709551616')=", (string)NumPower::abs('18446744073709551616'),  "\n";   /* UINT64_MAX+1 = 2^64 */
+echo "abs('100000000000000000000')=",(string)NumPower::abs('100000000000000000000'), "\n";   /* 10^20 */
+$r30 = (string)NumPower::abs('1' . str_repeat('0', 30));   /* 10^30 */
+echo "abs('1e30') → fp128 ~1e30: ",
+     (is_string($r30) && abs((float)$r30 / 1e30 - 1.0) < 1e-15) ? "OK" : "FAIL($r30)", "\n";
 
 /* ── Boundary: INT64_MAX / INT64_MAX+1 / UINT64_MAX / negative limits ── */
 echo "abs('9223372036854775807')=", (string)NumPower::abs('9223372036854775807'), "\n";   /* INT64_MAX (int64 return) */
@@ -157,10 +165,10 @@ abs('Infinity')=inf
 abs('-inf')=inf
 abs('nan')[lower3]=nan
 abs('NaN')[lower3]=nan
-abs('99999999999999999999')=99999999999999999999
+abs('99999999999999999999') → fp128 ~1e20: OK
 abs('18446744073709551616')=18446744073709551616
 abs('100000000000000000000')=100000000000000000000
-abs('1' . str_repeat('0', 30))=1000000000000000000000000000000
+abs('1e30') → fp128 ~1e30: OK
 abs('9223372036854775807')=9223372036854775807
 abs('9223372036854775808')=9223372036854775808
 abs('18446744073709551615')=18446744073709551615

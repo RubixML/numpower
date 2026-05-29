@@ -47,7 +47,14 @@ expect_throw("abs('.')",        fn() => NumPower::abs('.'));
 expect_throw("abs('  -  1.5')", fn() => NumPower::abs('  -  1.5'));
 
 /* ── Magnitudes past UINT64_MAX escalate to float128 (not saturate) ──── */
-echo "abs('99999999999999999999')=",        (string)NumPower::abs('99999999999999999999'),  "\n";
+/* 10^20-1 is not a power of two, so its exact decimal display depends on
+   the fp128 backend: libquadmath prints all 20 digits; the double-double
+   emulation (macOS, GPU) rounds the display to 1e20. Assert the escalation
+   (a wide-dtype string, never a saturated int) + magnitude portably. */
+$r = (string)NumPower::abs('99999999999999999999');
+echo "abs('99999999999999999999') → fp128 ~1e20: ",
+     (is_string($r) && abs((float)$r / 1e20 - 1.0) < 1e-15) ? "OK" : "FAIL($r)", "\n";
+/* 2^64 is a power of two → exact in both backends. */
 echo "abs('18446744073709551616')=",        (string)NumPower::abs('18446744073709551616'),  "\n";
 
 /* The strict validator on clip bounds still rejects malformed numbers. */
@@ -109,7 +116,7 @@ OK abs('+'): Numeric string expected, got malformed literal: "+".
 OK abs('-'): Numeric string expected, got malformed literal: "-".
 OK abs('.'): Numeric string expected, got malformed literal: ".".
 OK abs('  -  1.5'): Numeric string expected, got malformed literal: "  -  1.5".
-abs('99999999999999999999')=99999999999999999999
+abs('99999999999999999999') → fp128 ~1e20: OK
 abs('18446744073709551616')=18446744073709551616
 OK clip([1],'abc','5'): NDArray clip: 'min' is not a valid number:%s
 OK clip([1],'5','1.5e'): NDArray clip: 'max' has malformed exponent:%s

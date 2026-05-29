@@ -56,21 +56,29 @@ function check($label, $got, $want, $tol = 0.0) {
 
 /* ── Bit-exact libm parity on fp64 (CPU) ─────────────────────────────── */
 
+/* libm transcendentals (exp/expm1/log/log1p/log10) are NOT IEEE
+   correctly-rounded, so glibc and macOS libm differ by up to 1 ULP for
+   the same input. NumPower's fp64 path and PHP's math functions both call
+   the SAME platform libm, so deriving the reference from PHP keeps the
+   "bit-exact vs libm" assertion true on every platform (it verifies
+   NumPower routes through libm, not that two libm builds agree). Inputs
+   whose result is exact (exp(0), exp2, log of a power, sqrt — IEEE
+   correctly-rounded) keep their literal reference. */
 $cases = [
     /* op,       input,   PyTorch/libm reference */
-    ['exp',      1.0,     2.718281828459045],
+    ['exp',      1.0,     exp(1.0)],
     ['exp',      0.0,     1.0],
-    ['exp',      2.0,     7.38905609893065],
-    ['exp',      4.0,     54.598150033144236],
+    ['exp',      2.0,     exp(2.0)],
+    ['exp',      4.0,     exp(4.0)],
     ['exp2',     0.0,     1.0],
     ['exp2',     10.0,    1024.0],
     ['expm1',    0.0,     0.0],
-    ['expm1',    1.0,     1.718281828459045],
-    ['expm1',    1e-15,   1.0000000000000007e-15],
+    ['expm1',    1.0,     expm1(1.0)],
+    ['expm1',    1e-15,   expm1(1e-15)],
     ['log',      1.0,     0.0],
-    ['log',      2.0,     0.6931471805599453],
+    ['log',      2.0,     log(2.0)],
     ['log1p',    0.0,     0.0],
-    ['log1p',    1e-15,   9.999999999999995e-16],
+    ['log1p',    1e-15,   log1p(1e-15)],
     ['log2',     1024.0,  10.0],
     ['log2',     8.0,     3.0],
     ['log10',    1000.0,  3.0],
