@@ -3912,6 +3912,20 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                 }
                 default: break;
             }
+            /* Normalize NaN sign bit to canonical +NaN. libquadmath /
+               libm leak a sign-bit-set "-nan" out of `logq(-x)`,
+               `sqrtq(-x)`, `log1pq(-x)` etc. The fp64 path returns
+               NaN with the sign bit set too, but PHP's float
+               stringifier hides the sign (`var_dump(NAN)` prints
+               "NAN"); `quadmath_snprintf` honours it, so the user
+               sees the inconsistency only on fp128. Force-clear the
+               sign bit so display matches the rest of the unary
+               family. Skip on NDARRAY_UNOP_SIGN — that op uses NaN
+               propagation as a meaningful value (PyTorch parity) and
+               the input's sign bit is part of its signal. */
+            if (op != NDARRAY_UNOP_SIGN && NDARRAY_FP128_ISNAN(y)) {
+                y = NDARRAY_FP128_NAN();
+            }
             p[i] = y;
         }
         return 0;

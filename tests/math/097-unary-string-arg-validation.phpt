@@ -30,10 +30,25 @@ echo "sqrt('16.0')=",           (string)NumPower::sqrt('16.0'),               "\
 echo "clip('5',0,1)=",          (string)NumPower::clip('5', 0, 1),            "\n";
 echo "clip('5.5',0,1)=",        (string)NumPower::clip('5.5', 0, 1),          "\n";
 
-/* ── Empty / whitespace-only strings still throw ─────────────────────── */
-expect_throw("abs('')",      fn() => NumPower::abs(''));
-expect_throw("sqrt('   ')",  fn() => NumPower::sqrt('   '));
-expect_throw("clip('',0,1)", fn() => NumPower::clip('', 0, 1));
+/* ── Empty / whitespace-only / malformed strings throw ──────────────── */
+expect_throw("abs('')",         fn() => NumPower::abs(''));
+expect_throw("sqrt('   ')",     fn() => NumPower::sqrt('   '));
+expect_throw("clip('',0,1)",    fn() => NumPower::clip('', 0, 1));
+/* Stricter validation also rejects partial / illegal literals. */
+expect_throw("abs('0xff')",     fn() => NumPower::abs('0xff'));
+expect_throw("abs('abc')",      fn() => NumPower::abs('abc'));
+expect_throw("abs('1.5.5')",    fn() => NumPower::abs('1.5.5'));
+expect_throw("abs('1.5a')",     fn() => NumPower::abs('1.5a'));
+expect_throw("abs('1,5')",      fn() => NumPower::abs('1,5'));
+expect_throw("abs('1.5e')",     fn() => NumPower::abs('1.5e'));
+expect_throw("abs('+')",        fn() => NumPower::abs('+'));
+expect_throw("abs('-')",        fn() => NumPower::abs('-'));
+expect_throw("abs('.')",        fn() => NumPower::abs('.'));
+expect_throw("abs('  -  1.5')", fn() => NumPower::abs('  -  1.5'));
+
+/* ── Magnitudes past UINT64_MAX escalate to float128 (not saturate) ──── */
+echo "abs('99999999999999999999')=",        (string)NumPower::abs('99999999999999999999'),  "\n";
+echo "abs('18446744073709551616')=",        (string)NumPower::abs('18446744073709551616'),  "\n";
 
 /* The strict validator on clip bounds still rejects malformed numbers. */
 expect_throw("clip([1],'abc','5')",  fn() => NumPower::clip([1.0], 'abc', '5'));
@@ -81,9 +96,21 @@ sqrt('4')=2
 sqrt('16.0')=4
 clip('5',0,1)=1
 clip('5.5',0,1)=1
-OK abs(''): Numeric string expected, got an empty or whitespace-only value.
-OK sqrt('   '): Numeric string expected, got an empty or whitespace-only value.
-OK clip('',0,1): Numeric string expected, got an empty or whitespace-only value.
+OK abs(''): Numeric string expected, got an empty value.
+OK sqrt('   '): Numeric string expected, got a whitespace-only value.
+OK clip('',0,1): Numeric string expected, got an empty value.
+OK abs('0xff'): Numeric string expected, got malformed literal: "0xff".
+OK abs('abc'): Numeric string expected, got malformed literal: "abc".
+OK abs('1.5.5'): Numeric string expected, got malformed literal: "1.5.5".
+OK abs('1.5a'): Numeric string expected, got malformed literal: "1.5a".
+OK abs('1,5'): Numeric string expected, got malformed literal: "1,5".
+OK abs('1.5e'): Numeric string expected, got malformed literal: "1.5e".
+OK abs('+'): Numeric string expected, got malformed literal: "+".
+OK abs('-'): Numeric string expected, got malformed literal: "-".
+OK abs('.'): Numeric string expected, got malformed literal: ".".
+OK abs('  -  1.5'): Numeric string expected, got malformed literal: "  -  1.5".
+abs('99999999999999999999')=99999999999999999999
+abs('18446744073709551616')=18446744073709551616
 OK clip([1],'abc','5'): NDArray clip: 'min' is not a valid number:%s
 OK clip([1],'5','1.5e'): NDArray clip: 'max' has malformed exponent:%s
 OK clip([1],'','5'): NDArray clip: 'min' is empty.

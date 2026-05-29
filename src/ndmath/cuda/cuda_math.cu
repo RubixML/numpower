@@ -1253,13 +1253,47 @@ __device__ inline dd_real dd_clip(dd_real x, dd_real lo, dd_real hi) {
     return       dd_lt(hi, _y) ? hi : _y;    /* min(_y, hi) */
 }
 
-/* sinc(π·x) with x stored as DD. sin/cos through fp64 only — full DD
-   trig would need a CORDIC ladder; for normalised sinc the input is in
-   units of π so the argument never has the precision headroom DD offers
-   anyway. dd_to_double + sin retains > 15 decimal digits of accuracy. */
+/* sinc(π·x) with x stored as DD. For small |x| (|πx| < ~π/10) the
+   Taylor series sinc(x) = 1 - (πx)²/6 + (πx)⁴/120 - (πx)⁶/5040 + ...
+   converges so rapidly that 5 terms give full DD precision (~32 sig
+   digits); we run it in DD arithmetic so the (hi, lo) pair is
+   meaningful — the previous fp64 fallback collapsed `sinc(1e-10)` to
+   exactly `1.0`, losing the `~1.6e-21` deviation the CPU captures.
+   For larger |x| the argument reduction in `sin(πx)` is the dominant
+   error term (precision-bound by fp64), so we keep the fp64 path
+   there — full DD trig would need a CORDIC ladder. */
 __device__ inline dd_real dd_sinc(dd_real x) {
+    if (x.hi == 0.0 && x.lo == 0.0) return dd_make(1.0, 0.0);
+
+    double abs_hi = (x.hi < 0.0) ? -x.hi : x.hi;
+    if (abs_hi <= 0.1) {
+        /* π in double-double: hi = nearest-double(π), lo = π - hi. */
+        const dd_real pi_dd = dd_make(3.141592653589793,
+                                       1.2246467991473532e-16);
+        const dd_real one    = dd_make(1.0, 0.0);
+        const dd_real c_6    = dd_make(6.0, 0.0);
+        const dd_real c_120  = dd_make(120.0, 0.0);
+        const dd_real c_5040 = dd_make(5040.0, 0.0);
+        const dd_real c_362880   = dd_make(362880.0,   0.0);
+        const dd_real c_39916800 = dd_make(39916800.0, 0.0);
+
+        dd_real px  = dd_mul(pi_dd, x);
+        dd_real px2 = dd_mul(px, px);
+        dd_real term = px2;
+        dd_real result = dd_sub(one,    dd_div(term, c_6));
+        term   = dd_mul(term, px2);
+        result = dd_add(result, dd_div(term, c_120));
+        term   = dd_mul(term, px2);
+        result = dd_sub(result, dd_div(term, c_5040));
+        term   = dd_mul(term, px2);
+        result = dd_add(result, dd_div(term, c_362880));
+        term   = dd_mul(term, px2);
+        result = dd_sub(result, dd_div(term, c_39916800));
+        return result;
+    }
+
+    /* Larger |x|: argument reduction is the bottleneck; fp64 path. */
     double xd = dd_to_double(x);
-    if (xd == 0.0 && x.lo == 0.0) return dd_make(1.0, 0.0);
     double arg = 3.14159265358979323846 * xd;
     double r = sin(arg) / arg;
     return dd_make(r, 0.0);
@@ -1369,9 +1403,32 @@ template <typename T> __device__ inline T tcuda_log1p_fp(T x);
 template <>           __device__ inline float  tcuda_log1p_fp<float >(float  x) { return log1pf(x); }
 template <>           __device__ inline double tcuda_log1p_fp<double>(double x) { return log1p (x); }
 
+/* CUDA's log2/log2f intrinsics have up to 1 ULP error and round
+   log2(2^k) to k - 1 ULP for some powers of 2 — e.g. CUDA's log2(8.0)
+   returns 2.9999999999999996 instead of the exact 3.0 that libm
+   delivers. The power-of-2 short-circuit recovers the exact integer
+   result on GPU (CPU↔GPU parity for that input class) without
+   measurably affecting throughput on the general case: `frexp` is a
+   single hardware instruction. The check `m == 0.5` is true precisely
+   when @p x is an exact power of two; the unbiased exponent is then
+   `e - 1` in `log2`'s ranging convention. */
 template <typename T> __device__ inline T tcuda_log2_fp (T x);
-template <>           __device__ inline float  tcuda_log2_fp<float >(float  x) { return log2f(x); }
-template <>           __device__ inline double tcuda_log2_fp<double>(double x) { return log2 (x); }
+template <>           __device__ inline float  tcuda_log2_fp<float >(float  x) {
+    if (x > 0.0f && isfinite(x)) {
+        int e;
+        float m = frexpf(x, &e);
+        if (m == 0.5f) return (float)(e - 1);
+    }
+    return log2f(x);
+}
+template <>           __device__ inline double tcuda_log2_fp<double>(double x) {
+    if (x > 0.0 && isfinite(x)) {
+        int e;
+        double m = frexp(x, &e);
+        if (m == 0.5) return (double)(e - 1);
+    }
+    return log2(x);
+}
 
 template <typename T> __device__ inline T tcuda_log10_fp(T x);
 template <>           __device__ inline float  tcuda_log10_fp<float >(float  x) { return log10f(x); }
@@ -1646,7 +1703,7 @@ HALF_UNOP_KERNEL(tcuda_exp2_half_kernel,  exp2f)
 HALF_UNOP_KERNEL(tcuda_expm1_half_kernel, expm1f)
 HALF_UNOP_KERNEL(tcuda_log_half_kernel,   logf)
 HALF_UNOP_KERNEL(tcuda_log1p_half_kernel, log1pf)
-HALF_UNOP_KERNEL(tcuda_log2_half_kernel,  log2f)
+HALF_UNOP_KERNEL(tcuda_log2_half_kernel,  tcuda_log2_fp<float>)
 HALF_UNOP_KERNEL(tcuda_log10_half_kernel, log10f)
 HALF_UNOP_KERNEL(tcuda_logb_half_kernel,  logbf)
 /* Trig / hyperbolic / rounding fp16 kernels — round-trip through
@@ -1720,7 +1777,7 @@ DD_UNOP_KERNEL(tcuda_exp2_dd_kernel,   dd_make(exp2 (dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_expm1_dd_kernel,  dd_make(expm1(dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_log_dd_kernel,    dd_make(log  (dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_log1p_dd_kernel,  dd_make(log1p(dd_to_double(x)), 0.0))
-DD_UNOP_KERNEL(tcuda_log2_dd_kernel,   dd_make(log2 (dd_to_double(x)), 0.0))
+DD_UNOP_KERNEL(tcuda_log2_dd_kernel,   dd_make(tcuda_log2_fp<double>(dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_log10_dd_kernel,  dd_make(log10(dd_to_double(x)), 0.0))
 DD_UNOP_KERNEL(tcuda_logb_dd_kernel,   dd_make(logb (dd_to_double(x)), 0.0))
 

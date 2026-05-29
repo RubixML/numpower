@@ -460,6 +460,18 @@ double ndarray_fp128_to_double(ndarray_fp128_t val) {
 }
 
 void ndarray_fp128_to_string(ndarray_fp128_t val, char *buf, size_t bufsize) {
+    /* NaN-sign normalization: libquadmath / fp64 transcendentals leak a
+       sign-bit-set "-nan" out of `logq(-x)`, `sqrtq(-x)`, etc., and
+       quadmath_snprintf prints it verbatim. PHP's float stringifier
+       hides the sign on fp64 NaN (`var_dump(NAN)` prints "NAN"), so
+       the user sees the inconsistency only on fp128. Canonicalise to
+       the unsigned NaN literal across both libquadmath and DD
+       backends — the underlying value is unaffected; only the
+       human-readable form changes. */
+    if (NDARRAY_FP128_ISNAN(val)) {
+        snprintf(buf, bufsize, "nan");
+        return;
+    }
 #if HAVE_QUADMATH && NDARRAY_HAVE_FLOAT128
     /* libquadmath supplies %Qg which renders all 113 mantissa bits (~34
        decimal digits). Use it when available so fp128 round-trips show the
