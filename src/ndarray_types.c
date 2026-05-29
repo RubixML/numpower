@@ -530,17 +530,26 @@ void ndarray_element_to_string(const char *type,
     } else if (strcmp(type, "float16") == 0) {
         uint16_t fp16;
         memcpy(&fp16, data + byte_offset, 2);
-        snprintf(buf, bufsize, "%.6g", ndarray_fp16_to_double(fp16));
+        double v = ndarray_fp16_to_double(fp16);
+        /* NaN-sign normalization: glibc `%g` prints "-nan" for a quiet
+           NaN with the sign bit set, which PyTorch / Python `repr` do
+           not (they always print "nan"). Match PyTorch parity across
+           every fp dtype — fp128 / fp8 already canonicalize the same
+           way; fp16/fp32/fp64 now follow suit. */
+        if (isnan(v)) snprintf(buf, bufsize, "nan");
+        else          snprintf(buf, bufsize, "%.6g", v);
 
     } else if (strcmp(type, "float32") == 0) {
         float v;
         memcpy(&v, data + byte_offset, 4);
-        snprintf(buf, bufsize, "%.8g", (double)v);
+        if (isnan(v)) snprintf(buf, bufsize, "nan");
+        else          snprintf(buf, bufsize, "%.8g", (double)v);
 
     } else if (strcmp(type, "float64") == 0) {
         double v;
         memcpy(&v, data + byte_offset, 8);
-        snprintf(buf, bufsize, "%.16g", v);
+        if (isnan(v)) snprintf(buf, bufsize, "nan");
+        else          snprintf(buf, bufsize, "%.16g", v);
 
     } else if (strcmp(type, "float128") == 0) {
         ndarray_fp128_t v;

@@ -97,7 +97,9 @@ print_array_float32(float* buffer, int ndims, int* shape, int* strides, int cur_
     }
 
     if (ndims == 0) {
-        sprintf(str, "%g\n", buffer[0]);
+        float v0 = buffer[0];
+        if (isnan(v0)) sprintf(str, "nan\n");
+        else           sprintf(str, "%g\n", (double)v0);
         return str;
     }
 
@@ -114,8 +116,14 @@ print_array_float32(float* buffer, int ndims, int* shape, int* strides, int cur_
             for (int k = 0; k < ndims; k++) {
                 offset += index[k] * strides[k];
             }
-            // Print the element
-            sprintf(str + strlen(str), "%.8g", buffer[offset / sizeof(float)]);
+            // Print the element — NaN canonicalized to unsigned form to
+            // match PyTorch / Python repr (glibc `%g` emits "-nan" for
+            // sign-bit-set NaN; users wouldn't expect the sign on a
+            // numerical printout). Same normalization applies to fp64
+            // and to every dtype routed through `ndarray_element_to_string`.
+            float ve = buffer[offset / sizeof(float)];
+            if (isnan(ve)) sprintf(str + strlen(str), "nan");
+            else           sprintf(str + strlen(str), "%.8g", (double)ve);
 
             // Print a comma if this is not the last element in the dimension
             if (i < shape[cur_dim] - 1) {
@@ -234,7 +242,9 @@ print_array_float64(double* buffer, int ndims, int* shape, int* strides, int cur
     }
 
     if (ndims == 0) {
-        sprintf(str, "%g\n", buffer[0]);
+        double v0 = buffer[0];
+        if (isnan(v0)) sprintf(str, "nan\n");
+        else           sprintf(str, "%g\n", v0);
         return str;
     }
 
@@ -251,8 +261,11 @@ print_array_float64(double* buffer, int ndims, int* shape, int* strides, int cur
             for (int k = 0; k < ndims; k++) {
                 offset += index[k] * strides[k];
             }
-            // Print the element
-            sprintf(str + strlen(str), "%.16g", buffer[offset / sizeof(double)]);
+            // Print the element — NaN canonicalized to unsigned form
+            // (see analogous fp32 path above).
+            double ve = buffer[offset / sizeof(double)];
+            if (isnan(ve)) sprintf(str + strlen(str), "nan");
+            else           sprintf(str + strlen(str), "%.16g", ve);
 
             // Print a comma if this is not the last element in the dimension
             if (i < shape[cur_dim] - 1) {

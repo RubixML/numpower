@@ -3581,12 +3581,10 @@ static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
        literal contains a fractional / exponent part (→ fp128) and where
        the magnitude digits live (for the int64-vs-uint64 split). Any
        character that does not fit the grammar fails the scan. */
-    size_t k          = i;
-    int    has_sign   = 0;
-    int    is_neg     = 0;
+    size_t k      = i;
+    int    is_neg = 0;
     if (k < end && (str[k] == '+' || str[k] == '-')) {
-        has_sign = 1;
-        is_neg   = (str[k] == '-');
+        is_neg = (str[k] == '-');
         k++;
     }
     /* Mantissa integer part. */
@@ -3605,7 +3603,6 @@ static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
     }
     /* At least one digit in mantissa (integer or fractional). */
     if (mant_int_len == 0 && frac_len == 0) {
-        (void)has_sign;
         return NULL;
     }
 
@@ -3631,17 +3628,25 @@ static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
         return "float128";
     }
 
-    /* Pure integer literal. */
-    if (is_neg) {
-        return "int64";
-    }
-    /* Magnitude check on the integer digits (skip leading zeros). */
+    /* Pure integer literal — magnitude check on the digits (skip leading
+       zeros) decides int64 vs uint64 vs float128. */
     const char *p = str + mant_int_start;
     size_t      m = mant_int_len;
     while (m > 1 && *p == '0') { p++; m--; }
 
     static const char int64_max_str[]  = "9223372036854775807";   /* 19 digits */
+    static const char int64_min_mag[]  = "9223372036854775808";   /* |INT64_MIN|, 19 digits */
     static const char uint64_max_str[] = "18446744073709551615";  /* 20 digits */
+
+    if (is_neg) {
+        /* Negative magnitude: int64 holds down to -INT64_MIN = -9223372036854775808;
+           anything wider must escalate to float128 (uint64 cannot represent
+           negatives, and strtoll would silently saturate to INT64_MIN with
+           errno=ERANGE if we'd routed it through int64). */
+        if (m > 19) return "float128";
+        if (m == 19 && memcmp(p, int64_min_mag, 19) > 0) return "float128";
+        return "int64";
+    }
     if (m > 20) {
         /* Past UINT64_MAX — escalate to fp128 to keep precision rather
            than saturate the integer dtypes. */

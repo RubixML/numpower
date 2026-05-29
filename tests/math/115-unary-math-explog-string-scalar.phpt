@@ -76,9 +76,15 @@ check("sign('9223372036854775808') uint64",
       is_string(NumPower::sign('9223372036854775808')),true);
 check("sign('18446744073709551615') uint64",
       is_string(NumPower::sign('18446744073709551615')),true);
-/* Negative magnitude can never fit uint64 → must stay int64 (signed). */
-check("sign('-18446744073709551615') int64",
-      is_int(NumPower::sign('-18446744073709551615')), true);
+/* Negative magnitudes up to |INT64_MIN| = 9223372036854775808 fit int64;
+   anything larger escalates to float128 to avoid the silent INT64_MIN
+   saturation a naïve `strtoll` would deliver. */
+check("sign('-9223372036854775808') int64",
+      is_int(NumPower::sign('-9223372036854775808')), true);
+check("sign('-9223372036854775809') float128",
+      is_string(NumPower::sign('-9223372036854775809')), true);
+check("sign('-18446744073709551615') float128",
+      is_string(NumPower::sign('-18446744073709551615')), true);
 
 /* ── MATHEMATICAL FUNCTIONS ───────────────────────────────────────────── */
 
@@ -220,7 +226,9 @@ OK sign('0') is int (int64)
 OK sign('9223372036854775807') int64
 OK sign('9223372036854775808') uint64
 OK sign('18446744073709551615') uint64
-OK sign('-18446744073709551615') int64
+OK sign('-9223372036854775808') int64
+OK sign('-9223372036854775809') float128
+OK sign('-18446744073709551615') float128
 OK abs('-3.5') (fp128)
 OK abs('-100') (int64)
 OK abs('18446744073709551615') (uint64)

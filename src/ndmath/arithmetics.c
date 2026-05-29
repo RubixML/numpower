@@ -3668,12 +3668,30 @@ static int unary_validate_numeric_string(const char *str, const char *which) {
 }
 
 /**
+ * @brief Skip leading ASCII whitespace, returning the first non-space char's
+ *        pointer. Mirrors `strtoll`'s leading-whitespace handling.
+ */
+static inline const char *unary_skip_ws(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    return s;
+}
+
+/**
  * @brief Parse @p str into the typed scalar buffer @p out_buf for @p dt.
  *
  * Validates the string syntactically first so callers get a clean error
- * instead of a silent 0 coerced from a malformed input. Routes through
- * `ndarray_set_from_string` so `float128` / `int64` / `uint64` strings
- * preserve precision. Other dtypes route through `double`.
+ * instead of a silent 0 coerced from a malformed input. For integer
+ * dtypes the value is *saturated* to the dtype's representable range
+ * (PyTorch `clamp` semantics): a negative bound for an unsigned dtype
+ * collapses to 0; a magnitude exceeding the signed dtype's `INT*_MAX`
+ * saturates to that max (or `INT*_MIN` if negative); without this
+ * saturation, `clip(uint8 tensor, -50, 100)` would silently wrap `-50`
+ * via the modulo-2^N cast inside `ndarray_set_from_string`, then see
+ * `lo (206) > hi (100)` and collapse every element to `100`. For
+ * float dtypes (and `int64`/`uint64`/`float128` where wide-precision
+ * strings carry the only loss-free intake), the call falls through to
+ * `ndarray_set_from_string` so `strtoll`/`strtoull`/`strtoflt128` keep
+ * the full source precision.
  *
  * @param[in]  dt      Canonical dtype string.
  * @param[in]  str     Decimal literal.
@@ -3684,6 +3702,66 @@ static int unary_validate_numeric_string(const char *str, const char *which) {
 static int unary_parse_typed_scalar(const char *dt, const char *str,
                                      const char *which, void *out_buf) {
     if (unary_validate_numeric_string(str, which) < 0) return -1;
+
+    /* Narrow integer dtypes — saturate the bound to the dtype range so
+       out-of-range literals don't wrap via the implicit `(T)strtoll(...)`
+       cast inside `ndarray_set_from_string`. int64/uint64 keep the
+       wide-precision intake path (their saturating boundary is exactly
+       at the strtoll/strtoull edge already). */
+    const char *p = unary_skip_ws(str);
+    int is_neg = (*p == '-');
+    if (!strcmp(dt, "uint8")) {
+        if (is_neg) { *(uint8_t *)out_buf = 0; return 0; }
+        unsigned long long v = strtoull(p, NULL, 10);
+        *(uint8_t *)out_buf = (uint8_t)(v > 0xFFu ? 0xFFu : v);
+        return 0;
+    }
+    if (!strcmp(dt, "uint16")) {
+        if (is_neg) { *(uint16_t *)out_buf = 0; return 0; }
+        unsigned long long v = strtoull(p, NULL, 10);
+        *(uint16_t *)out_buf = (uint16_t)(v > 0xFFFFu ? 0xFFFFu : v);
+        return 0;
+    }
+    if (!strcmp(dt, "uint32")) {
+        if (is_neg) { *(uint32_t *)out_buf = 0; return 0; }
+        unsigned long long v = strtoull(p, NULL, 10);
+        *(uint32_t *)out_buf = (uint32_t)(v > 0xFFFFFFFFu ? 0xFFFFFFFFu : v);
+        return 0;
+    }
+    if (!strcmp(dt, "int8")) {
+        long long v = strtoll(str, NULL, 10);
+        if (v >  0x7F)            v =  0x7F;
+        else if (v < -0x80)       v = -0x80;
+        *(int8_t *)out_buf = (int8_t)v;
+        return 0;
+    }
+    if (!strcmp(dt, "int16")) {
+        long long v = strtoll(str, NULL, 10);
+        if (v >  0x7FFF)          v =  0x7FFF;
+        else if (v < -0x8000)     v = -0x8000;
+        *(int16_t *)out_buf = (int16_t)v;
+        return 0;
+    }
+    if (!strcmp(dt, "int32")) {
+        long long v = strtoll(str, NULL, 10);
+        if (v >  0x7FFFFFFFLL)    v =  0x7FFFFFFFLL;
+        else if (v < -0x80000000LL) v = -0x80000000LL;
+        *(int32_t *)out_buf = (int32_t)v;
+        return 0;
+    }
+    /* uint64: strtoull silently wraps a negative literal modulo 2^64
+       (`strtoull("-50")` returns `UINT64_MAX - 49`) — saturate to 0
+       explicitly. ERANGE on a positive overflow is what strtoull would
+       cap at UINT64_MAX anyway. */
+    if (!strcmp(dt, "uint64")) {
+        if (is_neg) { *(uint64_t *)out_buf = 0; return 0; }
+        /* Fall through to ndarray_set_from_string for the positive path
+           so wide-precision literals route through the same parser used
+           elsewhere. */
+    }
+    /* int64 / uint64 (positive) / float* : strtoll / strtoull / strtod /
+       strtoflt128 already saturate at the dtype's edge under ERANGE,
+       matching the behaviour we want without an explicit upper-bound check. */
     ndarray_set_from_string(dt, (char *)out_buf, 0, str);
     return 0;
 }
@@ -3912,20 +3990,14 @@ static int unary_run_cpu_inplace(void *data, long n, const char *dt,
                 }
                 default: break;
             }
-            /* Normalize NaN sign bit to canonical +NaN. libquadmath /
-               libm leak a sign-bit-set "-nan" out of `logq(-x)`,
-               `sqrtq(-x)`, `log1pq(-x)` etc. The fp64 path returns
-               NaN with the sign bit set too, but PHP's float
-               stringifier hides the sign (`var_dump(NAN)` prints
-               "NAN"); `quadmath_snprintf` honours it, so the user
-               sees the inconsistency only on fp128. Force-clear the
-               sign bit so display matches the rest of the unary
-               family. Skip on NDARRAY_UNOP_SIGN — that op uses NaN
-               propagation as a meaningful value (PyTorch parity) and
-               the input's sign bit is part of its signal. */
-            if (op != NDARRAY_UNOP_SIGN && NDARRAY_FP128_ISNAN(y)) {
-                y = NDARRAY_FP128_NAN();
-            }
+            /* NaN-sign canonicalization happens at stringification time
+               (`ndarray_fp128_to_string`) rather than here. This keeps
+               the in-memory bit pattern mathematically faithful:
+               `NumPower::negative(NaN)` flips the sign bit (matches
+               NumPy / PyTorch `neg` on NaN), `NumPower::positive(NaN)`
+               preserves the input, while `__toString` / `toArray`
+               render every NaN as the unsigned `"nan"` literal across
+               every fp dtype. */
             p[i] = y;
         }
         return 0;
