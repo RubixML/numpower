@@ -2,6 +2,9 @@
 NumPower::round
 --FILE--
 <?php
+/* round uses round-half-to-even (banker's rounding), matching PyTorch
+   `torch.round` and NumPy `np.round`: -156.5 rounds to the even neighbour
+   -156 (not -157, which the legacy half-away `roundf` kernel produced). */
 $a = NumPower::array([[-156.50, 150.525435], [0, -39.151414]]);
 print_r(NumPower::round($a, precision: 0)->toArray());
 print_r(NumPower::round($a[0], precision: 1)->toArray());
@@ -12,7 +15,7 @@ Array
 (
     [0] => Array
         (
-            [0] => -157
+            [0] => -156
             [1] => 151
         )
 

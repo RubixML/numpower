@@ -44,9 +44,10 @@
 // NDArray_ColumnStack, NDArray_ConcatenateFlat, NDArray_Concatenate, NDArray_Slice
 #include "src/manipulation.h"
 
-// Live exports of double_math.h: float_abs, float_sqrt, float_round
-// (precision arg, legacy). `arctan2` moved to the typed binary dispatch
-// (`NDArray_Arctan2_*` / `cuda_atan2_*`). Every other float_* scalar helper
+// Live exports of double_math.h: float_abs, float_sqrt. `arctan2` moved to
+// the typed binary dispatch (`NDArray_Arctan2_*` / `cuda_atan2_*`) and
+// `round` to the typed unary dispatch (precision support, see
+// `NDArray_TypedUnaryOp`). Every other float_* scalar helper
 // (sin/cos/.../floor/ceil + exp/log family + sinc + negate/positive/sign/
 // clip/reciprocal/rsqrt) was retired by the typed-unary dispatcher in
 // src/ndmath/arithmetics.c.
@@ -92,12 +93,13 @@
 #include "src/ndarray/frontend/manipulations.h"
 
 #ifdef HAVE_CUBLAS
-  // Live cuda_float_* exports: cuda_float_abs, cuda_float_sqrt,
-  // cuda_float_round (precision arg, legacy). `arctan2` moved to the typed
-  // binary GPU dispatch (`cuda_atan2_{f32,f64,dd}`). All other cuda_float_*
-  // trig / hyperbolic / angle / rounding / sinc / negate / positive / sign /
-  // clip / reciprocal / rsqrt helpers were retired by the typed-unary
-  // GPU dispatcher (`cuda_<op>_{f16,f32,f64,dd}` per-dtype kernels)
+  // Live cuda_float_* exports: cuda_float_abs, cuda_float_sqrt. `arctan2`
+  // moved to the typed binary GPU dispatch (`cuda_atan2_{f32,f64,dd}`) and
+  // `round` to the typed unary GPU dispatch (`cuda_round_{f16,f32,f64,dd}`,
+  // precision-aware). All other cuda_float_* trig / hyperbolic / angle /
+  // rounding / sinc / negate / positive / sign / clip / reciprocal / rsqrt
+  // helpers were retired by the typed-unary GPU dispatcher
+  // (`cuda_<op>_{f16,f32,f64,dd}` per-dtype kernels)
   // — see the transcendental section in src/ndmath/cuda/cuda_math.h.
 # include "src/ndmath/cuda/cuda_math.h"
 
@@ -3836,10 +3838,11 @@ static void ndarray_release_unary_input(zval *array, NDArray *nda, int owned)
  * `arctanh`), the angle-conversion ops (`degrees`, `radians`), and
  * the rounding ops (`rint`, `fix`, `trunc`, `floor`, `ceil`).
  *
- * The clip op uses its own entry because of the lo / hi parameters;
- * `arctan2` (binary) and `round` (precision param) likewise still
- * ride bespoke entry points until the dispatcher grows
- * binary-unary / extra-arg support.
+ * `clip` (lo / hi bounds) and `round` (precision) have their own PHP
+ * entry points because of their extra parameters, but both still
+ * dispatch through `NDArray_TypedUnaryOp` (round passes its precision as
+ * the trailing `round_decimals` argument). `arctan2` (binary) rides the
+ * typed binary dispatch instead.
  *
  * Centralises the PHP-binding plumbing every unary method needs:
  *  - resolves the input zval to an NDArray via
@@ -3873,7 +3876,7 @@ ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAMETERS, NDArrayUnaryOp op) {
         return;
     }
 
-    NDArray *rtn = NDArray_TypedUnaryOp(op, nda, NULL, NULL);
+    NDArray *rtn = NDArray_TypedUnaryOp(op, nda, NULL, NULL, 0);
     ndarray_release_unary_input(array, nda, nda_owned);
     if (rtn == NULL) {
         return;
@@ -4397,7 +4400,7 @@ PHP_METHOD(NumPower, clip) {
     if (nda == NULL) { efree(min_str); efree(max_str); return; }
 
     NDArray *rtn = NDArray_TypedUnaryOp(NDARRAY_UNOP_CLIP, nda,
-                                         min_str, max_str);
+                                         min_str, max_str, 0);
     efree(min_str);
     efree(max_str);
     ndarray_release_unary_input(array, nda, nda_owned);
@@ -4824,37 +4827,41 @@ PHP_METHOD(NumPower, ceil) {
 /**
  * NumPower::round
  *
- * @param execute_data
- * @param return_value
+ * Element-wise round to `precision` decimal places using round-half-to-even
+ * (banker's rounding), matching PyTorch `torch.round(x, decimals=…)` and
+ * NumPy `np.round`: `round(0.5) == 0`, `round(2.5) == 2`. `precision`
+ * defaults to 0 (round to the nearest integer) and may be negative (round
+ * to the left of the decimal point). The input dtype is preserved on both
+ * CPU and GPU; integer dtypes are returned unchanged (NumPower's rounding
+ * family is dtype-preserving — cast to a float dtype to round integers to
+ * negative places). A bare numeric `$array` string is accepted for
+ * single-call `float128` / `uint64` precision, with the dtype inferred
+ * from the literal (see `ndarray_resolve_unary_input`).
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_round, 0, 0, 1)
 ZEND_ARG_INFO(0, array)
 ZEND_ARG_INFO(0, precision)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, round) {
-    NDArray *rtn = NULL;
     zval *array;
-    long precision;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-    Z_PARAM_ZVAL(array)
-    Z_PARAM_LONG(precision)
+    zend_long precision = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_ZVAL(array)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(precision)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
+
+    int nda_owned;
+    NDArray *nda = ndarray_resolve_unary_input(array, &nda_owned);
     if (nda == NULL) {
         return;
     }
 
-    if (NDArray_DEVICE(nda) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map1F(nda, float_round, (float)precision);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise1F(nda, cuda_float_round, (float)precision);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    if (Z_TYPE_P(array) == IS_ARRAY) {
-        NDArray_FREE(nda);
+    NDArray *rtn = NDArray_TypedUnaryOp(NDARRAY_UNOP_ROUND, nda,
+                                        NULL, NULL, (long)precision);
+    ndarray_release_unary_input(array, nda, nda_owned);
+    if (rtn == NULL) {
+        return;
     }
     ndarray_init_new_object(rtn, return_value);
 }

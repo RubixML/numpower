@@ -6,15 +6,13 @@
 #endif
 #include "../ndarray.h"
 
-/* Legacy float-only helpers that survive the typed-unary refactor only
-   because the corresponding PHP method is still on the legacy
-   NDArray_Map path:
-     - `float_round` — takes an extra precision argument (NDArray_Map1F).
-   It is out of scope for the unary dispatcher; refactoring it needs
-   precision-arg support. `arctan2` moved to the typed binary dispatch
-   (`NDArray_Arctan2_*` / `cuda_atan2_*`).
-   `float_abs` / `float_sqrt` are kept for ad-hoc usage elsewhere. */
+/* `float_abs` / `float_sqrt` are legacy float-precision scalar helpers that
+   are currently unreferenced: every element-wise math method now dispatches
+   through the typed paths — trig / hyperbolic / angle / rounding (incl.
+   `round` with precision support) via `NDArray_TypedUnaryOp`, `arctan2` via
+   the typed binary dispatch (`NDArray_Arctan2_*` / `cuda_atan2_*`). They are
+   retained only so this translation unit stays in the build; drop them
+   together with double_math.{c,h} in a future build-system cleanup. */
 float float_abs(float val);
 float float_sqrt(float val);
-float float_round(float number, float decimals);
 #endif //PHPSCI_NDARRAY_DOUBLE_MATH_H

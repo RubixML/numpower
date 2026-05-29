@@ -171,7 +171,13 @@ typedef enum {
     NDARRAY_UNOP_FIX,
     NDARRAY_UNOP_TRUNC,
     NDARRAY_UNOP_FLOOR,
-    NDARRAY_UNOP_CEIL
+    NDARRAY_UNOP_CEIL,
+    /* `round` carries a `decimals` precision argument, so it lives OUTSIDE
+       the `[SIN, CEIL]` trig block — `unary_op_is_trig` must stay false for
+       it. It is dispatched through the dedicated `unary_round_*_inplace`
+       helpers rather than `UNARY_TRIG_BODY`; the dispatcher rewrites
+       `round(x, 0)` to `NDARRAY_UNOP_RINT` since the two are identical. */
+    NDARRAY_UNOP_ROUND
 } NDArrayUnaryOp;
 
 /**
@@ -183,10 +189,13 @@ typedef enum {
  *                     @p op is `NDARRAY_UNOP_CLIP`.
  * @param[in] clip_max Decimal string for the upper clamp; NULL unless
  *                     @p op is `NDARRAY_UNOP_CLIP`.
+ * @param[in] round_decimals Decimal places for `NDARRAY_UNOP_ROUND`
+ *                     (may be negative); ignored by every other op, pass 0.
  * @return Caller-owned result NDArray on the same device as @p nda, or
  *         NULL on error (PHP exception in flight).
  */
 NDArray *NDArray_TypedUnaryOp(NDArrayUnaryOp op, NDArray *nda,
-                              const char *clip_min, const char *clip_max);
+                              const char *clip_min, const char *clip_max,
+                              long round_decimals);
 
 #endif //PHPSCI_NDARRAY_ARITHMETICS_H
