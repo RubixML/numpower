@@ -482,6 +482,155 @@ ndarray_dd_t ndarray_dd_logb(ndarray_dd_t a) {
     return ndarray_dd_from_double(logb(a.hi));
 }
 
+/* ── DD-precision hyperbolic functions ──────────────────────────────────────
+   sinh / cosh / tanh / asinh / acosh / atanh evaluated entirely in DD
+   arithmetic by composing the DD exp / expm1 / log / log1p / sqrt
+   primitives above, so each carries ~32 decimal digits — the same tier as
+   libquadmath's sinhq/coshq/… on the native fp128 build. The algorithms are
+   byte-identical to the device twins dd_sinh … dd_atanh in
+   src/ndmath/cuda/cuda_math.cu, which keeps the CPU DD fallback and the GPU
+   dd path bit-for-bit aligned. (These run only on the DD fp128 backend —
+   non-quadmath platforms; the libquadmath build calls sinhq/… directly.) */
+
+/**
+ * @brief DD-precision sinh(x).
+ *
+ * Near zero the direct (e^x − e^−x)/2 suffers catastrophic cancellation, so
+ * for |x| < 0.5 use the expm1 identity sinh(x) = u·(u+2) / (2·(u+1)) with
+ * u = expm1(x), which keeps full precision. For |x| ≥ 0.5 there is no
+ * harmful cancellation; the over/underflow of exp(±x) handled inside
+ * `ndarray_dd_exp` yields ±inf for large |x| without an inf−inf NaN.
+ * NaN propagates; sinh(±inf) = ±inf.
+ *
+ * @param[in] a Input DD value.
+ * @return sinh(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_sinh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi > -0.5 && a.hi < 0.5) {
+        ndarray_dd_t u   = ndarray_dd_expm1(a);
+        ndarray_dd_t num = ndarray_dd_mul(u, ndarray_dd_add(u, ndarray_dd_from_double(2.0)));
+        ndarray_dd_t den = ndarray_dd_mul(ndarray_dd_from_double(2.0),
+                                          ndarray_dd_add(u, ndarray_dd_from_double(1.0)));
+        return ndarray_dd_div(num, den);
+    }
+    ndarray_dd_t ex  = ndarray_dd_exp(a);
+    ndarray_dd_t enx = ndarray_dd_exp(ndarray_dd_neg(a));
+    return ndarray_dd_mul(ndarray_dd_sub(ex, enx), ndarray_dd_from_double(0.5));
+}
+
+/**
+ * @brief DD-precision cosh(x).
+ *
+ * cosh(x) = (e^x + e^−x)/2. Both terms are positive so there is no
+ * cancellation at any magnitude and cosh(0) = 1 stays exact. NaN
+ * propagates; cosh(±inf) = +inf.
+ *
+ * @param[in] a Input DD value.
+ * @return cosh(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_cosh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    ndarray_dd_t ex  = ndarray_dd_exp(a);
+    ndarray_dd_t enx = ndarray_dd_exp(ndarray_dd_neg(a));
+    return ndarray_dd_mul(ndarray_dd_add(ex, enx), ndarray_dd_from_double(0.5));
+}
+
+/**
+ * @brief DD-precision tanh(x).
+ *
+ * tanh(x) = v/(v+2) with v = expm1(2x): no cancellation near 0, and for
+ * |x| ≤ 40 the argument 2x ≤ 80 keeps e^{2x} ≈ 5.5e34 ≪ DBL_MAX so there
+ * is no overflow. For |x| > 40 (including ±inf) tanh saturates to ±1 to
+ * below DD epsilon (1 − tanh(40) ≈ 1e-35), so return ±1 directly. NaN
+ * propagates.
+ *
+ * @param[in] a Input DD value.
+ * @return tanh(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_tanh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi >  40.0) return ndarray_dd_from_double( 1.0);
+    if (a.hi < -40.0) return ndarray_dd_from_double(-1.0);
+    ndarray_dd_t two = ndarray_dd_from_double(2.0);
+    ndarray_dd_t v   = ndarray_dd_expm1(ndarray_dd_mul(a, two));
+    return ndarray_dd_div(v, ndarray_dd_add(v, two));
+}
+
+/**
+ * @brief DD-precision asinh(x) (inverse hyperbolic sine).
+ *
+ * asinh(x) = log1p(x + x²/(1 + sqrt(1+x²))). The x²/(1+s) term equals
+ * sqrt(x²+1) − 1 without cancellation, and log1p preserves precision near
+ * 0. The computation runs on |x| with the sign restored afterwards so the
+ * x + sqrt(x²+1) argument never cancels for x < 0. For |x| > 1e150, where
+ * x² would overflow fp64, fall back to asinh(x) ≈ ln(2|x|) = ln|x| + ln 2.
+ * NaN / ±inf propagate.
+ *
+ * @param[in] a Input DD value.
+ * @return asinh(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_arcsinh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a) || isinf(a.hi)) return a;
+    int          neg = (a.hi < 0.0);
+    ndarray_dd_t ax  = ndarray_dd_abs(a);
+    ndarray_dd_t one = ndarray_dd_from_double(1.0);
+    ndarray_dd_t r;
+    if (ax.hi > 1e150) {
+        r = ndarray_dd_add(ndarray_dd_log(ax), DD_LN2);
+    } else {
+        ndarray_dd_t t = ndarray_dd_mul(ax, ax);
+        ndarray_dd_t s = ndarray_dd_sqrt(ndarray_dd_add(t, one));
+        r = ndarray_dd_log1p(ndarray_dd_add(ax, ndarray_dd_div(t, ndarray_dd_add(one, s))));
+    }
+    return neg ? ndarray_dd_neg(r) : r;
+}
+
+/**
+ * @brief DD-precision acosh(x) (inverse hyperbolic cosine).
+ *
+ * Domain x ≥ 1; acosh(x) = log1p((x−1) + sqrt((x−1)(x+1))). The split sqrt
+ * avoids cancellation as x → 1 where acosh → 0. For x < 1 the result is
+ * NaN; for x > 1e150 fall back to acosh(x) ≈ ln(2x). NaN / +inf propagate.
+ *
+ * @param[in] a Input DD value.
+ * @return acosh(a) in DD precision, NaN when a < 1.
+ */
+ndarray_dd_t ndarray_dd_arccosh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    if (a.hi < 1.0)   return ndarray_dd_from_double(NAN);
+    if (isinf(a.hi))  return a;
+    if (a.hi > 1e150) return ndarray_dd_add(ndarray_dd_log(a), DD_LN2);
+    ndarray_dd_t one  = ndarray_dd_from_double(1.0);
+    ndarray_dd_t w    = ndarray_dd_sub(a, one);
+    ndarray_dd_t root = ndarray_dd_mul(ndarray_dd_sqrt(w),
+                                       ndarray_dd_sqrt(ndarray_dd_add(w, ndarray_dd_from_double(2.0))));
+    return ndarray_dd_log1p(ndarray_dd_add(w, root));
+}
+
+/**
+ * @brief DD-precision atanh(x) (inverse hyperbolic tangent).
+ *
+ * Domain |x| ≤ 1; atanh(x) = ½·log1p(2x/(1−x)), which avoids cancellation
+ * near 0. The |x| = 1 endpoint returns ±inf (handled explicitly, since
+ * 1−x = 0 would make the DD divide yield NaN); |x| > 1 returns NaN. NaN
+ * propagates.
+ *
+ * @param[in] a Input DD value.
+ * @return atanh(a) in DD precision.
+ */
+ndarray_dd_t ndarray_dd_arctanh(ndarray_dd_t a) {
+    if (ndarray_dd_isnan(a)) return a;
+    ndarray_dd_t ax = ndarray_dd_abs(a);
+    if (ax.hi > 1.0) return ndarray_dd_from_double(NAN);
+    if (ax.hi == 1.0 && a.lo == 0.0)
+        return ndarray_dd_from_double(a.hi > 0.0 ? INFINITY : -INFINITY);
+    ndarray_dd_t one = ndarray_dd_from_double(1.0);
+    ndarray_dd_t num = ndarray_dd_add(a, a);
+    ndarray_dd_t den = ndarray_dd_sub(one, a);
+    return ndarray_dd_mul(ndarray_dd_from_double(0.5), ndarray_dd_log1p(ndarray_dd_div(num, den)));
+}
+
 /* ── int conversion ─────────────────────────────────────────────────────── */
 
 long long ndarray_dd_to_int64(ndarray_dd_t a) {

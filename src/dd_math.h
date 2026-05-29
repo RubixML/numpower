@@ -60,6 +60,18 @@ ndarray_dd_t ndarray_dd_log2  (ndarray_dd_t a);
 ndarray_dd_t ndarray_dd_log10 (ndarray_dd_t a);
 ndarray_dd_t ndarray_dd_logb  (ndarray_dd_t a);
 
+/* Full-DD-precision hyperbolic functions (~32 sig digits), composed from
+   the DD exp/log/sqrt primitives above. Byte-identical to the GPU device
+   twins dd_sinh … dd_atanh so the DD fp128 backend and the GPU dd path
+   agree. Used only on the DD backend (non-quadmath platforms); the
+   libquadmath build routes through sinhq/coshq/… instead. */
+ndarray_dd_t ndarray_dd_sinh    (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_cosh    (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_tanh    (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_arcsinh (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_arccosh (ndarray_dd_t a);
+ndarray_dd_t ndarray_dd_arctanh (ndarray_dd_t a);
+
 /* ── comparisons ────────────────────────────────────────────────────────── */
 int  ndarray_dd_cmp(ndarray_dd_t a, ndarray_dd_t b);   /* -1, 0, 1 */
 int  ndarray_dd_iszero(ndarray_dd_t a);
