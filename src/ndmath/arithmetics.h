@@ -86,7 +86,7 @@ NDArray* NDArray_TypedBinOp_GPU(int opcode, NDArray* a, NDArray* b);
       and GPU once intermediates spilled past 2^53).
    Both operands must be on CPU and share the dtype. One operand may be
    a 0-D scalar. opcode is ZEND_ADD/SUB/MUL/MOD/POW; ZEND_DIV is promoted
-   to float upstream by ndarray_div_promote and never reaches here. */
+   to float upstream by ndarray_widen_int_to_float and never reaches here. */
 NDArray* NDArray_TypedBinOp_CPU_Int(int opcode, NDArray* a, NDArray* b);
 
 NDArray* NDArray_Add(NDArray* a, NDArray* b);

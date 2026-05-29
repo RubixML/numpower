@@ -93,17 +93,33 @@ $qy = NumPower::array(['1.0', '0.0',  '1.0'], 'float128');
 $rq = NumPower::arctan2($qx, $qy);
 ok(dt($rq) === 'float128', 'fp128 result dtype');
 $rqa = $rq->toArray();
-/* π/4 and π/2 to > 30 digits (decimal reference). */
-$PI_4 = '0.78539816339744830961566084581988';
-$PI_2 = '1.5707963267948966192313216916398';
-ok(strncmp((string)$rqa[0], $PI_4, 30) === 0, "fp128 atan2(1,1)=π/4 got={$rqa[0]}");
-ok(strncmp((string)$rqa[1], $PI_2, 30) === 0, "fp128 atan2(1,0)=π/2 got={$rqa[1]}");
-ok(near((float)$rqa[2], -M_PI / 4, 1e-13), 'fp128 atan2(-1,1)=-π/4');
+$PI_4 = '0.78539816339744830961566084581988';   /* decimal reference, 32 digits */
+/* Value checks use fp64 tolerance so they are PORTABLE: with libquadmath the
+   fp128 atan2 is full 113-bit, but on the double-double fallback build
+   (macOS / non-x86) fp128 *transcendentals* compute at fp64 precision (the
+   NDARRAY_FP128_ATAN2 macro routes through atan2(double)). A >fp64 digit-prefix
+   assertion would pass on Linux and FAIL on a DD build — so only assert it
+   behind a runtime libquadmath probe below. */
+ok(dt($rq) === 'float128', 'fp128 result dtype');
+ok(near((float)$rqa[0],  M_PI / 4, 1e-13), 'fp128 atan2(1,1)=π/4 (fp64 tol)');
+ok(near((float)$rqa[1],  M_PI / 2, 1e-13), 'fp128 atan2(1,0)=π/2 (fp64 tol)');
+ok(near((float)$rqa[2], -M_PI / 4, 1e-13), 'fp128 atan2(-1,1)=-π/4 (fp64 tol)');
 
-/* String scalar adopts the fp128 peer dtype → full precision. */
+/* Probe for full-precision fp128 transcendentals (libquadmath): if the result
+   already agrees with π/4 to 20 sig digits it cannot be the fp64 (~16-digit)
+   DD result, so the build has libquadmath and we can assert the 30-digit
+   prefix. On a DD build this probe is false and the strict check is skipped
+   (the fp64-tolerance checks above already cover correctness there). */
+$has_quadmath = (strncmp((string)$rqa[0], $PI_4, 20) === 0);
+if ($has_quadmath) {
+    ok(strncmp((string)$rqa[0], $PI_4, 30) === 0, 'fp128 atan2(1,1)=π/4 full precision (libquadmath)');
+}
+
+/* String scalar adopts the fp128 peer dtype (intake is loss-free on every
+   build); the atan2 result value is checked at fp64 tolerance for portability. */
 $rqs = NumPower::arctan2(NumPower::array(['1.0', '1.0'], 'float128'), '1.0');
 ok(dt($rqs) === 'float128', 'fp128 + string scalar dtype');
-ok(strncmp((string)$rqs->toArray()[0], $PI_4, 30) === 0, 'fp128 + string scalar value');
+ok(near((float)$rqs->toArray()[0], M_PI / 4, 1e-13), 'fp128 + string scalar value');
 
 /* uint64 string intake keeps a > 2^53 magnitude loss-free in the denominator
    (result ~0 because the numerator 1 is tiny next to it, but the point is the
@@ -156,8 +172,11 @@ ok(is_float($s) && near($s, M_PI / 4, 1e-14), '0-D float64 → PHP float');
    arithmetic operators — still a PHP float, at float32 precision. */
 $sbare = NumPower::arctan2(1.0, 1.0);
 ok(is_float($sbare) && near($sbare, M_PI / 4, 1e-6), '0-D bare scalar → PHP float');
+/* The important contract here is that a 0-D float128 result returns as a PHP
+   *string* (not a lossy float); the value is checked at fp64 tolerance so the
+   assertion is portable across the libquadmath and double-double builds. */
 $sq = NumPower::arctan2(NumPower::array('1.0', 'float128'), NumPower::array('1.0', 'float128'));
-ok(is_string($sq) && strncmp($sq, $PI_4, 30) === 0, '0-D float128 → PHP string');
+ok(is_string($sq) && near((float)$sq, M_PI / 4, 1e-13), '0-D float128 → PHP string');
 
 /* ── Edge values: ±inf, NaN, signed zero ────────────────────────────────── */
 $ex = NumPower::array([INF,  INF, 1.0, NAN, 1.0], 'float64');
@@ -187,6 +206,40 @@ ok(abs((float)$pr->toArray()[0] - $want) < 1e-15, 'precision guard: full float64
 /* ── Empty arrays ───────────────────────────────────────────────────────── */
 $e0 = NumPower::arctan2(NumPower::zeros([0, 4], 'float64'), NumPower::zeros([0, 4], 'float64'));
 ok($e0->shape() === [0, 4] && dt($e0) === 'float64', 'empty (0,4) shape+dtype');
+
+/* ── 0-D scalar broadcasts to a numel-1 array's shape (regression: CPU must
+      not collapse to a 0-D scalar — it has to match the GPU / NumPy result
+      shape (1,), see the DEFINE_ATAN2_FLOAT_CPU 0-D expansion) ────────────── */
+$sc1 = NumPower::arctan2(NumPower::array(1.0, 'float64'), NumPower::array([2.0], 'float64'));
+ok(is_object($sc1) && $sc1->shape() === [1], '0-D numerator + (1,) denominator -> shape (1,)');
+ok(near($sc1->toArray()[0], atan2(1.0, 2.0), 1e-14), '0-D + (1,) value');
+$sc2 = NumPower::arctan2(NumPower::array([2.0], 'float64'), NumPower::array(1.0, 'float64'));
+ok(is_object($sc2) && $sc2->shape() === [1], '(1,) numerator + 0-D denominator -> shape (1,)');
+/* float128 takes the same 0-D-expansion path */
+$sc3 = NumPower::arctan2(NumPower::array('1.0', 'float128'), NumPower::array(['2.0'], 'float128'));
+ok(is_object($sc3) && $sc3->shape() === [1], 'fp128 0-D + (1,) -> shape (1,)');
+/* a genuine 0-D pair still collapses to a PHP scalar */
+ok(is_float(NumPower::arctan2(NumPower::array(1.0, 'float64'), NumPower::array(1.0, 'float64'))),
+   '0-D + 0-D -> PHP scalar');
+
+/* ── String-operand validation: malformed literals throw, they are NOT
+      silently coerced to 0 (regression: the binary dispatch must reject
+      garbage like the unary path does) ─────────────────────────────────────── */
+$peer = NumPower::array(['1.0'], 'float128');
+foreach (['abc', '', '   ', '1.5.5', '0xff', '1,5'] as $bad) {
+    $threw = false;
+    try { NumPower::arctan2($peer, $bad); } catch (\Throwable $e) { $threw = true; }
+    ok($threw, "arctan2(fp128, malformed '" . addslashes($bad) . "') throws");
+}
+/* valid numeric strings (incl. inf / nan / exponent / sign) are still accepted.
+   Use a float64 peer so the 0-D result returns as a PHP float (PHP's
+   (float)"nan" cast yields 0.0, not NAN — testing via the float64 toArray
+   element is the reliable check). */
+$peerf = NumPower::array([1.0], 'float64');
+ok(near(NumPower::arctan2($peerf, 'inf')->toArray()[0], 0.0, 1e-30), "string 'inf' -> atan2(1,inf)=0");
+ok(is_nan(NumPower::arctan2($peerf, 'nan')->toArray()[0]), "string 'nan' -> NaN");
+ok(near(NumPower::arctan2($peerf, '-2')->toArray()[0], atan2(1.0, -2.0), 1e-12), "string '-2' accepted");
+ok(near(NumPower::arctan2($peerf, '1e3')->toArray()[0], atan2(1.0, 1000.0), 1e-12), "string '1e3' accepted");
 
 echo $FAILS === 0 ? "ALL CHECKS PASSED\n" : "TOTAL FAILURES: $FAILS\n";
 ?>

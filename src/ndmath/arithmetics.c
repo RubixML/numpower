@@ -2614,14 +2614,35 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
    numerator / y-coordinate, b the denominator / x-coordinate). */
 #define DEFINE_ATAN2_FLOAT_CPU(NAME, T, DT_CONST, FN)                              \
 NDArray* NAME(NDArray* a, NDArray* b) {                                            \
+    /* Expand a 0-D scalar operand to the peer's shape first, matching            \
+       NDArray_Add_Double et al. AND the GPU path: NumPy/PyTorch broadcast        \
+       arctan2(0-D, shape-(n,)) to (n,), never to a 0-D scalar. Without this,     \
+       a 0-D vs numel-1-array pair would tie on element count, fall through to    \
+       the `else` below, and take the 0-D operand's rank — yielding a 0-D CPU     \
+       result while the GPU (which broadcasts the scalar) returns (n,).           \
+       NDArray_Broadcast replicates the single element for any dtype. */          \
+    NDArray *sa = NULL, *sb = NULL;                                               \
+    if (NDArray_NDIM(a) == 0 && NDArray_NDIM(b) > 0) {                            \
+        sa = NDArray_Broadcast(a, b); if (sa == NULL) return NULL; a = sa;        \
+    } else if (NDArray_NDIM(b) == 0 && NDArray_NDIM(a) > 0) {                     \
+        sb = NDArray_Broadcast(b, a); if (sb == NULL) return NULL; b = sb;        \
+    }                                                                             \
     NDArray *broadcasted = NULL, *a_broad, *b_broad;                              \
     if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {                        \
         broadcasted = NDArray_Broadcast(a, b);                                    \
-        if (broadcasted == NULL) return NULL;                                     \
+        if (broadcasted == NULL) {                                                \
+            if (sa) NDArray_FREE(sa);                                             \
+            if (sb) NDArray_FREE(sb);                                             \
+            return NULL;                                                          \
+        }                                                                         \
         a_broad = broadcasted; b_broad = b;                                       \
     } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {                 \
         broadcasted = NDArray_Broadcast(b, a);                                    \
-        if (broadcasted == NULL) return NULL;                                     \
+        if (broadcasted == NULL) {                                                \
+            if (sa) NDArray_FREE(sa);                                             \
+            if (sb) NDArray_FREE(sb);                                             \
+            return NULL;                                                          \
+        }                                                                         \
         b_broad = broadcasted; a_broad = a;                                       \
     } else { a_broad = a; b_broad = b; }                                          \
     int ndim   = NDArray_NDIM(a_broad);                                           \
@@ -2630,15 +2651,19 @@ NDArray* NAME(NDArray* a, NDArray* b) {                                         
     else          shape[0] = 1;                                                   \
     NDArray *result = NDArray_Empty(shape, ndim, DT_CONST, NDARRAY_DEVICE_CPU);   \
     if (result == NULL) {                                                         \
-        if (broadcasted) NDArray_FREE(broadcasted);                              \
+        if (broadcasted) NDArray_FREE(broadcasted);                               \
+        if (sa) NDArray_FREE(sa);                                                 \
+        if (sb) NDArray_FREE(sb);                                                 \
         return NULL;                                                              \
-    }                                                                            \
+    }                                                                             \
     T       *rd = (T *)NDArray_DATA(result);                                      \
     const T *ad = (const T *)NDArray_DATA(a_broad);                               \
     const T *bd = (const T *)NDArray_DATA(b_broad);                               \
     long n = NDArray_NUMELEMENTS(result);                                         \
     for (long i = 0; i < n; i++) rd[i] = FN(ad[i], bd[i]);                        \
     if (broadcasted) NDArray_FREE(broadcasted);                                   \
+    if (sa) NDArray_FREE(sa);                                                     \
+    if (sb) NDArray_FREE(sb);                                                     \
     return result;                                                                \
 }
 DEFINE_ATAN2_FLOAT_CPU(NDArray_Arctan2_Float,  float,  NDARRAY_TYPE_FLOAT32, atan2f)
@@ -2928,9 +2953,9 @@ ndarray_int_binop_cpu(NDArray *a, NDArray *b, int opcode) {
  * Both operands must already share the same dtype — the calling
  * dispatcher (`ndarray_promote_and_op`) handles the cast through
  * `NDArray_AsType` before reaching this entry point. Falls back to
- * NULL with a PHP error for opcodes outside the supported set; `/` is
- * already promoted to a float dtype by `ndarray_div_promote` and never
- * reaches here.
+ * NULL with a PHP error for opcodes outside the supported set; `/` (and
+ * `arctan2`) are already promoted to a float dtype by
+ * `ndarray_widen_int_to_float` and never reach here.
  *
  * @param[in] opcode ZEND_ADD / SUB / MUL / MOD / POW.
  * @param[in] a, b   Same-dtype operands on CPU; one may be 0-D.

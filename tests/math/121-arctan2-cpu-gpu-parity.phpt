@@ -95,6 +95,18 @@ for ($i = 0; $i < 2; $i++) for ($j = 0; $j < 3; $j++)
     if (abs($cpu_m[$i][$j] - $gpu_m[$i][$j]) > 1e-12) $m_ok = false;
 ok($m_ok, 'broadcast row-vector → matrix CPU/GPU parity');
 
+/* ── 0-D scalar + numel-1 array: CPU and GPU must agree on BOTH shape and
+      value (CPU must broadcast the scalar, not collapse to 0-D) ───────────── */
+$z0 = NumPower::array(1.0, 'float64');
+$z1 = NumPower::array([2.0], 'float64');
+$cpu_z = NumPower::arctan2($z0, $z1);
+$gpu_z = NumPower::arctan2($z0->gpu(), $z1->gpu());
+ok($gpu_z->isGPU(), '0-D+(1,) stays on GPU');
+ok(is_object($cpu_z) && $cpu_z->shape() === $gpu_z->cpu()->shape(),
+   '0-D+(1,) CPU/GPU shape match');
+ok(abs($cpu_z->toArray()[0] - $gpu_z->cpu()->toArray()[0]) < 1e-12,
+   '0-D+(1,) CPU/GPU value match');
+
 /* ── Mixed device: a CPU scalar operand migrates to the GPU array's device ─ */
 $ga = NumPower::array([1.0, -1.0, 2.0, -2.0], 'float64')->gpu();
 $mixed = NumPower::arctan2(2.0, $ga);          /* CPU scalar numerator + GPU array */

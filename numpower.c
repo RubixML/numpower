@@ -474,6 +474,11 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda,
                                         NDArray *ndb,
                                         const char **result_type_out);
 
+/* Forward declaration: the strict numeric-string dtype inferrer is defined
+   further down; the shared string-scalar validator below (used by both the
+   binary and unary intakes) needs it before its definition. */
+static const char *ndarray_infer_dtype_from_string(const char *str, size_t len);
+
 /**
  * @brief Widen an integer dtype to floating point for binary ops that always
  *        return a float (true division and atan2).
@@ -603,6 +608,50 @@ static NDArray *ndarray_make_typed_scalar(zval *z, const char *target_dt)
 }
 
 /**
+ * @brief Infer the dtype of a numeric-string scalar, throwing a precise
+ *        diagnostic on a malformed / empty / whitespace-only literal.
+ *
+ * Shared by the binary (`ndarray_arith_resolve_operand`) and unary
+ * (`ndarray_resolve_unary_input`) string-scalar intakes so both reject
+ * non-numeric input identically — the bare `strto*` parsers behind
+ * `NDArray_EncodeZvalToDtype` ignore trailing junk and read "abc" as 0,
+ * which would otherwise let `arctan2($t, "abc")` silently compute
+ * `atan2(x, 0)`. The three failure modes are split out so a typo is easy
+ * to spot.
+ *
+ * @param[in] value PHP zval of type IS_STRING.
+ * @return Canonical dtype string on success; NULL after throwing a PHP
+ *         exception when @p value is not a valid numeric literal.
+ */
+static const char *ndarray_string_scalar_dtype_or_throw(zval *value)
+{
+    const char *p  = Z_STRVAL_P(value);
+    size_t      n  = Z_STRLEN_P(value);
+    const char *dt = ndarray_infer_dtype_from_string(p, n);
+    if (dt != NULL) {
+        return dt;
+    }
+    size_t ws = 0;
+    while (ws < n && (p[ws] == ' ' || p[ws] == '\t' ||
+                      p[ws] == '\n' || p[ws] == '\r')) {
+        ws++;
+    }
+    if (n == 0) {
+        zend_throw_error(NULL, "Numeric string expected, got an empty value.");
+    } else if (ws == n) {
+        zend_throw_error(NULL,
+            "Numeric string expected, got a whitespace-only value.");
+    } else {
+        /* Length-bounded (`%.*s`) so an embedded NUL doesn't truncate the
+           offending literal in the diagnostic. */
+        zend_throw_error(NULL,
+            "Numeric string expected, got malformed literal: \"%.*s\".",
+            (int)n, p);
+    }
+    return NULL;
+}
+
+/**
  * @brief Resolve a PHP operand zval to an NDArray, honouring weak-scalar
  *        promotion against the peer operand's dtype.
  *
@@ -630,6 +679,16 @@ static NDArray *ndarray_arith_resolve_operand(zval *value, NDArray *other,
 {
     *is_owned = 0;
     if (other != NULL && ndarray_is_promotable_scalar(value)) {
+        /* A string operand must be a syntactically valid numeric literal:
+           validate with the same strict inferrer the unary intake uses so
+           malformed / empty / whitespace input throws instead of being
+           silently coerced to 0. The value still adopts the peer's dtype
+           (below) for loss-free float128 / uint64 intake — we only borrow the
+           inferrer's syntax check, not its inferred dtype. */
+        if (Z_TYPE_P(value) == IS_STRING &&
+            ndarray_string_scalar_dtype_or_throw(value) == NULL) {
+            return NULL;
+        }
         const char *target = ndarray_pick_scalar_dtype(NDArray_TYPE(other), value);
         NDArray *r = ndarray_make_typed_scalar(value, target);
         if (r == NULL) {
@@ -812,12 +871,12 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
 
     if (both_gpu) {
         /* GPU stays on GPU for every supported dtype. We promote types, cast
-           on GPU via NDArray_AsType (now GPU-aware), call the typed GPU binop,
+           on GPU via NDArray_AsType (GPU-aware), call the typed GPU binop,
            then cast back. No CPU round-trip for float32, float64, float16,
-           int8..uint64, and (via dd kernels) float128.
-           float4/float8 fall back to CPU because there are no native CUDA
-           intrinsics and they're 1-byte values (we go through NDArray_AsType
-           which already routes them through CPU for those source/target types). */
+           int8..uint64, float4/float8 (cast on GPU via cuda_cast_fp4/fp8_*),
+           and (via dd kernels) float128. The CPU fallthrough below the
+           NDArray_TypedBinOp_GPU call is a defensive guard for any AsType cast
+           a given build cannot keep on the device. */
         const char *gpu_result_type =
             ndarray_binop_result_type(opcode, NDArray_TYPE(nda), NDArray_TYPE(ndb));
         const char *gpu_comp_type = compute_dtype_for_arithmetic(gpu_result_type);
@@ -3723,32 +3782,8 @@ static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
 static NDArray *ndarray_resolve_unary_input(zval *array, int *owned)
 {
     if (Z_TYPE_P(array) == IS_STRING) {
-        const char *dt = ndarray_infer_dtype_from_string(
-            Z_STRVAL_P(array), Z_STRLEN_P(array));
+        const char *dt = ndarray_string_scalar_dtype_or_throw(array);
         if (dt == NULL) {
-            /* Differentiate the three failure modes so callers can spot
-               typos quickly: empty literal, whitespace-only, or
-               syntactically malformed (non-empty, non-whitespace). */
-            const char *p = Z_STRVAL_P(array);
-            size_t      n = Z_STRLEN_P(array);
-            size_t      ws = 0;
-            while (ws < n && (p[ws] == ' ' || p[ws] == '\t' ||
-                              p[ws] == '\n' || p[ws] == '\r')) {
-                ws++;
-            }
-            if (n == 0) {
-                zend_throw_error(NULL,
-                    "Numeric string expected, got an empty value.");
-            } else if (ws == n) {
-                zend_throw_error(NULL,
-                    "Numeric string expected, got a whitespace-only value.");
-            } else {
-                /* Length-bounded (`%.*s`) so an embedded NUL doesn't
-                   truncate the offending literal in the diagnostic. */
-                zend_throw_error(NULL,
-                    "Numeric string expected, got malformed literal: \"%.*s\".",
-                    (int)n, p);
-            }
             return NULL;
         }
         NDArray *nda = ndarray_make_typed_scalar(array, dt);
