@@ -3494,6 +3494,85 @@ PHP_METHOD(NumPower, flatten) {
 }
 
 /**
+ * @brief Infer the loss-free dtype for a bare numeric string scalar.
+ *
+ * Bare strings carry no peer-NDArray context, so the dispatcher decides
+ * the dtype from the string's content. The rule is conservative and
+ * picks the widest dtype that can hold the value without rounding —
+ * strings are precisely the intake path callers use to escape PHP's
+ * native long/double range:
+ *  - any decimal point, exponent marker (`e`/`E`), or `inf`/`nan`/
+ *    `infinity` chars → `float128` (the only dtype that holds wide
+ *    decimal literals end-to-end);
+ *  - negative integer literal → `int64` (negatives can't fit `uint64`);
+ *  - non-negative integer literal with magnitude > INT64_MAX (i.e.
+ *    > 19 digits, or 19 digits exceeding the INT64_MAX prefix) →
+ *    `uint64` (the only dtype that holds the full 64-bit range);
+ *  - otherwise → `int64` (every magnitude that fits both signed and
+ *    unsigned, including zero).
+ *
+ * Magnitude is compared digit-by-digit against the INT64_MAX string,
+ * which sidesteps the strtoull/errno boundary and works correctly even
+ * with leading-zero or leading-`+` literals. Whitespace at either end
+ * is tolerated (mirrors `strtod` / `strtoll`).
+ *
+ * @param[in] str  String content (need not be NUL-terminated within
+ *                 @p len bytes).
+ * @param[in] len  Length in bytes.
+ * @return Canonical dtype string ("float128" / "int64" / "uint64") or
+ *         NULL when @p str is empty or all-whitespace (caller throws).
+ */
+static const char *ndarray_infer_dtype_from_string(const char *str, size_t len)
+{
+    if (len == 0) {
+        return NULL;
+    }
+    /* Trim leading whitespace (strtod-style). */
+    size_t i = 0;
+    while (i < len && (str[i] == ' ' || str[i] == '\t' ||
+                       str[i] == '\n' || str[i] == '\r')) {
+        i++;
+    }
+    if (i == len) {
+        return NULL;
+    }
+    /* Scan for float / special-value markers. Anything that turns the
+       literal into a floating-point number forces fp128 so the decimal
+       digits survive end-to-end. */
+    for (size_t k = i; k < len; k++) {
+        char c = str[k];
+        if (c == '.' || c == 'e' || c == 'E' ||
+            c == 'i' || c == 'I' || c == 'n' || c == 'N') {
+            return "float128";
+        }
+    }
+    /* Integer literal — check the sign. */
+    const char *p = str + i;
+    size_t plen = len - i;
+    /* Trim trailing whitespace. */
+    while (plen > 0 && (p[plen - 1] == ' ' || p[plen - 1] == '\t' ||
+                        p[plen - 1] == '\n' || p[plen - 1] == '\r')) {
+        plen--;
+    }
+    if (plen == 0) {
+        return NULL;
+    }
+    if (*p == '+') { p++; plen--; }
+    if (plen > 0 && *p == '-') {
+        /* Negative magnitude can never fit uint64; INT64_MIN fits int64. */
+        return "int64";
+    }
+    /* Skip leading zeros so the digit-count check measures magnitude,
+       not character length. */
+    while (plen > 1 && *p == '0') { p++; plen--; }
+    /* INT64_MAX = 9223372036854775807 (19 digits). */
+    static const char int64_max_str[] = "9223372036854775807";
+    if (plen > 19) return "uint64";
+    if (plen == 19 && memcmp(p, int64_max_str, 19) > 0) return "uint64";
+    return "int64";
+}
+
+/**
  * @brief Run a typed unary op on a single zval argument and install
  *        the result.
  *
@@ -3514,13 +3593,16 @@ PHP_METHOD(NumPower, flatten) {
  *
  * Centralises the PHP-binding plumbing every unary method needs:
  *  - resolves the input zval to an NDArray (array / int / float / NDArray);
- *  - bare strings are rejected with a clear error pointing the caller at
- *    `NumPower::array(['…'], 'dtype')`, the only loss-free string intake
- *    path for `float128` / `int64` / `uint64`;
+ *  - bare numeric strings are accepted: `ndarray_infer_dtype_from_string`
+ *    picks the widest loss-free dtype (float128 for decimal/exponential
+ *    literals, uint64 for non-negative integers above INT64_MAX, int64
+ *    otherwise) and a 0-D scalar is built via `ndarray_make_typed_scalar`.
+ *    This is the only intake that lets a one-call expression carry full
+ *    `float128` or `uint64` precision without first allocating an NDArray;
  *  - dispatches through `NDArray_TypedUnaryOp`, which keeps GPU inputs on
  *    GPU and matches CPU bit-for-bit on every supported dtype;
  *  - releases the transient NDArray when the caller passed a literal
- *    array / int / float so no buffer slot survives the call;
+ *    array / int / float / string so no buffer slot survives the call;
  *  - installs the result via `ndarray_init_new_object`, which collapses
  *    a 0-D result to the dtype-correct PHP scalar.
  *
@@ -3534,21 +3616,34 @@ ndarray_run_simple_unary(INTERNAL_FUNCTION_PARAMETERS, NDArrayUnaryOp op) {
         Z_PARAM_ZVAL(array)
     ZEND_PARSE_PARAMETERS_END();
 
+    NDArray *nda;
+    int nda_owned = 0;
     if (Z_TYPE_P(array) == IS_STRING) {
-        zend_throw_error(NULL,
-            "Cannot infer dtype for a bare string. Wrap it as "
-            "NumPower::array(['%s'], 'float128'|'int64'|'uint64'|...).",
-            Z_STRVAL_P(array));
-        return;
-    }
-
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) {
-        return;
+        const char *dt = ndarray_infer_dtype_from_string(
+            Z_STRVAL_P(array), Z_STRLEN_P(array));
+        if (dt == NULL) {
+            zend_throw_error(NULL,
+                "Numeric string expected, got an empty or whitespace-only value.");
+            return;
+        }
+        nda = ndarray_make_typed_scalar(array, dt);
+        if (nda == NULL) {
+            return;
+        }
+        nda_owned = 1;
+    } else {
+        nda = ZVAL_TO_NDARRAY(array);
+        if (nda == NULL) {
+            return;
+        }
     }
 
     NDArray *rtn = NDArray_TypedUnaryOp(op, nda, NULL, NULL);
-    CHECK_INPUT_AND_FREE(array, nda);
+    if (nda_owned) {
+        NDArray_FREE(nda);
+    } else {
+        CHECK_INPUT_AND_FREE(array, nda);
+    }
     if (rtn == NULL) {
         return;
     }
@@ -4070,27 +4165,48 @@ PHP_METHOD(NumPower, clip) {
         Z_PARAM_ZVAL(max_zv)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (Z_TYPE_P(array) == IS_STRING) {
-        zend_throw_error(NULL,
-            "Cannot infer dtype for a bare string. Wrap it as "
-            "NumPower::array(['%s'], 'float128'|'int64'|'uint64'|...).",
-            Z_STRVAL_P(array));
-        return;
-    }
-
     char *min_str = ndarray_clip_bound_to_string(min_zv, "min");
     if (min_str == NULL) return;
     char *max_str = ndarray_clip_bound_to_string(max_zv, "max");
     if (max_str == NULL) { efree(min_str); return; }
 
-    NDArray *nda = ZVAL_TO_NDARRAY(array);
-    if (nda == NULL) { efree(min_str); efree(max_str); return; }
+    /* Bare numeric string input: infer the dtype (fp128 / uint64 / int64)
+       from the literal and build a 0-D scalar via the typed-scalar helper.
+       This is the only single-call path that carries float128 / uint64
+       precision end-to-end without first allocating an NDArray. */
+    NDArray *nda;
+    int nda_owned = 0;
+    if (Z_TYPE_P(array) == IS_STRING) {
+        const char *dt = ndarray_infer_dtype_from_string(
+            Z_STRVAL_P(array), Z_STRLEN_P(array));
+        if (dt == NULL) {
+            zend_throw_error(NULL,
+                "Numeric string expected, got an empty or whitespace-only value.");
+            efree(min_str);
+            efree(max_str);
+            return;
+        }
+        nda = ndarray_make_typed_scalar(array, dt);
+        if (nda == NULL) {
+            efree(min_str);
+            efree(max_str);
+            return;
+        }
+        nda_owned = 1;
+    } else {
+        nda = ZVAL_TO_NDARRAY(array);
+        if (nda == NULL) { efree(min_str); efree(max_str); return; }
+    }
 
     NDArray *rtn = NDArray_TypedUnaryOp(NDARRAY_UNOP_CLIP, nda,
                                          min_str, max_str);
     efree(min_str);
     efree(max_str);
-    CHECK_INPUT_AND_FREE(array, nda);
+    if (nda_owned) {
+        NDArray_FREE(nda);
+    } else {
+        CHECK_INPUT_AND_FREE(array, nda);
+    }
     if (rtn == NULL) return;
     ndarray_init_new_object(rtn, return_value);
 }

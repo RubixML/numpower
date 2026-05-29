@@ -6,7 +6,8 @@ NumPower::exp/exp2/expm1/log/log1p/log2/log10/logb across every dtype (CPU)
      - integer inputs promote to float32 (narrow ints) or float64
        (32/64-bit ints) per the unary-result-dtype rule;
      - every floating-point dtype is preserved end-to-end;
-     - bare-string inputs throw the dtype-inference error;
+     - bare numeric strings infer dtype loss-free (decimal → fp128,
+       integer above INT64_MAX → uint64, otherwise int64);
      - fp128 inputs round-trip through libquadmath (when present) with
        full 32-digit precision via NumPower::array(['...'], 'float128');
      - 0-D inputs return a dtype-correct scalar;
@@ -182,12 +183,35 @@ $cube = NumPower::array([[[1.0, 10.0],[100.0, 1000.0]]], 'float64');
 check("3-D log10", NumPower::log10($cube)->toArray(),
                    [[[0.0, 1.0], [2.0, 3.0]]], 1e-12);
 
-/* ── Bare-string input throws ─────────────────────────────────────────── */
-try { NumPower::exp("1.0"); echo "FAIL exp(string) did not throw\n"; }
-catch (Error $e) { echo "OK exp(string) throws\n"; }
+/* ── Bare-string input is accepted: dtype inferred from the literal ─── */
+/* String with a decimal point → fp128. exp("1.0") returns an fp128
+   scalar whose stringification starts with the prefix of e (the
+   precision depends on the backend — see has_libquadmath() above). */
+$_e_prefix = has_libquadmath() ? '2.71828182845904523536' : '2.7182818284590';
+$es = (string)NumPower::exp("1.0");
+check("exp('1.0') string prefix",
+      strncmp($es, $_e_prefix, strlen($_e_prefix)) === 0, true);
 
-try { NumPower::log("2.0"); echo "FAIL log(string) did not throw\n"; }
-catch (Error $e) { echo "OK log(string) throws\n"; }
+/* String with a decimal point → fp128. log("2.71828182845904523536")
+   should be 1.0 to fp128 precision (or fp64 precision on DD-backed
+   builds). */
+$ls = (float)(string)NumPower::log("2.71828182845904523536");
+check("log('2.7182...') ≈ 1", $ls, 1.0, 1e-10);
+
+/* Integer-looking string fits in int64 → result widens to float64
+   (per the integer-result-dtype rule). */
+check("log2('1024') == 10.0", (float)(string)NumPower::log2("1024"), 10.0, 1e-12);
+
+/* uint64-magnitude integer string → result widens to float64. */
+check("log2('18446744073709551615') ≈ 64",
+      (float)(string)NumPower::log2("18446744073709551615"), 64.0, 1e-6);
+
+/* Empty / whitespace-only strings still throw. */
+try { NumPower::exp(""); echo "FAIL exp('') did not throw\n"; }
+catch (Error $e) { echo "OK exp('') throws\n"; }
+
+try { NumPower::log("   "); echo "FAIL log('   ') did not throw\n"; }
+catch (Error $e) { echo "OK log('   ') throws\n"; }
 
 /* ── Edge values: log(1)=0, log(0)=-inf, log(-1)=NaN, exp(0)=1 ────────── */
 $edge = NumPower::array([0.0, 1.0, -1.0], 'float64');
@@ -257,8 +281,12 @@ OK 0-D fp128 exp string prefix
 OK 2-D log
 OK 2-D exp2 of zeros
 OK 3-D log10
-OK exp(string) throws
-OK log(string) throws
+OK exp('1.0') string prefix
+OK log('2.7182...') ≈ 1
+OK log2('1024') == 10.0
+OK log2('18446744073709551615') ≈ 64
+OK exp('') throws
+OK log('   ') throws
 OK log(0)=-inf
 OK log(1)=0
 OK log(-1)=NaN
