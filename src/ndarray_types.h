@@ -141,12 +141,14 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_ABS(a)      ndarray_dd_abs(a)
 #  define NDARRAY_FP128_SQRT(a)     ndarray_dd_sqrt(a)
 #  define NDARRAY_FP128_SIN(a)      ndarray_dd_from_double(sin(ndarray_dd_to_double(a)))
-   /* Transcendental fp128 ops on the DD backend route through `double`
-      so the macro contract stays platform-portable; accuracy is the same
-      tier as the GPU `dd_*` reference path that already promotes
-      `dd → double → libm → dd` for sin/cos/exp/log. Linux GCC x86-64 with
-      libquadmath is the only configuration that yields full 113-bit
-      transcendentals — every other platform tops out at fp64 here. */
+   /* DD backend precision tiers (mirrors the GPU `dd_*` reference path):
+        - exp/log family and the hyperbolics (sinh…atanh) run in full DD
+          arithmetic (~32 digits) via the ndarray_dd_* helpers below;
+        - the trig group (sin/cos/tan/asin/acos/atan) and atan2 still route
+          `dd → double → libm → dd`, topping out at fp64, because full
+          113-bit trig needs argument reduction by a DD π.
+      Linux GCC x86-64 with libquadmath bypasses all of this with native
+      113-bit transcendentals; this branch only compiles elsewhere. */
 #  define NDARRAY_FP128_EXP(a)      ndarray_dd_exp   (a)
 #  define NDARRAY_FP128_EXP2(a)     ndarray_dd_exp2  (a)
 #  define NDARRAY_FP128_EXPM1(a)    ndarray_dd_expm1 (a)
@@ -160,12 +162,15 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_ARCSIN(a)   ndarray_dd_from_double(asin   (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_ARCCOS(a)   ndarray_dd_from_double(acos   (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_ARCTAN(a)   ndarray_dd_from_double(atan   (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_SINH(a)     ndarray_dd_from_double(sinh   (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_COSH(a)     ndarray_dd_from_double(cosh   (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_TANH(a)     ndarray_dd_from_double(tanh   (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_ARCSINH(a)  ndarray_dd_from_double(asinh  (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_ARCCOSH(a)  ndarray_dd_from_double(acosh  (ndarray_dd_to_double(a)))
-#  define NDARRAY_FP128_ARCTANH(a)  ndarray_dd_from_double(atanh  (ndarray_dd_to_double(a)))
+   /* Hyperbolics run in full DD precision (~32 digits) via the dd helpers,
+      matching the GPU dd path bit-for-bit — unlike the trig group above,
+      they no longer collapse to fp64. */
+#  define NDARRAY_FP128_SINH(a)     ndarray_dd_sinh   (a)
+#  define NDARRAY_FP128_COSH(a)     ndarray_dd_cosh   (a)
+#  define NDARRAY_FP128_TANH(a)     ndarray_dd_tanh   (a)
+#  define NDARRAY_FP128_ARCSINH(a)  ndarray_dd_arcsinh(a)
+#  define NDARRAY_FP128_ARCCOSH(a)  ndarray_dd_arccosh(a)
+#  define NDARRAY_FP128_ARCTANH(a)  ndarray_dd_arctanh(a)
 #  define NDARRAY_FP128_ATAN2(a, b) ndarray_dd_from_double(atan2(ndarray_dd_to_double(a), \
                                                                  ndarray_dd_to_double(b)))
 #  define NDARRAY_FP128_RINT(a)     ndarray_dd_from_double(rint   (ndarray_dd_to_double(a)))

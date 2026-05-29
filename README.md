@@ -201,7 +201,7 @@ Open the `php.ini` shown by `php --ini` and add the line `extension=ndarray.so`.
 - **Visual Studio 2019 or 2022** (Community is fine), or the standalone **Build Tools** package.
 - **PHP SDK + development pack** for the PHP version you target — easiest is the [php-sdk-binary-tools](https://github.com/php/php-sdk-binary-tools) repository.
 - **Prebuilt OpenBLAS for Windows x64** — download from the [OpenBLAS releases](https://github.com/OpenMathLib/OpenBLAS/releases) (the file looks like `OpenBLAS-0.3.30-x64.zip`). Unzip it anywhere.
-- **(GPU only)** NVIDIA **CUDA Toolkit 12.x** for Windows x64. The installer sets the `%CUDA_PATH%` environment variable automatically.
+- **(GPU only)** NVIDIA **CUDA Toolkit 11+** for Windows x64. The installer sets the `%CUDA_PATH%` environment variable automatically.
 
 **2. Build — CPU only**
 
