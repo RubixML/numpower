@@ -549,14 +549,6 @@ void arctanFloatKernel(float* d_array, int size) {
 }
 
 __global__
-void arctan2FloatKernel(float* d_array, float* d_array2, int size) {
-    int index = threadIdx.x + blockIdx.x * blockDim.x;
-    if (index < size) {
-        d_array[index] = atan2f(d_array[index], d_array2[index]);
-    }
-}
-
-__global__
 void absFloatKernel(float* d_array, int size) {
     int index = threadIdx.x + blockIdx.x * blockDim.x;
     if (index < size) {
@@ -968,6 +960,12 @@ __device__ inline T tcuda_pow_uint(T base, T exp) {
 __device__ inline double tcuda_pow_f(double a, double b) { return pow(a, b); }
 __device__ inline float  tcuda_pow_f(float a, float b)   { return powf(a, b); }
 
+/* Two-argument arctangent overloads — picks the dtype-correct libcudart
+   intrinsic (`atan2` for double, `atan2f` for float) so a single templated
+   kernel covers both float compute dtypes. */
+__device__ inline double tcuda_atan2_f(double a, double b) { return atan2(a, b); }
+__device__ inline float  tcuda_atan2_f(float a, float b)   { return atan2f(a, b); }
+
 #define TYPED_BINOP_KERNEL(KERNEL_NAME, EXPR)                                       \
 template <typename T>                                                                \
 __global__ void KERNEL_NAME(const T *a, const T *b, T *out, int n) {                 \
@@ -979,6 +977,10 @@ TYPED_BINOP_KERNEL(tcuda_add_kernel, x + y)
 TYPED_BINOP_KERNEL(tcuda_sub_kernel, x - y)
 TYPED_BINOP_KERNEL(tcuda_mul_kernel, x * y)
 TYPED_BINOP_KERNEL(tcuda_div_kernel, x / y)
+/* Element-wise atan2(x, y). Instantiated only for float / double (the
+   float compute dtypes the host dispatcher routes here); fp128 has its
+   own dd kernel below. */
+TYPED_BINOP_KERNEL(tcuda_atan2_kernel, tcuda_atan2_f(x, y))
 
 /* Specialised mod/pow kernels (need different impl for int vs float) */
 template <typename T>
@@ -1144,6 +1146,12 @@ __device__ inline dd_real dd_mod(dd_real a, dd_real b) {
     dd_real qt = dd_mul(b, dd_make(q_trunc, 0.0));
     return dd_sub(a, qt);
 }
+/* dd_atan2 degrades to fp64 — same contract as the dd unary transcendentals
+   (sin/cos/atan, which all route dd → double → libm → dd). Full 113-bit
+   atan2 needs the libquadmath CPU path; the GPU dd tier tops out at fp64. */
+__device__ inline dd_real dd_atan2(dd_real a, dd_real b) {
+    return dd_make(atan2(dd_to_double(a), dd_to_double(b)), 0.0);
+}
 
 #define DD_BINOP_KERNEL(NAME, OP)                                                   \
 __global__ void NAME(const double *a, const double *b, double *out, int n) {        \
@@ -1163,6 +1171,7 @@ DD_BINOP_KERNEL(tcuda_mul_dd_kernel, dd_mul)
 DD_BINOP_KERNEL(tcuda_div_dd_kernel, dd_div)
 DD_BINOP_KERNEL(tcuda_pow_dd_kernel, dd_pow)
 DD_BINOP_KERNEL(tcuda_mod_dd_kernel, dd_mod)
+DD_BINOP_KERNEL(tcuda_atan2_dd_kernel, dd_atan2)
 
 __global__ void tcuda_fill_dd_kernel(double *out, double hi, double lo, int n) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -2644,13 +2653,6 @@ extern "C" {
     }
 
     void
-    cuda_float_arctan2(int nblocks, float *d_array, float *y_array) {
-        int blockSize = 256;  // Number of threads per block. This is a typical choice.
-        int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
-        arctan2FloatKernel<<<numBlocks, blockSize>>>(d_array, y_array, nblocks);
-    }
-
-    void
     cuda_float_arccos(int nblocks, float *d_array) {
         int blockSize = 256;  // Number of threads per block. This is a typical choice.
         int numBlocks = (nblocks + blockSize - 1) / blockSize;  // Number of blocks in the grid.
@@ -3240,6 +3242,14 @@ void cuda_pow_f64(double *a, double *b, double *rtn, int n) {
     GRID_FOR(n);
     tcuda_pow_f64_kernel<<<numBlocks, blockSize>>>(a, b, rtn, n);
 }
+void cuda_atan2_f32(float *a, float *b, float *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_atan2_kernel<float><<<numBlocks, blockSize>>>(a, b, rtn, n);
+}
+void cuda_atan2_f64(double *a, double *b, double *rtn, int n) {
+    GRID_FOR(n);
+    tcuda_atan2_kernel<double><<<numBlocks, blockSize>>>(a, b, rtn, n);
+}
 
 /* float16 (__half) wrappers */
 void cuda_add_f16(uint16_t *a, uint16_t *b, uint16_t *rtn, int n) {
@@ -3375,6 +3385,7 @@ DEF_DD_WRAPPER(cuda_mul_dd, tcuda_mul_dd_kernel)
 DEF_DD_WRAPPER(cuda_div_dd, tcuda_div_dd_kernel)
 DEF_DD_WRAPPER(cuda_pow_dd, tcuda_pow_dd_kernel)
 DEF_DD_WRAPPER(cuda_mod_dd, tcuda_mod_dd_kernel)
+DEF_DD_WRAPPER(cuda_atan2_dd, tcuda_atan2_dd_kernel)
 
 /* ──────────────────────────────────────────────────────────────────────────
    Typed unary op wrappers — element-wise abs / negate / sign / square /

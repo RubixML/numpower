@@ -34,12 +34,12 @@ int cuda_det_float(float *a, float *result, int n);
 /* Legacy single-precision trig / hyperbolic / angle / rounding /
    sinc / negate / sign / clip helpers were removed from the public
    API by the typed-unary refactor — all dispatch goes through
-   `cuda_<op>_{f32,f64,f16,dd}` now. The only legacy float-only
-   wrapper still on a non-typed path is `cuda_float_arctan2` (binary)
-   and `cuda_float_round` (precision arg); they sit on the legacy
-   `NDArray_Map1ND` / `NDArray_Map1F` rails until binary-unary /
-   precision-arg support lands in the dispatcher. */
-void cuda_float_arctan2(int nblocks, float *d_array, float *y_array);
+   `cuda_<op>_{f32,f64,f16,dd}` now. `arctan2` joined the typed binary
+   dispatch (`cuda_atan2_{f32,f64,dd}`, declared with the other typed
+   binops below); the only legacy float-only wrapper still on a
+   non-typed path is `cuda_float_round` (precision arg), which sits on
+   the legacy `NDArray_Map1F` rail until precision-arg support lands in
+   the dispatcher. */
 void cuda_float_multiply_matrix_vector(int nblocks, float *a_array, float *b_array, float *result, int rows, int cols);
 void cuda_float_compare_equal(int nblocks, float *a_array, float *b_array, float *result, int n);
 void cuda_matrix_float_inverse(float* matrix, int n);
@@ -379,6 +379,12 @@ void cuda_div_f64(double *a, double *b, double *rtn, int n);
 void cuda_mod_f64(double *a, double *b, double *rtn, int n);
 void cuda_pow_f64(double *a, double *b, double *rtn, int n);
 
+/* Typed two-argument arctangent (atan2). Only the float compute dtypes are
+   needed: the host dispatcher promotes every integer / narrow-float input to
+   float32 or float64 first, and routes float128 to `cuda_atan2_dd`. */
+void cuda_atan2_f32(float  *a, float  *b, float  *rtn, int n);
+void cuda_atan2_f64(double *a, double *b, double *rtn, int n);
+
 /* Typed fills */
 void cuda_fill_i8 (int8_t   *a, int8_t   value, int n);
 void cuda_fill_u8 (uint8_t  *a, uint8_t  value, int n);
@@ -415,6 +421,7 @@ void cuda_mul_dd(double *a, double *b, double *rtn, int n);
 void cuda_div_dd(double *a, double *b, double *rtn, int n);
 void cuda_pow_dd(double *a, double *b, double *rtn, int n);
 void cuda_mod_dd(double *a, double *b, double *rtn, int n);
+void cuda_atan2_dd(double *a, double *b, double *rtn, int n);
 
 /* ── Typed unary in-place kernels ───────────────────────────────────────────
    Element-wise unary ops parameterised by dtype. Each wrapper runs the

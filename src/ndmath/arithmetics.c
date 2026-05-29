@@ -2600,6 +2600,57 @@ NDArray* NDArray_Mod_Float128(NDArray* a, NDArray* b) {
     return result;
 }
 
+/* ── Two-argument arctangent (atan2) CPU kernels ──────────────────────────
+   atan2 is a binary element-wise op that always returns a floating-point
+   result, so `ndarray_promote_and_op` promotes both operands to a common
+   float compute dtype (float32 / float64 / float128) before dispatching
+   here — these kernels never see integer input. Broadcasting and the 0-D
+   scalar case reuse `NDArray_Broadcast`, matching the existing float
+   arithmetic kernels (`NDArray_Add_Double` et al.) so CPU and the
+   `cuda_atan2_*` GPU kernels stay in step on every shape they both support.
+   CPU-only: GPU residency is handled by `NDArray_TypedBinOp_GPU`.
+
+   Argument order follows NumPy: `arctan2(a, b)` == C `atan2(a, b)` (a is the
+   numerator / y-coordinate, b the denominator / x-coordinate). */
+#define DEFINE_ATAN2_FLOAT_CPU(NAME, T, DT_CONST, FN)                              \
+NDArray* NAME(NDArray* a, NDArray* b) {                                            \
+    NDArray *broadcasted = NULL, *a_broad, *b_broad;                              \
+    if (NDArray_NUMELEMENTS(a) < NDArray_NUMELEMENTS(b)) {                        \
+        broadcasted = NDArray_Broadcast(a, b);                                    \
+        if (broadcasted == NULL) return NULL;                                     \
+        a_broad = broadcasted; b_broad = b;                                       \
+    } else if (NDArray_NUMELEMENTS(b) < NDArray_NUMELEMENTS(a)) {                 \
+        broadcasted = NDArray_Broadcast(b, a);                                    \
+        if (broadcasted == NULL) return NULL;                                     \
+        b_broad = broadcasted; a_broad = a;                                       \
+    } else { a_broad = a; b_broad = b; }                                          \
+    int ndim   = NDArray_NDIM(a_broad);                                           \
+    int *shape = emalloc(sizeof(int) * (ndim > 0 ? ndim : 1));                    \
+    if (ndim > 0) memcpy(shape, NDArray_SHAPE(a_broad), sizeof(int) * ndim);      \
+    else          shape[0] = 1;                                                   \
+    NDArray *result = NDArray_Empty(shape, ndim, DT_CONST, NDARRAY_DEVICE_CPU);   \
+    if (result == NULL) {                                                         \
+        if (broadcasted) NDArray_FREE(broadcasted);                              \
+        return NULL;                                                              \
+    }                                                                            \
+    T       *rd = (T *)NDArray_DATA(result);                                      \
+    const T *ad = (const T *)NDArray_DATA(a_broad);                               \
+    const T *bd = (const T *)NDArray_DATA(b_broad);                               \
+    long n = NDArray_NUMELEMENTS(result);                                         \
+    for (long i = 0; i < n; i++) rd[i] = FN(ad[i], bd[i]);                        \
+    if (broadcasted) NDArray_FREE(broadcasted);                                   \
+    return result;                                                                \
+}
+DEFINE_ATAN2_FLOAT_CPU(NDArray_Arctan2_Float,  float,  NDARRAY_TYPE_FLOAT32, atan2f)
+DEFINE_ATAN2_FLOAT_CPU(NDArray_Arctan2_Double, double, NDARRAY_TYPE_FLOAT64, atan2)
+#undef DEFINE_ATAN2_FLOAT_CPU
+
+/* float128 atan2 — same broadcast / 0-D handling as the other fp128 binops
+   via DEFINE_FP128_BINOP; the per-element body routes through
+   `NDARRAY_FP128_ATAN2`, which is `atan2q` on the libquadmath build (full
+   113-bit) and the DD `atan2(double)` fallback elsewhere. */
+DEFINE_FP128_BINOP(Arctan2, NDARRAY_FP128_ATAN2(x, y))
+
 /* ──────────────────────────────────────────────────────────────────────────
    Native integer CPU arithmetic kernels covering every one of the eight
    integer dtypes: `int8`, `uint8`, `int16`, `uint16`, `int32`, `uint32`,
@@ -3140,6 +3191,34 @@ NDArray *NDArray_TypedBinOp_GPU(int opcode, NDArray *a, NDArray *b) {
     }
     int n = (int)NDArray_NUMELEMENTS(result);
     const char *dt = NDArray_TYPE(result);
+
+    /* atan2 always computes in a float dtype (the dispatcher promotes integer
+       and narrow-float inputs to float32 / float64 / float128 first), so it
+       dispatches on its own here: the shared DISPATCH_OP macro below is also
+       instantiated for the integer dtypes, which have no `cuda_atan2_<int>`
+       kernel. fp4 / fp8 never reach this point — their arithmetic compute
+       dtype is float32. */
+    if (opcode == NDARRAY_BINOP_ATAN2) {
+        if (!strcmp(dt, "float32")) {
+            cuda_atan2_f32((float *)NDArray_DATA(a_broad),
+                           (float *)NDArray_DATA(b_broad),
+                           (float *)NDArray_DATA(result), n);
+        } else if (!strcmp(dt, "float64")) {
+            cuda_atan2_f64((double *)NDArray_DATA(a_broad),
+                           (double *)NDArray_DATA(b_broad),
+                           (double *)NDArray_DATA(result), n);
+        } else if (!strcmp(dt, "float128")) {
+            cuda_atan2_dd((double *)NDArray_DATA(a_broad),
+                          (double *)NDArray_DATA(b_broad),
+                          (double *)NDArray_DATA(result), n);
+        } else {
+            NDArray_FREE(result);
+            result = NULL;
+            zend_throw_error(NULL,
+                "GPU atan2: unsupported compute dtype %s.", dt);
+        }
+        goto done;
+    }
 
 #define DISPATCH_OP(DTSTR, TAG, T)                                                  \
     if (!strcmp(dt, DTSTR)) {                                                       \

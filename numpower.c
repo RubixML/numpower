@@ -45,10 +45,11 @@
 #include "src/manipulation.h"
 
 // Live exports of double_math.h: float_abs, float_sqrt, float_round
-// (precision arg, legacy), float_arctan2 (binary, legacy).
-// Every other float_* scalar helper (sin/cos/.../floor/ceil + exp/log
-// family + sinc + negate/positive/sign/clip/reciprocal/rsqrt) was
-// retired by the typed-unary dispatcher in src/ndmath/arithmetics.c.
+// (precision arg, legacy). `arctan2` moved to the typed binary dispatch
+// (`NDArray_Arctan2_*` / `cuda_atan2_*`). Every other float_* scalar helper
+// (sin/cos/.../floor/ceil + exp/log family + sinc + negate/positive/sign/
+// clip/reciprocal/rsqrt) was retired by the typed-unary dispatcher in
+// src/ndmath/arithmetics.c.
 #include "src/ndmath/double_math.h"
 
 // NDArray_Matmul, NDArray_Inner,      NDArray_Outer, NDArray_Dot,   NDArray_Trace,
@@ -92,10 +93,10 @@
 
 #ifdef HAVE_CUBLAS
   // Live cuda_float_* exports: cuda_float_abs, cuda_float_sqrt,
-  // cuda_float_round (precision arg, legacy), cuda_float_arctan2
-  // (binary, legacy). All other cuda_float_* trig / hyperbolic /
-  // angle / rounding / sinc / negate / positive / sign / clip /
-  // reciprocal / rsqrt helpers were retired by the typed-unary
+  // cuda_float_round (precision arg, legacy). `arctan2` moved to the typed
+  // binary GPU dispatch (`cuda_atan2_{f32,f64,dd}`). All other cuda_float_*
+  // trig / hyperbolic / angle / rounding / sinc / negate / positive / sign /
+  // clip / reciprocal / rsqrt helpers were retired by the typed-unary
   // GPU dispatcher (`cuda_<op>_{f16,f32,f64,dd}` per-dtype kernels)
   // — see the transcendental section in src/ndmath/cuda/cuda_math.h.
 # include "src/ndmath/cuda/cuda_math.h"
@@ -474,26 +475,55 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda,
                                         const char **result_type_out);
 
 /**
- * Apply ZEND_DIV's "true division" dtype rule: integer operands divide to
- * float (float32 for narrow ints, float64 for 32/64-bit ints). Matches
- * PyTorch and the same logic used in the non-empty arithmetic path.
+ * @brief Widen an integer dtype to floating point for binary ops that always
+ *        return a float (true division and atan2).
  *
- * @param result_type promoted dtype before applying the division rule
- * @return            adjusted dtype to use for the division result
+ * Integer operands widen per PyTorch's rule: narrow ints (int8..uint16) →
+ * float32, the 32/64-bit ints (int32/uint32/int64/uint64) → float64. A dtype
+ * that is already floating point passes through unchanged.
+ *
+ * @param result_type Promoted dtype string.
+ * @return            float32 / float64 for an integer @p result_type, else
+ *                    @p result_type unchanged.
  */
-static const char *ndarray_div_promote(const char *result_type)
+static const char *ndarray_widen_int_to_float(const char *result_type)
 {
-    int is_int_result =
-        (!strcmp(result_type, "int8")   || !strcmp(result_type, "uint8")  ||
-         !strcmp(result_type, "int16")  || !strcmp(result_type, "uint16") ||
-         !strcmp(result_type, "int32")  || !strcmp(result_type, "uint32") ||
-         !strcmp(result_type, "int64")  || !strcmp(result_type, "uint64"));
-    if (!is_int_result) return result_type;
-    if (!strcmp(result_type, "int32") || !strcmp(result_type, "uint32") ||
-        !strcmp(result_type, "int64") || !strcmp(result_type, "uint64")) {
-        return "float64";
+    int is_wide_int =
+        (!strcmp(result_type, "int32") || !strcmp(result_type, "uint32") ||
+         !strcmp(result_type, "int64") || !strcmp(result_type, "uint64"));
+    int is_int =
+        (!strcmp(result_type, "int8")  || !strcmp(result_type, "uint8")  ||
+         !strcmp(result_type, "int16") || !strcmp(result_type, "uint16") ||
+         is_wide_int);
+    if (!is_int) return result_type;
+    return is_wide_int ? "float64" : "float32";
+}
+
+/**
+ * @brief Final result dtype of a binary op, applying the per-opcode rule on
+ *        top of `promote_dtype`.
+ *
+ * Centralises the post-promotion adjustment shared by the empty-broadcast,
+ * GPU and CPU paths of `ndarray_promote_and_op`. Both true division
+ * (`ZEND_DIV`) and `arctan2` (`NDARRAY_BINOP_ATAN2`) always return a float, so
+ * an integer-promoted result widens via `ndarray_widen_int_to_float` (int32 /
+ * 2 → float32, not a truncated int32; atan2(int, int) → float). Every other
+ * opcode keeps the promoted dtype.
+ *
+ * @param opcode Binary opcode (a `ZEND_*` arithmetic opcode or
+ *               `NDARRAY_BINOP_ATAN2`).
+ * @param a_dt   First operand dtype.
+ * @param b_dt   Second operand dtype.
+ * @return       Result dtype string.
+ */
+static const char *ndarray_binop_result_type(zend_uchar opcode,
+                                             const char *a_dt, const char *b_dt)
+{
+    const char *t = promote_dtype(a_dt, b_dt);
+    if (opcode == ZEND_DIV || opcode == NDARRAY_BINOP_ATAN2) {
+        return ndarray_widen_int_to_float(t);
     }
-    return "float32";
+    return t;
 }
 
 /**
@@ -771,10 +801,8 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
             if (ndb_dev_migrated) NDArray_FREE(ndb_dev_migrated);
             return NULL;
         }
-        const char *empty_result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
-        if (opcode == ZEND_DIV) {
-            empty_result_type = ndarray_div_promote(empty_result_type);
-        }
+        const char *empty_result_type =
+            ndarray_binop_result_type(opcode, NDArray_TYPE(nda), NDArray_TYPE(ndb));
         if (result_type_out) *result_type_out = empty_result_type;
         NDArray *empty_rtn = NDArray_Empty(rshape, rndim, empty_result_type, dev_a);
         if (nda_dev_migrated) NDArray_FREE(nda_dev_migrated);
@@ -790,11 +818,8 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
            float4/float8 fall back to CPU because there are no native CUDA
            intrinsics and they're 1-byte values (we go through NDArray_AsType
            which already routes them through CPU for those source/target types). */
-        const char *gpu_result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
-
-        if (opcode == ZEND_DIV) {
-            gpu_result_type = ndarray_div_promote(gpu_result_type);
-        }
+        const char *gpu_result_type =
+            ndarray_binop_result_type(opcode, NDArray_TYPE(nda), NDArray_TYPE(ndb));
         const char *gpu_comp_type = compute_dtype_for_arithmetic(gpu_result_type);
         if (result_type_out) *result_type_out = gpu_result_type;
 
@@ -873,13 +898,10 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
         both_gpu = 0;
     }
 
-    const char *result_type = promote_dtype(NDArray_TYPE(nda), NDArray_TYPE(ndb));
-
-    /* PyTorch: true division ("/") always returns a float dtype, even for
-       integer inputs. int32 / 2 → float32 (not int32 truncated). */
-    if (opcode == ZEND_DIV) {
-        result_type = ndarray_div_promote(result_type);
-    }
+    /* Result dtype: promotion + the per-opcode rule (true-division and atan2
+       both widen integer results to float). See `ndarray_binop_result_type`. */
+    const char *result_type =
+        ndarray_binop_result_type(opcode, NDArray_TYPE(nda), NDArray_TYPE(ndb));
 
     const char *comp_type   = compute_dtype_for_arithmetic(result_type);
     if (result_type_out) *result_type_out = result_type;
@@ -949,6 +971,10 @@ static NDArray *ndarray_promote_and_op(zend_uchar opcode, NDArray *nda, NDArray 
             rtn = use_float128 ? NDArray_Mod_Float128(a, b)
                 : use_double   ? NDArray_Mod_Double(a, b)
                                : NDArray_Mod_Float(a, b);      break;
+        case NDARRAY_BINOP_ATAN2:
+            rtn = use_float128 ? NDArray_Arctan2_Float128(a, b)
+                : use_double   ? NDArray_Arctan2_Double(a, b)
+                               : NDArray_Arctan2_Float(a, b);  break;
         default:
             break;
         }
@@ -3938,47 +3964,35 @@ PHP_METHOD(NumPower, arctan) {
 /**
  * NumPower::arctan2
  *
- * Two-argument arctangent `atan2(x, y)` element-wise. Returns the
- * angle in radians between the positive x-axis and the point `(y, x)`,
- * choosing the quadrant from the signs of both args.
+ * Element-wise two-argument arctangent `atan2(x, y)`: the angle in radians
+ * (range (-π, π]) between the positive x-axis and the point `(y, x)`,
+ * choosing the quadrant from the signs of both arguments.
  *
- * Out of scope of the typed-unary refactor — `arctan2` is a binary op
- * and still rides the legacy `NDArray_Map1ND` / `cuda_float_arctan2`
- * path which assumes float32. See [[sin-cos-trig-dtype-bug]] follow-up.
+ * Rides the shared typed binary dispatch (`ndarray_arith_dispatch` →
+ * `ndarray_promote_and_op`), so it gets the same behaviour as the
+ * arithmetic operators for free:
+ *  - both operands are promoted to a common dtype, then widened to floating
+ *    point (atan2 always returns a float — narrow ints → float32, 32/64-bit
+ *    ints → float64), and computed natively on every supported dtype;
+ *  - GPU-resident inputs stay on GPU (`cuda_atan2_{f32,f64,dd}`), CPU inputs
+ *    use `NDArray_Arctan2_{Float,Double,Float128}`, bit-for-bit aligned on
+ *    every shape both paths support;
+ *  - a scalar / numeric-string operand alongside an NDArray adopts the
+ *    array's dtype, keeping `float128` / `uint64` precision loss-free;
+ *  - a 0-D result collapses to the dtype-correct PHP scalar (float, or a
+ *    string for a `float128` result).
  */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ndarray_arctan2, 0, 0, 2)
     ZEND_ARG_INFO(0, x)
     ZEND_ARG_INFO(0, y)
 ZEND_END_ARG_INFO()
 PHP_METHOD(NumPower, arctan2) {
-    NDArray *rtn = NULL;
     zval *x, *y;
     ZEND_PARSE_PARAMETERS_START(2, 2)
             Z_PARAM_ZVAL(x)
             Z_PARAM_ZVAL(y)
     ZEND_PARSE_PARAMETERS_END();
-    NDArray *ndx = ZVAL_TO_NDARRAY(x);
-    if (ndx == NULL) {
-        return;
-    }
-    NDArray *ndy = ZVAL_TO_NDARRAY(y);
-    if (ndy == NULL) {
-        CHECK_INPUT_AND_FREE(x, ndx);
-        return;
-    }
-
-    if (NDArray_DEVICE(ndx) == NDARRAY_DEVICE_CPU) {
-        rtn = NDArray_Map1ND(ndx, float_arctan2, ndy);
-    } else {
-#ifdef HAVE_CUBLAS
-        rtn = NDArrayMathGPU_ElementWise1N(ndx, cuda_float_arctan2, ndy);
-#else
-        zend_throw_error(NULL, "GPU operations unavailable. CUBLAS not detected.");
-#endif
-    }
-    CHECK_INPUT_AND_FREE(x, ndx);
-    CHECK_INPUT_AND_FREE(y, ndy);
-    ndarray_init_new_object(rtn, return_value);
+    (void)ndarray_arith_dispatch(NDARRAY_BINOP_ATAN2, x, y, return_value);
 }
 
 /**

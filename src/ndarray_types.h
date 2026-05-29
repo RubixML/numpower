@@ -73,6 +73,9 @@ uint16_t ndarray_double_to_fp16(double val);
    ndarray_fp128_t ndarray_fp128_arcsinh(ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_arccosh(ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_arctanh(ndarray_fp128_t a);
+   /* Two-argument arctangent — binary, so it has its own out-of-line
+      helper (the LIBM_WRAPPER macro only covers unary ops). */
+   ndarray_fp128_t ndarray_fp128_atan2  (ndarray_fp128_t a, ndarray_fp128_t b);
    /* Rounding — rintq/truncq/floorq/ceilq from libquadmath. */
    ndarray_fp128_t ndarray_fp128_rint   (ndarray_fp128_t a);
    ndarray_fp128_t ndarray_fp128_trunc  (ndarray_fp128_t a);
@@ -100,6 +103,7 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_ARCSINH(a)  ndarray_fp128_arcsinh(a)
 #  define NDARRAY_FP128_ARCCOSH(a)  ndarray_fp128_arccosh(a)
 #  define NDARRAY_FP128_ARCTANH(a)  ndarray_fp128_arctanh(a)
+#  define NDARRAY_FP128_ATAN2(a, b) ndarray_fp128_atan2((a), (b))
 #  define NDARRAY_FP128_RINT(a)     ndarray_fp128_rint(a)
 #  define NDARRAY_FP128_TRUNC(a)    ndarray_fp128_trunc(a)
 #  define NDARRAY_FP128_FLOOR(a)    ndarray_fp128_floor(a)
@@ -162,6 +166,8 @@ uint16_t ndarray_double_to_fp16(double val);
 #  define NDARRAY_FP128_ARCSINH(a)  ndarray_dd_from_double(asinh  (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_ARCCOSH(a)  ndarray_dd_from_double(acosh  (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_ARCTANH(a)  ndarray_dd_from_double(atanh  (ndarray_dd_to_double(a)))
+#  define NDARRAY_FP128_ATAN2(a, b) ndarray_dd_from_double(atan2(ndarray_dd_to_double(a), \
+                                                                 ndarray_dd_to_double(b)))
 #  define NDARRAY_FP128_RINT(a)     ndarray_dd_from_double(rint   (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_TRUNC(a)    ndarray_dd_from_double(trunc  (ndarray_dd_to_double(a)))
 #  define NDARRAY_FP128_FLOOR(a)    ndarray_dd_from_double(floor  (ndarray_dd_to_double(a)))

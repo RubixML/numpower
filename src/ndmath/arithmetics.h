@@ -91,6 +91,26 @@ NDArray* NDArray_TypedBinOp_CPU_Int(int opcode, NDArray* a, NDArray* b);
 
 NDArray* NDArray_Add(NDArray* a, NDArray* b);
 
+/* Sentinel "opcode" for the two-argument arctangent (atan2). It rides the
+   shared typed binary dispatch (`ndarray_promote_and_op` →
+   `NDArray_TypedBinOp_GPU` / the CPU float kernels) so atan2 reuses the same
+   device-migration, broadcasting, dtype-promotion, cast-back and leak
+   handling as +,-,*,/,**,% instead of duplicating it. The value sits above
+   `ZEND_VM_LAST_OPCODE` (210 on PHP 8.5) and well clear of the six real
+   arithmetic opcodes (ADD/SUB/MUL/DIV/MOD=1..5, POW=12) the dispatch also
+   handles, so it can never collide; it fits the `zend_uchar` opcode slot. */
+#define NDARRAY_BINOP_ATAN2 250
+
+/* Element-wise two-argument arctangent atan2(a, b) for the three float
+   compute dtypes. `ndarray_promote_and_op` promotes both operands to a
+   common float dtype (float32 / float64 / float128) before calling, so
+   these never see integer input. CPU-only — GPU residency is handled by
+   `NDArray_TypedBinOp_GPU`. Argument order follows NumPy: `arctan2(a, b)`
+   == C `atan2(a, b)` (a is the numerator, b the denominator). */
+NDArray* NDArray_Arctan2_Float(NDArray* a, NDArray* b);
+NDArray* NDArray_Arctan2_Double(NDArray* a, NDArray* b);
+NDArray* NDArray_Arctan2_Float128(NDArray* a, NDArray* b);
+
 /* ── Typed unary dispatch ────────────────────────────────────────────────────
    Element-wise unary operations dispatched across every supported dtype
    (`float4`..`float128`, `int8`..`uint64`) for both CPU and GPU residency.
