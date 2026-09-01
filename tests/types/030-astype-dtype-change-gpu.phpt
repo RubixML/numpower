@@ -8,13 +8,13 @@ NDArray::astype() on a GPU array keeps the array on GPU and converts values
    GPU and convert the values. Cast-back via ->cpu() to inspect values. */
 
 $cases = [
-    'float32'  => ['int32',  [1.5, 2.5, 3.5], [1, 2, 3]],
-    'int32'    => ['float64', [1, 2, 3],     [1.0, 2.0, 3.0]],
-    'float64'  => ['float32', [1.5, 2.5, 0.5], [1.5, 2.5, 0.5]],
-    'int32'    => ['int16',   [1, 2, 3],     [1, 2, 3]],
+    ['float32', 'int32',   [1.5, 2.5, 3.5], [1, 2, 3]],
+    ['int32',   'float64', [1, 2, 3],      [1.0, 2.0, 3.0]],
+    ['float64', 'float32', [1.5, 2.5, 0.5], [1.5, 2.5, 0.5]],
+    ['int32',   'int16',   [1, 2, 3],      [1, 2, 3]],
 ];
 
-foreach ($cases as $src => [$dst, $vals, $expect]) {
+foreach ($cases as [$src, $dst, $vals, $expect]) {
     $g = (new NDArray($vals, $src))->gpu();
     $r = $g->astype($dst);
     $on_gpu = $r->isGPU();
