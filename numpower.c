@@ -297,14 +297,14 @@ PHP_METHOD(NDArray, gpu) {
 #endif
 }
 
-ZEND_BEGIN_ARG_INFO(arginfo_settype, 0)
+ZEND_BEGIN_ARG_INFO(arginfo_setdtype, 0)
     ZEND_ARG_INFO(0, dtype)
 ZEND_END_ARG_INFO();
 /**
  * @brief Sets the data type of this NDArray in place.
  *
  * ```
- * setType(string $dtype): void
+ * setDataType(string $dtype): void
  * ```
  *
  * Re-casts the array to the requested dtype, releasing the previous
@@ -320,7 +320,7 @@ ZEND_END_ARG_INFO();
  *
  * @throws \Error If the dtype is unknown.
  */
-PHP_METHOD(NDArray, setType) {
+PHP_METHOD(NDArray, setDataType) {
     char *dtype;
     size_t dtypeLen = 0;
     zval *obj_zval = getThis();
@@ -364,6 +364,39 @@ PHP_METHOD(NDArray, setType) {
     if (prev) {
         NDArray_FREE(prev);
     }
+}
+
+ZEND_BEGIN_ARG_INFO(arginfo_datatype, 0)
+ZEND_END_ARG_INFO();
+/**
+ * @brief Returns the data type of this NDArray.
+ *
+ * ```
+ * dataType(): string
+ * ```
+ *
+ * One of the supported dtypes: float4, float8, float16, float32,
+ * float64, float128, int8, uint8, int16, uint16, int32, uint32,
+ * int64, uint64.
+ *
+ * Pair with `setDataType(string $dtype): void`.
+ */
+PHP_METHOD(NDArray, dataType) {
+    zval *obj_zval = getThis();
+
+    ZEND_PARSE_PARAMETERS_START(0, 0)
+    ZEND_PARSE_PARAMETERS_END();
+
+    NDArray *ndarray = NDArrayFactory_restoreFromZval(obj_zval);
+    if (ndarray == NULL) {
+        return;
+    }
+
+    /* NDArray_TYPE() points at a canonical static string from src/types.h
+       (e.g. "float32"); RETVAL_STRINGL copies the bytes into a fresh
+       PHP string zval so the descriptor's storage is not affected. */
+    const char *type = NDArray_TYPE(ndarray);
+    RETVAL_STRINGL(type, (size_t)strlen(type));
 }
 
 /**
@@ -7491,7 +7524,8 @@ static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, gpu, arginfo_gpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, cpu, arginfo_cpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, isGPU, arginfo_is_gpu, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, setType, arginfo_settype, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, setDataType, arginfo_setdtype, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, dataType, arginfo_datatype, ZEND_ACC_PUBLIC)
 
     ZEND_ME(NDArray, size, arginfo_size, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, count, arginfo_count, ZEND_ACC_PUBLIC)
