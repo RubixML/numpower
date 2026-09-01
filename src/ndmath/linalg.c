@@ -400,9 +400,11 @@ NDArray_Det(NDArray *a) {
                 efree(matrix);
                 return rtn;
             }
-            printf("Error in LU decomposition. Code: %d\n", info);
+            zend_throw_error(NULL, "LU decomposition failed (dgetrf info=%d)", info);
             efree(ipiv);
-            exit(1);
+            efree(matrix);
+            NDArray_FREE(rtn);
+            return NULL;
         }
 
         // Calculate determinant as product of diagonal elements
