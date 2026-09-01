@@ -3237,6 +3237,69 @@ extern "C" {
         if (cusolverH)  cusolverDnDestroy(cusolverH);
     }
 
+    /* Double-precision (float64) in-place inverse via cuSOLVER Dgetrf/Dgetrs.
+       Companion to cuda_matrix_float_inverse; the single-precision path
+       re-casts 8-byte double buffers as float* so it must not run against
+       float64 inputs. */
+    void cuda_matrix_double_inverse(double* matrix, int n) {
+        cusolverDnHandle_t cusolverH = NULL;
+        int *d_info = NULL;
+        int *d_pivot = NULL;
+        double *d_work = NULL;
+        double *d_identity = NULL;
+        int lwork = 0;
+        cusolverStatus_t cstat;
+
+        cstat = cusolverDnCreate(&cusolverH);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_double_inverse: cusolverDnCreate failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        vmalloc((void**) &d_info, sizeof(int));
+
+        cstat = cusolverDnDgetrf_bufferSize(cusolverH, n, n, matrix, n, &lwork);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_double_inverse: getrf_bufferSize failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        if (lwork > 0) {
+            vmalloc((void**) &d_work, (size_t) lwork * sizeof(double));
+        }
+        vmalloc((void**) &d_pivot, (size_t) n * sizeof(int));
+
+        cstat = cusolverDnDgetrf(cusolverH, n, n, matrix, n, d_work, d_pivot, d_info);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_double_inverse: LU decomposition failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+
+        vmalloc((void**) &d_identity, (size_t) n * (size_t) n * sizeof(double));
+        cudaMemset(d_identity, 0, (size_t) n * (size_t) n * sizeof(double));
+        {
+            double oned = 1.0;
+            for (int i = 0; i < n; ++i) {
+                cudaMemcpy(d_identity + i * n + i, &oned, sizeof(double),
+                           cudaMemcpyHostToDevice);
+            }
+        }
+
+        cstat = cusolverDnDgetrs(cusolverH, CUBLAS_OP_N, n, n, matrix, n,
+                                 d_pivot, d_identity, n, d_info);
+        if (cstat != CUSOLVER_STATUS_SUCCESS) {
+            fprintf(stderr, "cuda_matrix_double_inverse: triangular solve failed (status=%d)\n", (int)cstat);
+            goto cleanup;
+        }
+        cudaMemcpy(matrix, d_identity, (size_t) n * (size_t) n * sizeof(double),
+                   cudaMemcpyDeviceToHost);
+
+    cleanup:
+        if (d_identity) vfree(d_identity);
+        if (d_pivot)    vfree(d_pivot);
+        if (d_work)     vfree(d_work);
+        if (d_info)     vfree(d_info);
+        if (cusolverH)  cusolverDnDestroy(cusolverH);
+    }
+
     void cuda_matrix_eig_float(float* d_matrix, int n, float* d_eigvalues) {
         cusolverDnHandle_t handle = NULL;
         cusolverStatus_t status;

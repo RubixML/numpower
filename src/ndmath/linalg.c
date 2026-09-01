@@ -539,6 +539,47 @@ matrixFloatInverse(float* matrix, int n) {
 }
 
 /**
+ * Double-precision (float64) matrix inverse via LAPACK dgetrf/dgetri.
+ *
+ * Companion to matrixFloatInverse for float64 inputs. The float32 path
+ * re-casts double buffers as float* and runs single-precision LAPACK,
+ * which both misreads the 8-byte element layout and loses precision —
+ * so float64 arrays must take this branch instead.
+ *
+ * @param matrix
+ * @param n
+ * @return 1 if succeeded, 0 if failed
+ */
+int
+matrixDoubleInverse(double* matrix, int n) {
+    int* ipiv = (int*)emalloc(n * sizeof(int)); // Pivot indices
+    int info; // Status variable
+
+    // Perform LU factorization
+    dgetrf_(&n, &n, matrix, &n, ipiv, &info);
+    if (info != 0) {
+        zend_throw_error(NULL, "LU factorization failed. Unable to compute the matrix inverse.\n");
+        efree(ipiv);
+        return 0;
+    }
+
+    // Calculate the inverse. Workspace is heap-allocated: lwork = n*n can be
+    // megabytes for moderate matrices, and MSVC doesn't accept C99 VLAs anyway.
+    int lwork = n * n;
+    double *work_query = (double *)emalloc((size_t)lwork * sizeof(double));
+    dgetri_(&n, matrix, &n, ipiv, work_query, &lwork, &info);
+    if (info != 0) {
+        zend_throw_error(NULL, "Matrix inversion failed.\n");
+        efree(work_query);
+        efree(ipiv);
+        return 0;
+    }
+    efree(work_query);
+    efree(ipiv);
+    return 1;
+}
+
+/**
  *
  * @param matrix
  * @param n
@@ -622,17 +663,52 @@ NDArray_Inverse(NDArray* target) {
         return NULL;
     }
 
+    int n = NDArray_SHAPE(rtn)[0];
+    int is_double = is_type(NDArray_TYPE(rtn), NDARRAY_TYPE_FLOAT64);
+    int is_float64_compatible = is_double || is_type(NDArray_TYPE(rtn), NDARRAY_TYPE_FLOAT128);
+
     if (NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
-        // CPU INVERSE CALL
-        info = matrixFloatInverse(NDArray_F32DATA(rtn), NDArray_SHAPE(rtn)[0]);
-        if (!info) {
-            NDArray_FREE(rtn);
-            return NULL;
+        // CPU INVERSE CALL — dispatch on dtype so float64 (and float128, which
+        // downcasts) runs in double precision. The float32 path re-casts the
+        // 8-byte element buffers to float* and would silently misread the
+        // data, so it must not run against float64 inputs.
+        if (is_float64_compatible) {
+            if (!is_double) {
+                NDArray *f64 = NDArray_AsType(rtn, NDARRAY_TYPE_FLOAT64);
+                NDArray_FREE(rtn);
+                rtn = f64;
+            }
+            info = matrixDoubleInverse(NDArray_F64DATA(rtn), n);
+            if (!info) {
+                NDArray_FREE(rtn);
+                return NULL;
+            }
+        } else {
+            info = matrixFloatInverse(NDArray_F32DATA(rtn), n);
+            if (!info) {
+                NDArray_FREE(rtn);
+                return NULL;
+            }
         }
     } else {
-        // GPU INVERSE CALL
+        // GPU INVERSE CALL — dispatch on dtype so float64 uses the
+        // double-precision cuSOLVER path. float128 on GPU falls back to the
+        // float64 downcast path (the dd⇄fp128 conversion lives outside the
+        // GPU, so we compute in fp64 and leave the dtype as the result).
 #ifdef HAVE_CUBLAS
-        cuda_matrix_float_inverse(NDArray_F32DATA(rtn), NDArray_SHAPE(rtn)[0]);
+        if (is_float64_compatible) {
+            NDArray *f64 = rtn;
+            if (!is_double) {
+                f64 = NDArray_AsType(rtn, NDARRAY_TYPE_FLOAT64);
+                NDArray_FREE(rtn);
+                rtn = f64;
+            }
+            cuda_matrix_double_inverse(NDArray_F64DATA(rtn), n);
+        } else {
+            cuda_matrix_float_inverse(NDArray_F32DATA(rtn), n);
+        }
+#else
+        (void)is_float64_compatible;
 #endif
     }
 

@@ -2338,11 +2338,12 @@ NDArray_Load(char *filename) {
 NDArray *
 NDArray_AssignRawScalar(NDArray *dst, NDArray *src) {
     if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_CPU) {
-        NDArray_F32DATA(dst)[0] = NDArray_F32DATA(src)[0];
+        double val = ndarray_element_to_double(NDArray_TYPE(src), NDArray_DATA(src), 0);
+        ndarray_set_from_double(NDArray_TYPE(dst), NDArray_DATA(dst), 0, val);
     }
 #ifdef HAVE_CUBLAS
     if (NDArray_DEVICE(dst) == NDARRAY_DEVICE_GPU) {
-        vmemcpyd2d(NDArray_DATA(src), NDArray_DATA(dst), sizeof(float));
+        vmemcpyd2d(NDArray_DATA(src), NDArray_DATA(dst), (unsigned int)NDArray_ELSIZE(src));
     }
 #endif
     return dst;
@@ -2400,11 +2401,11 @@ raw_array_assign_array(int ndim, int const *shape,
             for (int i = 0; i < size; i++) {
                 if (device == NDARRAY_DEVICE_CPU) {
                     memcpy(dst_data + (int) (i * dst_strides_it[0]), src_data + (int) (i * src_strides_it[0]),
-                           sizeof(float));
+                           (size_t)dst_dtype->elsize);
                 }
                 if (device == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
-                    vmemcpyd2d(src_data + (int) (i * src_strides_it[0]), dst_data + (int) (i * dst_strides_it[0]), sizeof(float));
+                    vmemcpyd2d(src_data + (int) (i * src_strides_it[0]), dst_data + (int) (i * dst_strides_it[0]), (unsigned int)dst_dtype->elsize);
 #endif
                 }
             }

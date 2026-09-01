@@ -387,6 +387,38 @@ void CHECK_INPUT_AND_FREE(zval *a, NDArray *nda) {
 #endif
 }
 
+/**
+ * Release each element of a parsed input-arrays list in a borrow-safe way.
+ *
+ * ARRAY_OF_NDARRAYS() resolves each element to either an NDArray it owns (a
+ * raw array / scalar promoted to an NDArray, which the caller must free) or a
+ * reference to an NDArray already owned by a live PHP NDArray object (bought
+ * through buffer_get). The object-owned buffer slot is the single point of
+ * truth for the underlying memory; releasing the reference here via
+ * NDArray_FREE() drops the object's refcount to zero and frees memory that
+ * the object (and its buffer slot) still points at. The next operation on
+ * that object then reads freed memory — a heap use-after-free seen as
+ * corrupted shape/stride values in later calls.
+ *
+ * CHECK_INPUT_AND_FREE() handles exactly this split: free the NDArray only
+ * when the zval does not wrap a PHP NDArray object we were handed. This is
+ * the pattern used by every arithmetic path and by NumPower::append().
+ */
+static void release_borrowed_input_arrays(zval *arrays_zval, NDArray **ndarrays, int num_args)
+{
+    if (ndarrays == NULL || num_args <= 0) {
+        return;
+    }
+    int i = 0;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(arrays_zval), zval *val) {
+        if (i < num_args) {
+            CHECK_INPUT_AND_FREE(val, ndarrays[i]);
+        }
+        i++;
+    }
+    ZEND_HASH_FOREACH_END();
+}
+
 NDArray**
 ARRAY_OF_NDARRAYS(zval *array, int *size) {
     zval *val;
@@ -5409,9 +5441,7 @@ PHP_METHOD(NumPower, verticalStack) {
     if (ndarrays == NULL) return;
     rtn = NDArray_VSTACK(ndarrays, num_args);
 
-    for (int i = 0; i < num_args; i++) {
-        NDArray_FREE(ndarrays[i]);
-    }
+    release_borrowed_input_arrays(arrays, ndarrays, num_args);
     efree(ndarrays);
     ndarray_init_new_object(rtn, return_value);
 }
@@ -5433,9 +5463,7 @@ PHP_METHOD(NumPower, horizontalStack) {
     if (ndarrays == NULL) return;
     rtn = NDArray_HSTACK(ndarrays, num_args);
 
-    for (int i = 0; i < num_args; i++) {
-        NDArray_FREE(ndarrays[i]);
-    }
+    release_borrowed_input_arrays(arrays, ndarrays, num_args);
     efree(ndarrays);
     ndarray_init_new_object(rtn, return_value);
 }
@@ -5457,9 +5485,7 @@ PHP_METHOD(NumPower, depthStack) {
     if (ndarrays == NULL) return;
     rtn = NDArray_DSTACK(ndarrays, num_args);
 
-    for (int i = 0; i < num_args; i++) {
-        NDArray_FREE(ndarrays[i]);
-    }
+    release_borrowed_input_arrays(arrays, ndarrays, num_args);
     efree(ndarrays);
     ndarray_init_new_object(rtn, return_value);
 }
@@ -5481,9 +5507,7 @@ PHP_METHOD(NumPower, columnStack) {
     if (ndarrays == NULL) return;
     rtn = NDArray_ColumnStack(ndarrays, num_args);
 
-    for (int i = 0; i < num_args; i++) {
-        NDArray_FREE(ndarrays[i]);
-    }
+    release_borrowed_input_arrays(arrays, ndarrays, num_args);
     efree(ndarrays);
     ndarray_init_new_object(rtn, return_value);
 }
@@ -5518,9 +5542,7 @@ PHP_METHOD(NumPower, concatenate) {
         }
     }
 
-    for (int i = 0; i < num_args; i++) {
-        NDArray_FREE(ndarrays[i]);
-    }
+    release_borrowed_input_arrays(arrays, ndarrays, num_args);
     efree(ndarrays);
     ndarray_init_new_object(rtn, return_value);
 }
