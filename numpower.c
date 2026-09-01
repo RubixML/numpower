@@ -297,6 +297,55 @@ PHP_METHOD(NDArray, gpu) {
 #endif
 }
 
+ZEND_BEGIN_ARG_INFO(arginfo_astype, 0)
+    ZEND_ARG_INFO(0, dtype)
+ZEND_END_ARG_INFO();
+/**
+ * @brief Casts the NDArray to a new data type, returning a new NDArray.
+ *
+ * ```
+ * astype(string $dtype): NDArray
+ * ```
+ *
+ * The returned NDArray preserves the source device (CPU or GPU); the
+ * original array is left unchanged. The dtype is one of the supported
+ * types: float4, float8, float16, float32, float64, float128, int8, uint8,
+ * int16, uint16, int32, uint32, int64, uint64.
+ *
+ * @param dtype Target dtype alias.
+ *
+ * @throws \Error If the dtype is unknown.
+ */
+PHP_METHOD(NDArray, astype) {
+    char *dtype;
+    size_t dtypeLen = 0;
+    zval *obj_zval = getThis();
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(dtype, dtypeLen)
+    ZEND_PARSE_PARAMETERS_END();
+
+    NDArray *ndarray = NDArrayFactory_restoreFromZval(obj_zval);
+    if (ndarray == NULL) {
+        return;
+    }
+
+    const char *canonical = type_canonicalize(dtype);
+    if (canonical == NULL) {
+        zend_throw_error(NULL,
+            "Invalid data type '%s'. Supported: float4, float8, float16, "
+            "float32, float64, float128, int8, uint8, int16, uint16, "
+            "int32, uint32, int64, uint64", dtype);
+        return;
+    }
+
+    NDArray *rtn = NDArray_AsType(ndarray, canonical);
+    if (rtn == NULL) {
+        return;
+    }
+    ndarray_install_object(rtn, return_value);
+}
+
 /**
  * @brief Fills the NDArray with a specified value.
  *
@@ -7422,6 +7471,7 @@ static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, gpu, arginfo_gpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, cpu, arginfo_cpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, isGPU, arginfo_is_gpu, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, astype, arginfo_astype, ZEND_ACC_PUBLIC)
 
     ZEND_ME(NDArray, size, arginfo_size, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, count, arginfo_count, ZEND_ACC_PUBLIC)
