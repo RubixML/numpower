@@ -1306,12 +1306,31 @@ void RETURN_3NDARRAY(NDArray* array1, NDArray* array2, NDArray* array3, zval* re
  * @brief Intercept the built-in `print_r` to make NDArray-aware output
  *        available transparently.
  *
- * Locates the global `print_r` function entry, repoints its internal
- * handler at our `ZEND_FN(print_r_)` implementation, and renames the
- * entry to `print_r_` so users can still reach the original behaviour
- * through that name. Called from `PHP_RINIT_FUNCTION(ndarray)`; the
- * rename persists for the process lifetime (subsequent RINITs find
- * no `print_r` to rename and exit early).
+ * Locates the global `print_r` function entry and repoints its internal
+ * handler at our `ZEND_FN(print_r_)` implementation. Called from
+ * `PHP_RINIT_FUNCTION(ndarray)` on every request, but the mutation below
+ * must run exactly once per process — hence the `done` guard.
+ *
+ * `EG(function_table)` for internal (non-userland) functions is the
+ * same persistent, process-wide hash table on every request — it is
+ * never rebuilt per request. Renaming `functionEntry->common.function_name`
+ * only overwrites that *field*; it does **not** change the hash bucket's
+ * key, which stays `"print_r"`. So `zend_hash_find_ptr(..., "print_r")`
+ * keeps finding this same entry on every subsequent request — the old
+ * "subsequent RINITs find no print_r to rename and exit early" assumption
+ * was false, and unguarded re-entry here was a heap-corrupting bug:
+ * on request 1, `function_name` is the engine-interned `"print_r"`
+ * string, so releasing it is a safe no-op (`ZSTR_IS_INTERNED` short-
+ * circuits `zend_string_release_ex`). On request 2+, `function_name` is
+ * by then *our own* `"print_r_"` string — not interned, allocated with
+ * `persistent = 1` (raw `malloc`). Releasing it again via
+ * `zend_string_release_ex(name, 0)` takes the `efree()` branch instead
+ * of `free()` (see `zend_string_release_ex` in zend_string.h), handing
+ * a `malloc`-backed pointer to Zend's per-request memory manager —
+ * corrupting its heap and crashing (often on a later, unrelated
+ * allocation) with "zend_mm_heap corrupted". The `done` guard makes the
+ * rename fire exactly once, which is also what every comment here always
+ * assumed happened.
  *
  * Ownership of the new function-name string transfers to the
  * function-table entry. The engine's `zend_internal_function_dtor`
@@ -1330,6 +1349,12 @@ void RETURN_3NDARRAY(NDArray* array1, NDArray* array2, NDArray* array3, zval* re
  */
 void
 bypass_printr() {
+    static int done = 0;
+    if (done) {
+        return;
+    }
+    done = 1;
+
     zend_string *functionToRename = zend_string_init("print_r",
                                                        strlen("print_r"), 0);
     zend_function *functionEntry = zend_hash_find_ptr(EG(function_table),
