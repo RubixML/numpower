@@ -297,26 +297,30 @@ PHP_METHOD(NDArray, gpu) {
 #endif
 }
 
-ZEND_BEGIN_ARG_INFO(arginfo_astype, 1)
+ZEND_BEGIN_ARG_INFO(arginfo_settype, 0)
     ZEND_ARG_INFO(0, dtype)
 ZEND_END_ARG_INFO();
 /**
- * @brief Casts the NDArray to a new data type, returning a new NDArray.
+ * @brief Sets the data type of this NDArray in place.
  *
  * ```
- * astype(string $dtype): NDArray
+ * setType(string $dtype): void
  * ```
  *
- * The returned NDArray preserves the source device (CPU or GPU); the
- * original array is left unchanged. The dtype is one of the supported
- * types: float4, float8, float16, float32, float64, float128, int8, uint8,
- * int16, uint16, int32, uint32, int64, uint64.
+ * Re-casts the array to the requested dtype, releasing the previous
+ * storage (unless still referenced by a live slice). This method mutates
+ * `$this` and returns nothing, consistent with the other in-place method
+ * `fill()`. The device (CPU or GPU) is preserved. If the target dtype
+ * equals the current dtype, the call is a true no-op with no allocation.
+ *
+ * Supported dtypes: float4, float8, float16, float32, float64, float128,
+ * int8, uint8, int16, uint16, int32, uint32, int64, uint64.
  *
  * @param dtype Target dtype alias.
  *
  * @throws \Error If the dtype is unknown.
  */
-PHP_METHOD(NDArray, astype) {
+PHP_METHOD(NDArray, setType) {
     char *dtype;
     size_t dtypeLen = 0;
     zval *obj_zval = getThis();
@@ -339,11 +343,27 @@ PHP_METHOD(NDArray, astype) {
         return;
     }
 
-    NDArray *rtn = NDArray_AsType(ndarray, canonical);
-    if (rtn == NULL) {
+    /* Fast path: already this dtype — true no-op, no allocation, no swap. */
+    if (is_type(NDArray_TYPE(ndarray), canonical)) {
         return;
     }
-    ndarray_install_object(rtn, return_value);
+
+    /* NDArray_AsType always returns a fresh, caller-owned, unbuffered
+       NDArray; the source `ndarray` is left intact. We then swap the new
+       array into the same buffer slot (preserving the object's uuid) and
+       release the previous occupant. NDArray_FREE is refcount-aware: if a
+       live slice still references the old array, its data survives until
+       the last view is freed. */
+    NDArray *casted = NDArray_AsType(ndarray, canonical);
+    if (casted == NULL) {
+        return; /* Original NDArray remains untouched. */
+    }
+
+    int uuid = NDArray_UUID(ndarray);
+    NDArray *prev = buffer_replace(uuid, casted);
+    if (prev) {
+        NDArray_FREE(prev);
+    }
 }
 
 /**
@@ -7471,7 +7491,7 @@ static const zend_function_entry class_NDArray_methods[] = {
     ZEND_ME(NDArray, gpu, arginfo_gpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, cpu, arginfo_cpu, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, isGPU, arginfo_is_gpu, ZEND_ACC_PUBLIC)
-    ZEND_ME(NDArray, astype, arginfo_astype, ZEND_ACC_PUBLIC)
+    ZEND_ME(NDArray, setType, arginfo_settype, ZEND_ACC_PUBLIC)
 
     ZEND_ME(NDArray, size, arginfo_size, ZEND_ACC_PUBLIC)
     ZEND_ME(NDArray, count, arginfo_count, ZEND_ACC_PUBLIC)
