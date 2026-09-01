@@ -297,7 +297,7 @@ PHP_METHOD(NDArray, gpu) {
 #endif
 }
 
-ZEND_BEGIN_ARG_INFO(arginfo_astype, 0)
+ZEND_BEGIN_ARG_INFO(arginfo_astype, 1)
     ZEND_ARG_INFO(0, dtype)
 ZEND_END_ARG_INFO();
 /**
