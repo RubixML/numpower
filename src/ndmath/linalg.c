@@ -63,11 +63,60 @@ NDArray_FMatmul(NDArray *a, NDArray *b) {
     output_shape[0] = NDArray_SHAPE(a)[0];
     output_shape[1] = NDArray_SHAPE(b)[1];
 
-    NDArray* result = NDArray_Zeros(output_shape, 2, NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(a));
-
     int m = NDArray_SHAPE(a)[0];
     int k = NDArray_SHAPE(a)[1];
     int n = NDArray_SHAPE(b)[1];
+    char *type = NDArray_TYPE(a);
+
+    if (is_type(type, NDARRAY_TYPE_FLOAT64)) {
+        if (is_type(NDArray_TYPE(b), NDARRAY_TYPE_FLOAT64) == 0) {
+            zend_throw_error(NULL, "matmul requires both operands to have the same float dtype");
+            efree(output_shape);
+            return NULL;
+        }
+        NDArray* result = NDArray_Zeros(output_shape, 2, NDARRAY_TYPE_FLOAT64, NDArray_DEVICE(a));
+        if (result == NULL) {
+            efree(output_shape);
+            return NULL;
+        }
+        double alpha = 1.0;
+        double beta = 0.0;
+        if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
+#ifdef HAVE_CUBLAS
+            static cublasHandle_t handle = NULL;
+            static bool handle_initialized = false;
+
+            if (!handle_initialized) {
+                cublasCreate(&handle);
+                handle_initialized = true;
+            }
+
+            cublasDgemm(
+                handle,
+                CUBLAS_OP_N, CUBLAS_OP_N,
+                n, m, k,
+                &alpha,
+                NDArray_F64DATA(b), n,
+                NDArray_F64DATA(a), k,
+                &beta,
+                (double*)NDArray_F64DATA(result), n
+            );
+#endif
+        } else {
+            cblas_dgemm(
+                    CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    m, n, k,
+                    alpha,
+                    NDArray_F64DATA(a), k,
+                    NDArray_F64DATA(b), n,
+                    beta,
+                    NDArray_F64DATA(result), n
+            );
+        }
+        return result;
+    }
+
+    NDArray* result = NDArray_Zeros(output_shape, 2, NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(a));
 
     float alpha = 1.0f;
     float beta = 0.0f;
@@ -127,6 +176,17 @@ computeSVDFloat(float* A, int m, int n, float* U, float* S, float* V) {
 
 }
 
+void
+computeSVDDouble(double* A, int m, int n, double* U, double* S, double* V) {
+    int lda = n;
+    int ldu = m;
+    int ldvt = n;
+    int info = LAPACKE_dgesdd(LAPACK_ROW_MAJOR, 'S', m, n, A, lda, S, U, ldu, V, ldvt);
+    if (info > 0) {
+        printf("SVD computation failed.\n");
+    }
+}
+
 #ifdef HAVE_CUBLAS
 void
 computeSVDFloatGPU(float* A, int m, int n, float* U, float* S, float* V) {
@@ -142,11 +202,12 @@ NDArray_SVD(NDArray *target) {
     NDArray **rtns;
     NDArray *target_ptr = target;
     NDArray *rtn_s, *rtn_u, *rtn_v;
-    double *U, *S, *V;
+    double *Ud, *Sd, *Vd;
     float *output_data;
     float  *Uf, *Sf, *Vf;
     int *U_shape, *S_shape, *V_shape;
     int smallest_dim = -1;
+    int is_double = is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT64);
 
     if (NDArray_NDIM(target) == 1) {
         zend_throw_error(NULL, "Array must be at least two-dimensional");
@@ -164,36 +225,60 @@ NDArray_SVD(NDArray *target) {
             smallest_dim = NDArray_SHAPE(target_ptr)[i];
         }
     }
-    if(NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_GPU) {
-#ifdef HAVE_CUBLAS
-        target_ptr = NDArray_Transpose(target, NULL);
-        vmalloc((void**)&Sf, sizeof(float) * smallest_dim);
-        vmalloc((void**)&Uf, sizeof(float) * NDArray_SHAPE(target)[0] * NDArray_SHAPE(target)[0]);
-        vmalloc((void**)&Vf, sizeof(float) * NDArray_SHAPE(target)[1] * NDArray_SHAPE(target)[1]);
-        vmalloc((void**)&output_data, sizeof(float) * NDArray_NUMELEMENTS(target));
-        cudaMemcpy(output_data, NDArray_F32DATA(target_ptr), sizeof(float) * NDArray_NUMELEMENTS(target), cudaMemcpyDeviceToDevice);
-#else
-        return NULL;
-#endif
+
+    // Allocate scratch buffers for the chosen dtype. In the GPU float32
+    // path these live on-device (vmalloc); in the CPU path they are host.
+    char  *U_buf, *S_buf, *V_buf;
+    size_t U_elems = (size_t)NDArray_SHAPE(target)[0] * NDArray_SHAPE(target)[0];
+    size_t V_elems = (size_t)NDArray_SHAPE(target)[1] * NDArray_SHAPE(target)[1];
+    size_t S_elems = (size_t)smallest_dim;
+    size_t A_elems = NDArray_NUMELEMENTS(target);
+    if (is_double) {
+        size_t e = sizeof(double);
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_GPU) {
+            vmalloc((void**)&Ud, e * U_elems);
+            vmalloc((void**)&Sd, e * S_elems);
+            vmalloc((void**)&Vd, e * V_elems);
+        } else {
+            Ud = emalloc(e * U_elems);
+            Sd = emalloc(e * S_elems);
+            Vd = emalloc(e * V_elems);
+        }
+        U_buf = (char*)Ud; S_buf = (char*)Sd; V_buf = (char*)Vd;
     } else {
-        Sf = (float *) emalloc(sizeof(float) * smallest_dim);
-        Uf = (float *) emalloc(sizeof(float) * NDArray_SHAPE(target_ptr)[0] * NDArray_SHAPE(target_ptr)[0]);
-        Vf = (float *) emalloc(sizeof(float) * NDArray_SHAPE(target_ptr)[1] * NDArray_SHAPE(target_ptr)[1]);
-        output_data = emalloc(sizeof(float) * NDArray_NUMELEMENTS(target_ptr));
-        memcpy(output_data, NDArray_F32DATA(target_ptr), sizeof(float) * NDArray_NUMELEMENTS(target_ptr));
+        if (NDArray_DEVICE(target) == NDARRAY_DEVICE_GPU) {
+            vmalloc((void**)&Uf, sizeof(float) * U_elems);
+            vmalloc((void**)&Sf, sizeof(float) * S_elems);
+            vmalloc((void**)&Vf, sizeof(float) * V_elems);
+            vmalloc((void**)&output_data, sizeof(float) * A_elems);
+        } else {
+            Uf = emalloc(sizeof(float) * U_elems);
+            Sf = emalloc(sizeof(float) * S_elems);
+            Vf = emalloc(sizeof(float) * V_elems);
+            output_data = emalloc(sizeof(float) * A_elems);
+        }
+        U_buf = (char*)Uf; S_buf = (char*)Sf; V_buf = (char*)Vf;
     }
 
-    if(NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_GPU) {
+    if (is_double && NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
+        double *a_data = emalloc(sizeof(double) * A_elems);
+        memcpy(a_data, NDArray_F64DATA(target_ptr), sizeof(double) * A_elems);
+        computeSVDDouble(a_data, NDArray_SHAPE(target_ptr)[0], NDArray_SHAPE(target_ptr)[1], Ud, Sd, Vd);
+        efree(a_data);
+    } else if (NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
+        target_ptr = NDArray_Transpose(target, NULL);
+        cudaMemcpy(output_data, NDArray_F32DATA(target_ptr), sizeof(float) * A_elems, cudaMemcpyDeviceToDevice);
         computeSVDFloatGPU(output_data, NDArray_SHAPE(target)[0], NDArray_SHAPE(target)[1], Uf, Sf, Vf);
 #else
         return NULL;
 #endif
     } else {
+        memcpy(output_data, NDArray_F32DATA(target_ptr), sizeof(float) * A_elems);
         computeSVDFloat((float *) output_data, NDArray_SHAPE(target_ptr)[0], NDArray_SHAPE(target_ptr)[1], Uf, Sf, Vf);
     }
 
-    if(NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_CPU) {
+    if (NDArray_DEVICE(target_ptr) == NDARRAY_DEVICE_CPU && !is_double) {
         efree(output_data);
     }
     U_shape = emalloc(sizeof(int) * NDArray_NDIM(target_ptr));
@@ -211,15 +296,9 @@ NDArray_SVD(NDArray *target) {
     rtn_s = Create_NDArray(S_shape, 1, NDArray_TYPE(target_ptr), NDArray_DEVICE(target_ptr));
     rtn_v = Create_NDArray(V_shape, NDArray_NDIM(target_ptr), NDArray_TYPE(target_ptr), NDArray_DEVICE(target_ptr));
 
-    if(is_type(NDArray_TYPE(target_ptr), NDARRAY_TYPE_FLOAT64)) {
-        rtn_u->data = (char *) U;
-        rtn_s->data = (char *) S;
-        rtn_v->data = (char *) V;
-    } else {
-        rtn_u->data = (char *) Uf;
-        rtn_s->data = (char *) Sf;
-        rtn_v->data = (char *) Vf;
-    }
+    rtn_u->data = U_buf;
+    rtn_s->data = S_buf;
+    rtn_v->data = V_buf;
 
     rtns[0] = rtn_u;
     rtns[1] = rtn_s;
@@ -284,13 +363,64 @@ NDArray_Matmul(NDArray *a, NDArray *b) {
 NDArray*
 NDArray_Det(NDArray *a) {
     int *new_shape = emalloc(sizeof(int));
-    NDArray *rtn = Create_NDArray(new_shape, 0, NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(a));
+    char *type = NDArray_TYPE(a);
+    int is_double = is_type(type, NDARRAY_TYPE_FLOAT64);
+    /* The determinant of a float64 matrix is a float64; of a float32 matrix,
+       a float32. Preserve the source dtype so downstream consumers (and the
+       PHP scalar produced by __toString) see the right width. */
+    const char *result_type = is_double ? NDARRAY_TYPE_FLOAT64 : NDARRAY_TYPE_FLOAT32;
+    NDArray *rtn = Create_NDArray(new_shape, 0, result_type, NDArray_DEVICE(a));
     if (NDArray_DEVICE(a) == NDARRAY_DEVICE_GPU) {
 #ifdef HAVE_CUBLAS
         rtn->device = NDARRAY_DEVICE_GPU;
-        vmalloc((void **)&rtn->data, sizeof(float));
-        cuda_det_float(NDArray_F32DATA(a), NDArray_F32DATA(rtn), NDArray_SHAPE(a)[0]);
+        if (is_double) {
+            vmalloc((void **)&rtn->data, sizeof(double));
+            cuda_det_double(NDArray_F64DATA(a), NDArray_F64DATA(rtn), NDArray_SHAPE(a)[0]);
+        } else {
+            vmalloc((void **)&rtn->data, sizeof(float));
+            cuda_det_float(NDArray_F32DATA(a), NDArray_F32DATA(rtn), NDArray_SHAPE(a)[0]);
+        }
+#else
+        return NULL;
 #endif
+    } else if (is_double) {
+        int info;
+        int N = NDArray_SHAPE(a)[0];
+        int* ipiv = (int*) emalloc(N * sizeof(int));
+        double *matrix = emalloc(sizeof(double) * NDArray_NUMELEMENTS(a));
+        rtn->data = emalloc(sizeof(double));
+        memcpy(matrix, NDArray_F64DATA(a), sizeof(double) * NDArray_NUMELEMENTS(a));
+        // LU Decomposition using LAPACKE interface
+        dgetrf_(&N, &N, matrix, &N, ipiv, &info);
+
+        if (info != 0) {
+            if (info > 0) {
+                NDArray_F64DATA(rtn)[0] = 0.0;
+                efree(ipiv);
+                efree(matrix);
+                return rtn;
+            }
+            printf("Error in LU decomposition. Code: %d\n", info);
+            efree(ipiv);
+            exit(1);
+        }
+
+        // Calculate determinant as product of diagonal elements
+        double det = 1.0;
+        for (int i = 0; i < N; i++) {
+            det *= matrix[i* N + i];
+        }
+
+        // Account for the parity of the permutation
+        int num_perm = 0;
+        for (int i = 0; i < N; i++) {
+            if (i + 1 != ipiv[i]) num_perm++;
+        }
+        if (num_perm % 2 != 0) det = -det;
+
+        efree(ipiv);
+        efree(matrix);
+        NDArray_F64DATA(rtn)[0] = det;
     } else {
         int info;
         int N = NDArray_SHAPE(a)[0];
@@ -641,6 +771,73 @@ matrixFloatLU(float* matrix, int n, float *p, float *l, float *u) {
 }
 
 /**
+ * Double-precision (float64) LU with partial pivoting. Companion to
+ * matrixFloatLU for float64 inputs.
+ *
+ * @param matrix   (in)  input matrix, row-major, n x n
+ * @param n        size of the square matrix
+ * @param p        (out) permutation matrix
+ * @param l        (out) unit lower-triangular factor
+ * @param u        (out) upper-triangular factor
+ * @return 1
+ */
+int
+matrixDoubleLU(double* matrix, int n, double *p, double *l, double *u) {
+    int i, j, k, maxIndex;
+    double maxVal, tempVal;
+
+    // Initialize L, U, and P matrices
+    for (i = 0; i < n; i++) {
+        for (j = 0; j < n; j++) {
+            if (i == j) {
+                l[i * n + j] = 1.0;
+                u[i * n + j] = matrix[i * n + j];
+            } else {
+                l[i * n + j] = 0.0;
+                u[i * n + j] = matrix[i * n + j];
+            }
+            p[i * n + j] = (i == j) ? 1.0 : 0.0;
+        }
+    }
+
+    // Perform LU decomposition with partial pivoting
+    for (k = 0; k < n - 1; k++) {
+        maxIndex = k;
+        maxVal = u[k * n + k];
+
+        // Find the row with the maximum value in the current column
+        for (i = k + 1; i < n; i++) {
+            if (u[i * n + k] > maxVal) {
+                maxIndex = i;
+                maxVal = u[i * n + k];
+            }
+        }
+
+        // Swap rows in U matrix
+        if (maxIndex != k) {
+            for (j = 0; j < n; j++) {
+                tempVal = u[k * n + j];
+                u[k * n + j] = u[maxIndex * n + j];
+                u[maxIndex * n + j] = tempVal;
+
+                tempVal = p[k * n + j];
+                p[k * n + j] = p[maxIndex * n + j];
+                p[maxIndex * n + j] = tempVal;
+            }
+        }
+
+        // Perform elimination in U matrix and store multipliers in L matrix
+        for (i = k + 1; i < n; i++) {
+            l[i * n + k] = u[i * n + k] / u[k * n + k];
+            for (j = k; j < n; j++) {
+                u[i * n + j] -= l[i * n + k] * u[k * n + j];
+            }
+        }
+    }
+    return 1;
+}
+
+/**
  * Calculate the inverse of a square NDArray
  *
  * @param target
@@ -733,6 +930,8 @@ NDArray_LU(NDArray* target) {
     }
     NDArray **rtns = emalloc(sizeof(NDArray*) * 3);
     int info;
+    int is_double = is_type(NDArray_TYPE(target), NDARRAY_TYPE_FLOAT64);
+    const char *factor_type = is_double ? NDARRAY_TYPE_FLOAT64 : NDARRAY_TYPE_FLOAT32;
     int *new_shape_p = emalloc(sizeof(int) * NDArray_NDIM(target));
     int *new_shape_l = emalloc(sizeof(int) * NDArray_NDIM(target));
     int *new_shape_u = emalloc(sizeof(int) * NDArray_NDIM(target));
@@ -740,17 +939,25 @@ NDArray_LU(NDArray* target) {
     memcpy(new_shape_l, NDArray_SHAPE(target), sizeof(int) * (int)NDArray_NDIM(target));
     memcpy(new_shape_u, NDArray_SHAPE(target), sizeof(int) * (int)NDArray_NDIM(target));
     NDArray *copied = NDArray_Copy(target, NDArray_DEVICE(target));
-    NDArray *p = NDArray_Empty(new_shape_p, NDArray_NDIM(target), NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(target));
-    NDArray *l = NDArray_Empty(new_shape_l, NDArray_NDIM(target), NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(target));
-    NDArray *u = NDArray_Empty(new_shape_u, NDArray_NDIM(target), NDARRAY_TYPE_FLOAT32, NDArray_DEVICE(target));
+    NDArray *p = NDArray_Empty(new_shape_p, NDArray_NDIM(target), factor_type, NDArray_DEVICE(target));
+    NDArray *l = NDArray_Empty(new_shape_l, NDArray_NDIM(target), factor_type, NDArray_DEVICE(target));
+    NDArray *u = NDArray_Empty(new_shape_u, NDArray_NDIM(target), factor_type, NDArray_DEVICE(target));
 
     if (NDArray_DEVICE(target) == NDARRAY_DEVICE_CPU) {
         // CPU INVERSE CALL
-        info = matrixFloatLU(NDArray_F32DATA(copied),
-                             NDArray_SHAPE(copied)[0],
-                             NDArray_F32DATA(p),
-                             NDArray_F32DATA(l),
-                             NDArray_F32DATA(u));
+        if (is_double) {
+            info = matrixDoubleLU(NDArray_F64DATA(copied),
+                                  NDArray_SHAPE(copied)[0],
+                                  NDArray_F64DATA(p),
+                                  NDArray_F64DATA(l),
+                                  NDArray_F64DATA(u));
+        } else {
+            info = matrixFloatLU(NDArray_F32DATA(copied),
+                                 NDArray_SHAPE(copied)[0],
+                                 NDArray_F32DATA(p),
+                                 NDArray_F32DATA(l),
+                                 NDArray_F32DATA(u));
+        }
         if (!info) {
             NDArray_FREE(copied);
             return NULL;
@@ -758,7 +965,11 @@ NDArray_LU(NDArray* target) {
     } else {
         // GPU INVERSE CALL
 #ifdef HAVE_CUBLAS
-        cuda_float_lu(NDArray_F32DATA(copied), NDArray_F32DATA(l), NDArray_F32DATA(u), NDArray_F32DATA(p), NDArray_SHAPE(copied)[0]);
+        if (is_double) {
+            cuda_double_lu(NDArray_F64DATA(copied), NDArray_F64DATA(l), NDArray_F64DATA(u), NDArray_F64DATA(p), NDArray_SHAPE(copied)[0]);
+        } else {
+            cuda_float_lu(NDArray_F32DATA(copied), NDArray_F32DATA(l), NDArray_F32DATA(u), NDArray_F32DATA(p), NDArray_SHAPE(copied)[0]);
+        }
 #endif
     }
     NDArray_FREE(copied);
@@ -879,16 +1090,30 @@ NDArray_Trace(NDArray *a) {
 
 int
 computeEigenvaluesAndEigenvectorsFloat(NDArray* array, NDArray* rightEigenvectors,
-                                       NDArray* eigenvalues, NDArray *wivectors, NDArray *leftEigenvectors) {
+                                        NDArray* eigenvalues, NDArray *wivectors, NDArray *leftEigenvectors) {
     // Assuming 'array' contains the input square matrix
     int n = array->dimensions[0]; // Size of the square matrix
 
     // Compute eigenvalues and right eigenvectors using LAPACK function
     int info = LAPACKE_sgeev(LAPACK_ROW_MAJOR, 'N', 'V', n, NDArray_F32DATA(array), n,
-                             NDArray_F32DATA(rightEigenvectors), NDArray_F32DATA(wivectors), NDArray_F32DATA(leftEigenvectors),
-                             n, NDArray_F32DATA(eigenvalues), n);
+                              NDArray_F32DATA(rightEigenvectors), NDArray_F32DATA(wivectors), NDArray_F32DATA(leftEigenvectors),
+                              n, NDArray_F32DATA(eigenvalues), n);
 
     // Check if the computation was successful (info == 0)
+    if (info != 0) {
+        zend_throw_error(NULL, "Error computing eigenvalues and eigenvectors.\n");
+        return 0;
+    }
+    return 1;
+}
+
+int
+computeEigenvaluesAndEigenvectorsDouble(NDArray* array, NDArray* rightEigenvectors,
+                                        NDArray* eigenvalues, NDArray *wivectors, NDArray *leftEigenvectors) {
+    int n = array->dimensions[0];
+    int info = LAPACKE_dgeev(LAPACK_ROW_MAJOR, 'N', 'V', n, NDArray_F64DATA(array), n,
+                              NDArray_F64DATA(rightEigenvectors), NDArray_F64DATA(wivectors), NDArray_F64DATA(leftEigenvectors),
+                              n, NDArray_F64DATA(eigenvalues), n);
     if (info != 0) {
         zend_throw_error(NULL, "Error computing eigenvalues and eigenvectors.\n");
         return 0;
@@ -916,7 +1141,24 @@ NDArray_Eig(NDArray *a) {
     rightEigenvectors_shape[0] = NDArray_SHAPE(a)[0];
 
     rightEigenvectors = NDArray_Zeros(rightEigenvectors_shape, 1, NDArray_TYPE(a), NDArray_DEVICE(a));
-    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
+    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU && is_type(NDArray_TYPE(a), NDARRAY_TYPE_FLOAT64)) {
+        wivectors_shape = emalloc(sizeof(int));
+        leftEigenvectors_shape = emalloc(sizeof(int));
+        eigenvalues_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
+        wivectors_shape[0] = NDArray_SHAPE(a)[0];
+        eigenvalues_shape[0] = NDArray_SHAPE(a)[0];
+        eigenvalues_shape[1] = NDArray_SHAPE(a)[0];
+        leftEigenvectors_shape[0] = NDArray_SHAPE(a)[0];
+        eigenvalues = NDArray_Zeros(eigenvalues_shape, NDArray_NDIM(a), NDArray_TYPE(a), NDArray_DEVICE(a));
+        wivectors = NDArray_Zeros(wivectors_shape, 1, NDArray_TYPE(a), NDArray_DEVICE(a));
+        leftEigenvectors = NDArray_Zeros(leftEigenvectors_shape, 1, NDArray_TYPE(a), NDArray_DEVICE(a));
+        if (!computeEigenvaluesAndEigenvectorsDouble(a, rightEigenvectors, eigenvalues, wivectors, leftEigenvectors)) {
+            efree(rtn);
+            return NULL;
+        }
+        NDArray_FREE(leftEigenvectors);
+        NDArray_FREE(wivectors);
+    } else if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
         wivectors_shape = emalloc(sizeof(int));
         leftEigenvectors_shape = emalloc(sizeof(int));
         eigenvalues_shape = emalloc(sizeof(int) * NDArray_NDIM(a));
@@ -969,6 +1211,12 @@ NDArray_Lstsq(NDArray *a, NDArray *b) {
         return NULL;
     }
 
+    int is_double = is_type(NDArray_TYPE(a), NDARRAY_TYPE_FLOAT64);
+    if (is_type(NDArray_TYPE(b), NDARRAY_TYPE_FLOAT64) != is_double) {
+        zend_throw_error(NULL, "ndarray::lstsq requires both arrays to have matching float dtypes (both float32 or both float64)");
+        return NULL;
+    }
+
     int m = a->dimensions[0]; // Number of rows of the coefficient matrix A
     int n = a->dimensions[1]; // Number of columns of the coefficient matrix A
     int nrhs = b->dimensions[1]; // Number of right-hand sides (columns of B)
@@ -976,8 +1224,29 @@ NDArray_Lstsq(NDArray *a, NDArray *b) {
     int *out_shape = (int*)emalloc(2 * sizeof(int));
     out_shape[0] = n;
     out_shape[1] = nrhs;
-    NDArray *x = NDArray_Zeros(out_shape, 2, NDArray_TYPE(a), NDArray_DEVICE(a));
-    if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
+    NDArray *x = NDArray_Zeros(out_shape, 2, is_double ? NDARRAY_TYPE_FLOAT64 : NDArray_TYPE(a), NDArray_DEVICE(a));
+    if (is_double) {
+        double *a_data = (double *) emalloc((size_t)m * n * sizeof(double));
+        memcpy(a_data, a->data, (size_t)m * n * sizeof(double));
+        double *b_data = (double *) emalloc((size_t)m * nrhs * sizeof(double));
+        memcpy(b_data, b->data, (size_t)m * nrhs * sizeof(double));
+
+        int info = LAPACKE_dgels(LAPACK_ROW_MAJOR, 'N', NDArray_SHAPE(a)[0], NDArray_SHAPE(a)[1], NDArray_SHAPE(b)[1],
+                                 a_data,
+                                 NDArray_SHAPE(a)[1], b_data, NDArray_SHAPE(b)[1]);
+
+        if (info > 0) {
+            zend_throw_error(NULL,
+                             "The diagonal element %i of the triangular factor of $a is zero, so that $a does not have full rank.",
+                             info);
+            efree(a_data);
+            efree(b_data);
+            return NULL;
+        }
+        memcpy(NDArray_F64DATA(x), b_data, (size_t)n * nrhs * sizeof(double));
+        efree(a_data);
+        efree(b_data);
+    } else if (NDArray_DEVICE(a) == NDARRAY_DEVICE_CPU) {
         // Allocate memory and copy data for the coefficient matrix A
         float *a_data = (float *) emalloc(m * n * sizeof(float));
         memcpy(a_data, a->data, m * n * sizeof(float));
@@ -994,6 +1263,8 @@ NDArray_Lstsq(NDArray *a, NDArray *b) {
             zend_throw_error(NULL,
                              "The diagonal element %i of the triangular factor of $a is zero, so that $a does not have full rank.",
                              info);
+            efree(a_data);
+            efree(b_data);
             return NULL;
         }
         // Copy the result data to the output NDArray
@@ -1115,10 +1386,44 @@ NDArray_Solve(NDArray *a, NDArray *b) {
 
     int n = a->dimensions[0]; // Number of rows/columns of the square matrix A
 
+    int is_double = is_type(NDArray_TYPE(a), NDARRAY_TYPE_FLOAT64);
+
     int *x_dimensions = (int*)emalloc(2 * sizeof(int));
     x_dimensions[0] = n;
     x_dimensions[1] = b->dimensions[1];
-    NDArray *x = NDArray_Zeros(x_dimensions, 2, NDArray_TYPE(a), NDArray_DEVICE(a));
+    NDArray *x = NDArray_Zeros(x_dimensions, 2, is_double ? NDARRAY_TYPE_FLOAT64 : NDArray_TYPE(a), NDArray_DEVICE(a));
+
+    if (is_double) {
+        double* a_data = (double*)emalloc((size_t)n * n * sizeof(double));
+        memcpy(a_data, a->data, (size_t)n * n * sizeof(double));
+
+        double* b_data = (double*)emalloc((size_t)n * x->dimensions[1] * sizeof(double));
+        memcpy(b_data, b->data, (size_t)n * x->dimensions[1] * sizeof(double));
+
+        int* ipiv = (int*)emalloc(n * sizeof(int));
+
+        /* Row-major convention: lda (leading dim of row-major A) = number of
+           columns of row-major A = n (A is square). ldb (leading dim of
+           row-major B) = number of columns of row-major B = nrhs. Passing
+           ldb=n (the number of rows) is the classic bug that produces a
+           silently-wrong first element — see regression tests. */
+        int nrhs = x->dimensions[1];
+        int info = LAPACKE_dgesv(LAPACK_ROW_MAJOR, n, nrhs, a_data, n, ipiv, b_data, nrhs);
+        if (info != 0) {
+            zend_throw_error(NULL, "Solving linear system failed (LAPACKE_dgesv info=%d); is $a singular?", info);
+            efree(a_data);
+            efree(b_data);
+            efree(ipiv);
+            return NULL;
+        }
+
+        memcpy(x->data, b_data, (size_t)NDArray_NUMELEMENTS(b) * sizeof(double));
+
+        efree(a_data);
+        efree(b_data);
+        efree(ipiv);
+        return x;
+    }
 
     // Allocate memory and copy data for the square matrix A
     float* a_data = (float*)emalloc(n * n * sizeof(float));
@@ -1131,7 +1436,15 @@ NDArray_Solve(NDArray *a, NDArray *b) {
     // Allocate memory for the pivot indices
     int* ipiv = (int*)emalloc(n * sizeof(int));
 
-    LAPACKE_sgesv(LAPACK_ROW_MAJOR, n, NDArray_SHAPE(b)[1], a_data, NDArray_SHAPE(a)[0], ipiv, b_data, NDArray_SHAPE(b)[0]);
+    int nrhs = x->dimensions[1];
+    int info = LAPACKE_sgesv(LAPACK_ROW_MAJOR, n, nrhs, a_data, n, ipiv, b_data, nrhs);
+    if (info != 0) {
+        zend_throw_error(NULL, "Solving linear system failed (LAPACKE_sgesv info=%d); is $a singular?", info);
+        efree(a_data);
+        efree(b_data);
+        efree(ipiv);
+        return NULL;
+    }
 
     // Copy the result data to the output NDArray
     memcpy(x->data, b_data, NDArray_NUMELEMENTS(b) * sizeof(float));

@@ -3114,6 +3114,49 @@ extern "C" {
         luFloatDecompositionKernel<<<gridSize, blockSize>>>(matrix, L, U, P, size);
     }
 
+    /* Double-precision LU decomposition for GPU. The float path uses a
+       bespoke block-LU kernel that has not been ported to double; rather
+       than maintain a second CUDA kernel (untestable in CPU-only builds),
+       we factor on the host with the exact same algorithm the CPU double
+       path uses (matrixDoubleLU) and memcpy the L/U/P factors back to the
+       caller's device buffers. The inputs are device pointers, so we stage
+       them through a host copy first. This yields byte-identical L/U/P
+       values to the CPU path, which is what NDArray_LU's callers expect. */
+    void
+    cuda_double_lu(double *matrix, double *L, double *U, double *P, int size) {
+        double *h_matrix = (double *)malloc((size_t)size * size * sizeof(double));
+        double *h_l      = (double *)malloc((size_t)size * size * sizeof(double));
+        double *h_u      = (double *)malloc((size_t)size * size * sizeof(double));
+        double *h_p      = (double *)malloc((size_t)size * size * sizeof(double));
+        if (!h_matrix || !h_l || !h_u || !h_p) {
+            free(h_matrix); free(h_l); free(h_u); free(h_p);
+            fprintf(stderr, "cuda_double_lu: host staging allocation failed\n");
+            return;
+        }
+
+        cudaError_t cerr = cudaMemcpy(h_matrix, matrix, (size_t)size * size * sizeof(double), cudaMemcpyDeviceToHost);
+        if (cerr != cudaSuccess) {
+            free(h_matrix); free(h_l); free(h_u); free(h_p);
+            return;
+        }
+
+        int ok = 0;
+#ifdef __cplusplus
+        extern "C" int matrixDoubleLU(double *matrix, int n, double *p, double *l, double *u);
+#else
+        int matrixDoubleLU(double *matrix, int n, double *p, double *l, double *u);
+#endif
+        ok = matrixDoubleLU(h_matrix, size, h_p, h_l, h_u);
+
+        if (ok) {
+            cudaMemcpy(L, h_l, (size_t)size * size * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(U, h_u, (size_t)size * size * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(P, h_p, (size_t)size * size * sizeof(double), cudaMemcpyHostToDevice);
+        }
+
+        free(h_matrix); free(h_l); free(h_u); free(h_p);
+    }
+
     void
     cuda_matrix_float_l1norm(float *target, float *rtn, int rows, int cols) {
         int threadsPerBlock = 256;
