@@ -14,16 +14,25 @@ NDArray::setDataType() mutates dtype in place; dataType() returns current type
      - return the current dtype as a string (e.g. 'float32')
      - reflect the immediately-preceding setDataType() call */
 
-/* 1. float32 -> int32: values truncate, elements become ints */
+/* 1. float32 -> int32: values truncate, elements become ints;
+      in-place: same PHP object identity, alias observes the change */
 $a = new NDArray([1.5, 2.5, 3.7], 'float32');
+$aliasA = $a;                                /* alias must share the object */
+$idA = spl_object_id($a);
 $pre = $a->dataType();
 $ret = $a->setDataType('int32');
 $php = $a->toArray();
 $post = $a->dataType();
+$aliasOK = (spl_object_id($aliasA) === $idA)
+    && ($aliasA->dataType() === 'int32')
+    && ($aliasA->toArray() === [1, 2, 3])
+    && (array_map('gettype', $aliasA->toArray()) === ['integer','integer','integer']);
 $ok = ($pre === 'float32') && $post === 'int32'
+     && (spl_object_id($a) === $idA)         /* same PHP object after setDataType */
      && ($ret === null) && $php === [1, 2, 3]
      && array_map('gettype', $php) === ['integer', 'integer', 'integer']
-     && !$a->isGPU();
+     && !$a->isGPU()
+     && $aliasOK;
 echo "float32->int32: pre=$pre post=$post ret=", ($ret === null ? 'null' : 'non-null'),
      " values=", json_encode($php),
      " ok=", ($ok ? 'OK' : 'BAD'), "\n";
@@ -44,12 +53,14 @@ echo "int32->float64: pre=$before post=$after",
 
 /* 3. unknown dtype throws; dataType() and values unchanged */
 $c = new NDArray([1.0, 2.0], 'float64');
+$idC = spl_object_id($c);
 $beforeType = $c->dataType();
 $beforeVals = $c->toArray();
 $threw = false; $tclass = '';
 try { $c->setDataType('badtype'); }
 catch (Throwable $t) { $threw = true; $tclass = get_class($t); }
 $ok = $threw
+     && (spl_object_id($c) === $idC)         /* object NOT replaced on throw */
      && $c->dataType() === $beforeType
      && $c->toArray() === $beforeVals
      && array_map('gettype', $c->toArray()) === ['double', 'double'];
@@ -59,8 +70,10 @@ echo "badtype: threw=", $tclass, " pre=$beforeType post=", $c->dataType(),
 
 /* 4. same-dtype cast is a true no-op: dtype and values unchanged */
 $d = new NDArray([4, 5, 6], 'int32');
+$idD = spl_object_id($d);
 $d->setDataType('int32');
-$ok = $d->dataType() === 'int32'
+$ok = (spl_object_id($d) === $idD)           /* no-op must not replace object */
+     && $d->dataType() === 'int32'
      && $d->toArray() === [4, 5, 6]
      && array_map('gettype', $d->toArray()) === ['integer','integer','integer']
      && !$d->isGPU();
