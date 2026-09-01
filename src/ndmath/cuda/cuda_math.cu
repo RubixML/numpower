@@ -3333,7 +3333,7 @@ extern "C" {
             goto cleanup;
         }
         cudaMemcpy(matrix, d_identity, (size_t) n * (size_t) n * sizeof(double),
-                   cudaMemcpyDeviceToHost);
+                   cudaMemcpyDeviceToDevice);
 
     cleanup:
         if (d_identity) vfree(d_identity);
