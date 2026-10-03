@@ -321,3 +321,16 @@ $xCpu = $x->cpu();
 ```
 
 > **Heads up:** every operation works on arrays that live on the *same* device. Adding a CPU array to a GPU array throws an exception — copy one of them across with `->cpu()` or `->gpu()` first.
+
+## Changing datatypes at runtime
+
+```php
+$x = new NDArray([1.5, 2.5, 3.5], 'float32');
+
+$x->cast('float16');                      // converts $x in place (alias: toDataType())
+echo $x->dataType();                      // "float16"
+
+$y = NumPower::copy($x)->cast('int32');   // cast a copy to keep the original
+```
+
+`cast()` returns `$this`, so it can be chained. `setDataType()` does the same conversion but returns nothing.
