@@ -48,3 +48,5 @@ tensor
 test_img.jpg
 composer.lock
 vendor
+docker
+docker-compose.yml
