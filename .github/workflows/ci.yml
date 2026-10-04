@@ -125,8 +125,11 @@ jobs:
           if-no-files-found: ignore
 
   # =========================================================================
-  # macOS matrix: macos-14 / macos-15 (both Apple Silicon ARM64) × PHP 8.1–8.5.
+  # macOS matrix: macos-15 / macos-26 (both Apple Silicon ARM64) × PHP 8.1–8.5.
   # 10 combinations. CPU only — CUDA is not available on macOS.
+  # macos-14 was dropped: Homebrew no longer supports macOS 14, so
+  # setup-php builds PHP from source for ~35 min and then fails
+  # (shivammathur/setup-php#1125).
   #
   # Apple clang on ARM64 falls through the long-double fallback in
   # src/ndarray_types.h (no __float128, no libquadmath). The HAVE_AVX2 macro
@@ -140,7 +143,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:  [macos-14, macos-15]
+        os:  [macos-15, macos-26]
         php: ['8.1', '8.2', '8.3', '8.4', '8.5']
 
     steps:
@@ -233,11 +236,37 @@ jobs:
           arch: x64
           ts: nts
 
+      # windows-2025 now ships only Visual Studio 2026 (MSVC 14.5x), and
+      # setup-php-sdk picks that toolset. The official PHP 8.4/8.5 Windows
+      # builds are linked with MSVC 14.44, and PHP refuses to load an
+      # extension linked with a different 14.xx ("linked with 14.51, but the
+      # core is linked with 14.44"). Install the 14.44 (VS 2022 17.14) toolset
+      # side by side into VS 2026 and build with it.
+      - name: Install MSVC 14.44 toolset
+        if: matrix.os == 'windows-2025' && (matrix.php == '8.4' || matrix.php == '8.5')
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -latest -products * -property installationPath
+          Write-Host "Visual Studio: $installPath"
+          $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+          $proc = Start-Process -FilePath $installer -Wait -PassThru -NoNewWindow -ArgumentList @(
+            'modify',
+            '--installPath', "`"$installPath`"",
+            '--add', 'Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64',
+            '--quiet', '--norestart', '--nocache'
+          )
+          # 3010 = success, reboot required (not needed for a toolset).
+          if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+            throw "vs_installer failed with exit code $($proc.ExitCode)"
+          }
+          Get-ChildItem "$installPath\VC\Tools\MSVC" | Select-Object -ExpandProperty Name
+
       - name: Set up MSVC developer prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          toolset: ${{ steps.php-sdk.outputs.toolset }}
+          toolset: ${{ (matrix.os == 'windows-2025' && (matrix.php == '8.4' || matrix.php == '8.5')) && '14.44' || steps.php-sdk.outputs.toolset }}
 
       # OpenBLAS for Windows: download the upstream pre-built x64 release.
       # The ZIP contains include/, lib/libopenblas.lib + libopenblas.dll.a,
