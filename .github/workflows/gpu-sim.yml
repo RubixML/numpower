@@ -1,0 +1,143 @@
+name: GPU Simulator
+
+# The hosted runners have no GPU, so the CUDA legs of ci.yml build the CUDA
+# extension but skip every GPU test at runtime. This job builds the same
+# extension with CUDA 13.0 and runs `make test` on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim), with NDARRAY_VCHECK=1, and
+# fails if any GPU test is skipped. A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "numpower.c"
+      - "*.h"
+      - "src/**"
+      - "tests/**"
+      - "config.m4"
+      - "Makefile.frag"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-tests:
+    name: GPU tests (PHP 8.3 CUDA 13.0 and simulated H100)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@d52fc211a0436f8839a587b3b5b8efddab4744ea # v2
+        with:
+          php-version: '8.3'
+          extensions: gd
+          tools: none
+          coverage: none
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential autoconf liblapacke-dev libopenblas-dev
+
+      # library-path is disabled so that the extension links against the
+      # toolkit's cuBLAS, cuSOLVER and cuRAND; `vgpu run` swaps in the
+      # simulator's at run time.
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+          library-path: 'false'
+
+      - name: Build extension
+        env:
+          CPATH: /usr/local/cuda-13.0/include
+          LIBRARY_PATH: /usr/local/cuda-13.0/lib64
+        run: |
+          phpize
+          ./configure --with-cuda
+          grep -q "HAVE_CUBLAS 1" config.h
+          make -j3
+
+      # Same cuda-modules step as ci.yml. GENCODE_FLAGS is also passed to the
+      # C compiler there, so the target goes on the nvcc command instead:
+      # compute_90 embeds PTX only, which the simulator runs, and the
+      # simulator needs a shared CUDA runtime.
+      - name: Link CUDA objects into extension
+        env:
+          CPATH: /usr/local/cuda-13.0/include
+          LIBRARY_PATH: /usr/local/cuda-13.0/lib64
+        run: |
+          make cuda-modules NVCC="nvcc -ccbin g++ -arch=compute_90 -code=compute_90 -cudart shared"
+          ldd modules/ndarray.so | grep -E "cudart|cublas|cusolver|curand"
+
+      # Excluded tests, each with the reason:
+      # - types/030-setdatatype-gpu: compares the float64 result with
+      #   `=== [1, 2, 3]` (ints), so it fails on a real GPU too (RTX 3060).
+      # - math/083-cpu-gpu-sum-prod-parity: the float32 axis reduction goes
+      #   through cuda_float_transpose, which transposes in place (same
+      #   input and output buffer). On the simulator, whose threads do not run
+      #   in lockstep, some rows come out wrong; it passes on an RTX 3060.
+      # - initializers/106 and 109 (poisson on GPU): the simulator's cuRAND
+      #   does not have curandGeneratePoisson yet.
+      - name: Exclude tests
+        run: |
+          rm tests/types/030-setdatatype-gpu.phpt
+          rm tests/math/083-cpu-gpu-sum-prod-parity.phpt
+          rm tests/initializers/106-numpower-poisson-dtype-gpu.phpt
+          rm tests/initializers/109-numpower-poisson-vram-no-leak.phpt
+
+      # Same GD handling as the Run tests step in ci.yml. --quiet keeps the
+      # simulator's start-up line out of each test's output.
+      - name: Run tests
+        env:
+          NDARRAY_VCHECK: 1
+          REPORT_EXIT_STATUS: 1
+        run: |
+          set -o pipefail
+          EXTRA_EXT=""
+          if ! php -n -m 2>/dev/null | grep -qi '^gd$'; then
+            GD_PATH=$(php -r 'echo ini_get("extension_dir") . "/gd.so";')
+            if [ -f "$GD_PATH" ]; then
+              EXTRA_EXT=" -d extension=$GD_PATH"
+            fi
+          fi
+          vgpu run --quiet make test \
+            PHP_TEST_SHARED_EXTENSIONS="$EXTRA_EXT -d extension=ndarray.so" \
+            TESTS="-q --show-diff" | tee test.log
+
+      # A GPU test skips when NDArray::gpu() throws; none should here.
+      # device/003 and device/006 are the inverse (they skip when CUDA is
+      # compiled in) and are not counted.
+      - name: Check that no GPU test was skipped
+        run: |
+          is_gpu_test() {
+            sed -n '/^--SKIPIF--/,/^--FILE--/p' "$1" > "$RUNNER_TEMP/skipif.txt"
+            grep -q 'gpu()' "$RUNNER_TEMP/skipif.txt" && ! grep -q 'skip CUDA is compiled in' "$RUNNER_TEMP/skipif.txt"
+          }
+          total=0
+          for f in $(find tests -name '*.phpt'); do
+            if is_gpu_test "$f"; then total=$((total + 1)); fi
+          done
+          skipped=0
+          for f in $(grep -a 'SKIP' test.log | grep -aoE '\[tests/[^]]*\.phpt\]' | tr -d '[]' | sort -u); do
+            if is_gpu_test "$f"; then
+              echo "::error::GPU test skipped: $f"
+              skipped=$((skipped + 1))
+            fi
+          done
+          echo "GPU tests: $total, skipped: $skipped"
+          test "$skipped" -eq 0
