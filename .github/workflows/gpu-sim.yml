@@ -56,7 +56,7 @@ jobs:
       # toolkit's cuBLAS, cuSOLVER and cuRAND; `vgpu run` swaps in the
       # simulator's at run time.
       - name: Set up the simulated GPU and CUDA toolkit
-        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        uses: pantheongpu/setup-pantheonsim@656f502ef4782d94d34d8ddd368e333960609639 # v0.1.8
         with:
           gpu: nvidia/h100
           cuda-toolkit: "13.0"
@@ -91,14 +91,10 @@ jobs:
       #   through cuda_float_transpose, which transposes in place (same
       #   input and output buffer). On the simulator, whose threads do not run
       #   in lockstep, some rows come out wrong; it passes on an RTX 3060.
-      # - initializers/106 and 109 (poisson on GPU): the simulator's cuRAND
-      #   does not have curandGeneratePoisson yet.
       - name: Exclude tests
         run: |
           rm tests/types/030-setdatatype-gpu.phpt
           rm tests/math/083-cpu-gpu-sum-prod-parity.phpt
-          rm tests/initializers/106-numpower-poisson-dtype-gpu.phpt
-          rm tests/initializers/109-numpower-poisson-vram-no-leak.phpt
 
       # Same GD handling as the Run tests step in ci.yml. --quiet keeps the
       # simulator's start-up line out of each test's output.
